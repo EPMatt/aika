@@ -1163,3 +1163,87 @@ input {
     row-gap: 16px;
   }
 }
+
+.month-cell.range-selected {
+  background: var(--accent-soft);
+}
+.month-cell,
+.time-column {
+  touch-action: none;
+}
+.time-selection {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  pointer-events: none;
+  z-index: 1;
+}
+.resize-handle {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 9px;
+  cursor: ns-resize;
+}
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  left: calc(50% - 9px);
+  width: 18px;
+  border-top: 2px solid var(--accent);
+}
+
+.month-row {
+  position: relative;
+  --month-event-height: 26px;
+}
+.month-spans {
+  position: absolute;
+  top: 40px;
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-auto-rows: var(--month-event-height);
+  pointer-events: none;
+  z-index: 2;
+}
+.month-span {
+  min-width: 0;
+  padding: 0 6px;
+  pointer-events: auto;
+}
+.month-span .event-chip,
+.all-day-spans .event-chip {
+  width: 100%;
+}
+.all-day-row {
+  position: relative;
+}
+.all-day-spans {
+  position: absolute;
+  left: 64px;
+  right: 0;
+  top: 5px;
+  display: grid;
+  grid-template-columns: repeat(var(--days), minmax(0, 1fr));
+  grid-auto-rows: 26px;
+  pointer-events: none;
+}
+.all-day-spans > div {
+  min-width: 0;
+  padding: 0 5px;
+  pointer-events: auto;
+}
+@media (max-height: 760px) {
+  .month-row {
+    --month-event-height: 21px;
+  }
+  .month-spans {
+    top: 31px;
+  }
+}

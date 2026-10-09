@@ -167,3 +167,34 @@ export function layoutTimedEvents(events: CalendarEvent[], day: DateTime): Posit
   finishGroup();
   return positioned;
 }
+
+export function layoutAllDaySpans(events: CalendarEvent[], days: DateTime[]) {
+  const first = dateKey(days[0]);
+  const last = dateKey(days[days.length - 1].plus({ days: 1 }));
+  const laneEnds: number[] = [];
+  return events
+    .filter(
+      (event) =>
+        event.time.kind === 'allDay' && event.time.startDate < last && event.time.endDate > first,
+    )
+    .sort((a, b) =>
+      a.time.kind === 'allDay' && b.time.kind === 'allDay'
+        ? a.time.startDate.localeCompare(b.time.startDate) ||
+          b.time.endDate.localeCompare(a.time.endDate)
+        : 0,
+    )
+    .map((event) => {
+      if (event.time.kind !== 'allDay') throw new Error('Expected all-day event');
+      const time = event.time;
+      const start = Math.max(
+        0,
+        days.findIndex((day) => dateKey(day) >= time.startDate),
+      );
+      const endIndex = days.findIndex((day) => dateKey(day) >= time.endDate);
+      const end = endIndex < 0 ? days.length : endIndex;
+      let lane = laneEnds.findIndex((value) => value <= start);
+      if (lane < 0) lane = laneEnds.length;
+      laneEnds[lane] = end;
+      return { event, start, end, lane };
+    });
+}

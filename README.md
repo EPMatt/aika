@@ -2,7 +2,7 @@
 
 A desktop calendar. Tauri 2, React, TypeScript, and Rust.
 
-**Current milestone: phase 2 local domain.** The desktop app saves one local calendar in SQLite, restores events and appearance/view/sidebar preferences after restart, and supports session undo. The browser preview remains an in-memory design harness with sample data.
+**Current milestone: phase 3 calendar experience.** The desktop app saves one local calendar in SQLite, restores events and appearance/view/sidebar preferences after restart, and supports session undo. The browser preview remains an in-memory design harness with sample data.
 
 ## Run
 
@@ -43,6 +43,6 @@ Review URLs use a fixed date for reproducible screenshots:
 - `/?date=2026-10-09&scenario=empty`
 - `/?date=2026-10-09&scenario=dense`
 
-Shortcuts: **N** creates an event; **T** returns to today; **1/2/3** selects month/week/day; **Ctrl/Cmd+Z** undoes a session change; **Escape** dismisses the editor. Dragging an event between dates preserves its local time and duration; DST gaps and repeated times require editing explicitly. Complete drag-to-create, timed drop positioning, and resizing belong to phase 3.
+Shortcuts: **N** creates an event; **T** returns to today; **1/2/3** selects month/week/day; **Ctrl/Cmd+Z** undoes a session change; **Escape** dismisses the editor. In month view, dragging an event between dates preserves its local time and duration; DST gaps and repeated times require editing explicitly. Drag across month dates to create an all-day range, or across a time column to create a timed range. Timed drops and the bottom resize handle snap to 15 minutes. Escape cancels a selection. All-day events span visible dates; crowded month rows use overflow. Enter on a time column or all-day row creates an event; Enter on an event opens its dates/times for keyboard moving and resizing. Gesture failures leave saved data unchanged; retry the gesture or use the editor to select a DST offset.
 
-Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [latest handoff](docs/handoffs/phase-2.md) before continuing. Phase 3 completes creation/move/resize gestures and their keyboard alternatives.
+Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [latest handoff](docs/handoffs/phase-3.md) before continuing. Phase 4 adds provider proof, credentials, and native/platform quality checks.

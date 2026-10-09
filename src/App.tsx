@@ -26,6 +26,7 @@ import {
   eventsOnDate,
   firstWeekday,
   layoutTimedEvents,
+  layoutAllDaySpans,
   makeEvent,
   monthDays,
   moveEvent,
@@ -137,10 +138,12 @@ function EventChip({
   event,
   onClick,
   compact = false,
+  day,
 }: {
   event: CalendarEvent;
   onClick: (event: CalendarEvent, anchor: HTMLElement) => void;
   compact?: boolean;
+  day?: DateTime;
 }) {
   return (
     <button
@@ -155,10 +158,16 @@ function EventChip({
         e.stopPropagation();
         onClick(event, e.currentTarget);
       }}
-      aria-label={`${event.title}, ${event.time.kind === 'allDay' ? 'all day' : timeLabel(event.time.start)}`}
+      aria-label={`${event.title}, ${event.time.kind === 'allDay' ? `all day, ${event.time.startDate} through ${DateTime.fromISO(event.time.endDate).minus({ days: 1 }).toISODate()}` : timeLabel(event.time.start)}`}
     >
       {event.time.kind === 'timed' && <span className="event-dot" />}
+      {day && event.time.kind === 'allDay' && event.time.startDate < dateKey(day) && (
+        <span aria-hidden="true">‹</span>
+      )}
       <span className="event-title">{event.title}</span>
+      {day &&
+        event.time.kind === 'allDay' &&
+        event.time.endDate > dateKey(day.plus({ days: 1 })) && <span aria-hidden="true">›</span>}
       {event.time.kind === 'timed' && !compact && (
         <span className="event-time">{timeLabel(event.time.start)}</span>
       )}
@@ -179,15 +188,29 @@ function MonthView({
   today: DateTime;
   events: CalendarEvent[];
   onSelect: (date: DateTime) => void;
-  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean) => void;
+  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean, end?: DateTime) => void;
   onEdit: (event: CalendarEvent, anchor: HTMLElement) => void;
-  onMove: (id: string, date: DateTime) => void;
+  onMove: (id: string, date: DateTime, precise?: boolean) => void;
 }) {
   const days = monthDays(date);
   const [overflow, setOverflow] = useState<string | null>(null);
   const [capacity, setCapacity] = useState({ full: 3, overflow: 2 });
   const gridRef = useRef<HTMLDivElement>(null);
   const keyboardFocus = useRef(false);
+  const rangeStart = useRef<DateTime | null>(null);
+  const [rangeEnd, setRangeEnd] = useState<string | null>(null);
+  const suppressClick = useRef(false);
+  useEffect(() => {
+    const cancel = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape' && rangeStart.current) {
+        rangeStart.current = null;
+        setRangeEnd(null);
+        suppressClick.current = true;
+      }
+    };
+    window.addEventListener('keydown', cancel);
+    return () => window.removeEventListener('keydown', cancel);
+  }, []);
   useEffect(() => {
     if (!gridRef.current) return;
     const observer = new ResizeObserver((entries) => {
@@ -239,10 +262,61 @@ function MonthView({
       </div>
       <div className="month-grid" role="grid" ref={gridRef} aria-label={date.toFormat('LLLL yyyy')}>
         {Array.from({ length: 6 }, (_, row) => (
-          <div className="month-row" role="row" key={row}>
+          <div
+            className="month-row"
+            role="row"
+            key={row}
+            onDragOver={(e) => {
+              if (Array.from(e.dataTransfer.types).includes(DRAG_TYPE)) e.preventDefault();
+            }}
+            onDrop={(e) => {
+              if ((e.target as HTMLElement).closest('.month-cell')) return;
+              e.preventDefault();
+              const rect = e.currentTarget.getBoundingClientRect();
+              const column = Math.min(
+                6,
+                Math.max(0, Math.floor(((e.clientX - rect.left) / rect.width) * 7)),
+              );
+              onMove(e.dataTransfer.getData(DRAG_TYPE), days[row * 7 + column]);
+            }}
+          >
+            <div className="month-spans" aria-label="All-day events">
+              {layoutAllDaySpans(events, days.slice(row * 7, row * 7 + 7))
+                .filter((span) => span.lane < capacity.overflow)
+                .map(({ event, start, end, lane }) => (
+                  <div
+                    key={event.id}
+                    className="month-span"
+                    style={{ gridColumn: `${start + 1} / ${end + 1}`, gridRow: lane + 1 }}
+                  >
+                    <EventChip event={event} day={days[row * 7 + start]} onClick={onEdit} />
+                  </div>
+                ))}
+            </div>
             {days.slice(row * 7, row * 7 + 7).map((day) => {
-              const items = eventsOnDate(events, day);
-              const limit = items.length <= capacity.full ? capacity.full : capacity.overflow;
+              const allItems = eventsOnDate(events, day);
+              const column = days
+                .slice(row * 7, row * 7 + 7)
+                .findIndex((value) => dateKey(value) === dateKey(day));
+              const visibleSpans = layoutAllDaySpans(
+                events,
+                days.slice(row * 7, row * 7 + 7),
+              ).filter(
+                (span) =>
+                  span.lane < capacity.overflow && span.start <= column && span.end > column,
+              );
+              const reserved = visibleSpans.length
+                ? Math.max(...visibleSpans.map((span) => span.lane)) + 1
+                : 0;
+              const items = allItems.filter(
+                (event) => !visibleSpans.some((span) => span.event.id === event.id),
+              );
+              const full = Math.max(0, capacity.full - reserved);
+              const limit =
+                items.length <= full && items.every((event) => event.time.kind === 'timed')
+                  ? full
+                  : Math.max(0, capacity.overflow - reserved);
+              const chips = items.filter((event) => event.time.kind === 'timed').slice(0, limit);
               const key = dateKey(day);
               return (
                 <div
@@ -252,9 +326,45 @@ function MonthView({
                   aria-selected={day.hasSame(date, 'day')}
                   tabIndex={day.hasSame(date, 'day') ? 0 : -1}
                   data-date={key}
-                  className={`month-cell ${day.month !== date.month ? 'outside' : ''} ${day.hasSame(today, 'day') ? 'is-today' : ''}`}
+                  className={`month-cell ${day.month !== date.month ? 'outside' : ''} ${day.hasSame(today, 'day') ? 'is-today' : ''} ${rangeStart.current && rangeEnd && key >= [dateKey(rangeStart.current), rangeEnd].sort()[0] && key <= [dateKey(rangeStart.current), rangeEnd].sort()[1] ? 'range-selected' : ''}`}
                   onKeyDown={(e) => keyNavigate(e, day)}
-                  onClick={() => onSelect(day)}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return;
+                    rangeStart.current = day;
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                  }}
+                  onPointerMove={(e) => {
+                    if (!rangeStart.current) return;
+                    const cell = document
+                      .elementFromPoint(e.clientX, e.clientY)
+                      ?.closest<HTMLElement>('[data-date]');
+                    if (cell?.dataset.date) setRangeEnd(cell.dataset.date);
+                  }}
+                  onPointerCancel={() => {
+                    rangeStart.current = null;
+                    setRangeEnd(null);
+                  }}
+                  onPointerUp={(e) => {
+                    const first = rangeStart.current;
+                    rangeStart.current = null;
+                    setRangeEnd(null);
+                    const key = document
+                      .elementFromPoint(e.clientX, e.clientY)
+                      ?.closest<HTMLElement>('[data-date]')?.dataset.date;
+                    if (!first || !key || key === dateKey(first)) return;
+                    suppressClick.current = true;
+                    const last = DateTime.fromISO(key);
+                    onCreate(
+                      DateTime.min(first, last),
+                      e.currentTarget,
+                      true,
+                      DateTime.max(first, last).plus({ days: 1 }),
+                    );
+                  }}
+                  onClick={() => {
+                    if (suppressClick.current) suppressClick.current = false;
+                    else onSelect(day);
+                  }}
                   onDoubleClick={(e) => {
                     if (!(e.target as HTMLElement).closest('button'))
                       onCreate(day.set({ hour: 9 }), e.currentTarget, true);
@@ -292,18 +402,25 @@ function MonthView({
                       <Plus size={13} />
                     </button>
                   </div>
-                  <div className="cell-events">
-                    {items.slice(0, limit).map((event) => (
-                      <EventChip key={event.id} event={event} onClick={onEdit} />
+                  <div
+                    className="cell-events"
+                    style={{
+                      paddingTop: reserved
+                        ? `calc(${reserved} * var(--month-event-height))`
+                        : undefined,
+                    }}
+                  >
+                    {chips.map((event) => (
+                      <EventChip key={event.id} event={event} day={day} onClick={onEdit} />
                     ))}
-                    {items.length > limit && (
+                    {items.length > chips.length && (
                       <Popover.Root
                         open={overflow === key}
                         onOpenChange={(open) => setOverflow(open ? key : null)}
                       >
                         <Popover.Trigger asChild>
                           <button className="overflow-button" onClick={(e) => e.stopPropagation()}>
-                            +{items.length - limit} more
+                            +{items.length - chips.length} more
                           </button>
                         </Popover.Trigger>
                         <Popover.Portal>
@@ -313,7 +430,7 @@ function MonthView({
                             collisionPadding={16}
                           >
                             <div className="overflow-heading">{day.toFormat('cccc, LLLL d')}</div>
-                            {items.map((event) => (
+                            {allItems.map((event) => (
                               <EventChip
                                 key={event.id}
                                 event={event}
@@ -347,29 +464,68 @@ function TimeView({
   onCreate,
   onEdit,
   onMove,
+  onResize,
 }: {
   date: DateTime;
   today: DateTime;
   view: 'week' | 'day';
   events: CalendarEvent[];
-  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean) => void;
+  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean, end?: DateTime) => void;
   onEdit: (event: CalendarEvent, anchor: HTMLElement) => void;
-  onMove: (id: string, date: DateTime) => void;
+  onMove: (id: string, date: DateTime, precise?: boolean) => void;
+  onResize: (id: string, end: DateTime) => void;
 }) {
   const days = daysForView(date, view);
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = HOUR_HEIGHT * 7.5;
   }, [view]);
+  const [selection, setSelection] = useState<{ day: string; start: number; end: number } | null>(
+    null,
+  );
+  const gesture = useRef<{ start: number; y: number; id?: string } | null>(null);
+  const suppressClick = useRef(false);
+  useEffect(() => {
+    const cancel = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape' && gesture.current) {
+        gesture.current = null;
+        setSelection(null);
+        suppressClick.current = true;
+      }
+    };
+    window.addEventListener('keydown', cancel);
+    return () => window.removeEventListener('keydown', cancel);
+  }, []);
+  const minuteAt = (y: number, element: HTMLElement) =>
+    Math.min(
+      1440,
+      Math.max(0, Math.round(((y - element.getBoundingClientRect().top) / HOUR_HEIGHT) * 4) * 15),
+    );
+  const [gestureFailure, setGestureFailure] = useState('');
+  const perform = (action: () => Promise<void>) => {
+    action()
+      .then(() => setGestureFailure(''))
+      .catch((err) => setGestureFailure(errorMessage(err)));
+  };
+  const at = async (day: DateTime, minute: number) => {
+    const date = dateKey(day.plus({ days: Math.floor(minute / 1440) }));
+    const clock = `${String(Math.floor((minute % 1440) / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+    return DateTime.fromISO(await resolveWallTime(`${date}T${clock}`));
+  };
   const countStyle = { '--days': days.length } as CSSProperties;
   const clickSlot = (e: MouseEvent<HTMLDivElement>, day: DateTime) => {
+    if (suppressClick.current) {
+      suppressClick.current = false;
+      return;
+    }
     if ((e.target as HTMLElement).closest('button')) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const minute = Math.min(
       1425,
       Math.max(0, Math.floor(((e.clientY - rect.top) / HOUR_HEIGHT) * 4) * 15),
     );
-    onCreate(day.set({ hour: Math.floor(minute / 60), minute: minute % 60 }), e.currentTarget);
+    const anchor = e.currentTarget;
+    perform(async () => onCreate(await at(day, minute), anchor));
   };
   return (
     <div
@@ -377,6 +533,11 @@ function TimeView({
       style={countStyle}
       aria-label={`${view === 'week' ? 'Week' : 'Day'} calendar`}
     >
+      {gestureFailure && (
+        <p role="alert" className="editor-error">
+          {gestureFailure} Use the editor to choose a time or offset.
+        </p>
+      )}
       <div className="time-head">
         <span className="zone-label">{DateTime.local().toFormat('ZZZZ')}</span>
         {days.map((day) => (
@@ -389,21 +550,64 @@ function TimeView({
           </div>
         ))}
       </div>
-      <div className="all-day-row">
+      <div
+        className="all-day-row"
+        onDragOver={(e) => {
+          if (Array.from(e.dataTransfer.types).includes(DRAG_TYPE)) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          if ((e.target as HTMLElement).closest('.all-day-cell')) return;
+          e.preventDefault();
+          const rect = e.currentTarget.getBoundingClientRect();
+          const column = Math.min(
+            days.length - 1,
+            Math.max(
+              0,
+              Math.floor(((e.clientX - rect.left - 64) / (rect.width - 64)) * days.length),
+            ),
+          );
+          onMove(e.dataTransfer.getData(DRAG_TYPE), days[column]);
+        }}
+        style={{
+          minHeight:
+            Math.max(1, ...layoutAllDaySpans(events, days).map((span) => span.lane + 1)) * 26 + 10,
+        }}
+      >
         <span className="all-day-label">all-day</span>
         {days.map((day) => (
           <div
             className="all-day-cell"
             key={dateKey(day)}
-            onDoubleClick={(e) => onCreate(day, e.currentTarget, true)}
-          >
-            {eventsOnDate(events, day)
-              .filter((event) => event.time.kind === 'allDay')
-              .map((event) => (
-                <EventChip key={event.id} event={event} compact onClick={onEdit} />
-              ))}
-          </div>
+            tabIndex={0}
+            role="group"
+            aria-label={`All-day events on ${day.toISODate()}`}
+            onKeyDown={(e) => {
+              if (e.target === e.currentTarget && e.key === 'Enter')
+                onCreate(day, e.currentTarget, true);
+            }}
+            onDragOver={(e) => {
+              if (Array.from(e.dataTransfer.types).includes(DRAG_TYPE)) e.preventDefault();
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              onMove(e.dataTransfer.getData(DRAG_TYPE), day);
+            }}
+            onDoubleClick={(e) => {
+              if (!(e.target as HTMLElement).closest('button'))
+                onCreate(day, e.currentTarget, true);
+            }}
+          ></div>
         ))}
+        <div className="all-day-spans">
+          {layoutAllDaySpans(events, days).map(({ event, start, end, lane }) => (
+            <div
+              key={event.id}
+              style={{ gridColumn: `${start + 1} / ${end + 1}`, gridRow: lane + 1 }}
+            >
+              <EventChip event={event} day={days[start]} compact onClick={onEdit} />
+            </div>
+          ))}
+        </div>
       </div>
       <div className="time-scroll" ref={scrollRef}>
         <div className="time-columns">
@@ -419,18 +623,89 @@ function TimeView({
               className="time-column"
               key={dateKey(day)}
               data-date={dateKey(day)}
+              tabIndex={0}
+              role="group"
+              aria-label={`Times on ${day.toISODate()}; Enter to create at 9 AM`}
+              onKeyDown={(e) => {
+                if (e.target === e.currentTarget && e.key === 'Enter') {
+                  e.preventDefault();
+                  onCreate(day.set({ hour: 9 }), e.currentTarget);
+                }
+              }}
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                const handle = (e.target as HTMLElement).closest<HTMLElement>('[data-resize]');
+                if (!handle && (e.target as HTMLElement).closest('button')) return;
+                gesture.current = {
+                  start: minuteAt(e.clientY, e.currentTarget),
+                  y: e.clientY,
+                  id: handle?.dataset.resize,
+                };
+                e.currentTarget.setPointerCapture(e.pointerId);
+              }}
+              onPointerMove={(e) => {
+                if (!gesture.current) return;
+                const scroll = scrollRef.current;
+                if (scroll) {
+                  const rect = scroll.getBoundingClientRect();
+                  if (e.clientY > rect.bottom - 28) scroll.scrollTop += 18;
+                  else if (e.clientY < rect.top + 28) scroll.scrollTop -= 18;
+                }
+                setSelection({
+                  day: dateKey(day),
+                  start: gesture.current.start,
+                  end: minuteAt(e.clientY, e.currentTarget),
+                });
+              }}
+              onPointerCancel={() => {
+                gesture.current = null;
+                setSelection(null);
+              }}
+              onPointerUp={(e) => {
+                const g = gesture.current;
+                gesture.current = null;
+                setSelection(null);
+                if (!g) return;
+                if (g.id) suppressClick.current = true;
+                if (Math.abs(e.clientY - g.y) < 5) return;
+                suppressClick.current = true;
+                const end = minuteAt(e.clientY, e.currentTarget);
+                const anchor = e.currentTarget;
+                perform(async () => {
+                  if (g.id) onResize(g.id, await at(day, end));
+                  else
+                    onCreate(
+                      await at(day, Math.min(g.start, end, 1425)),
+                      anchor,
+                      false,
+                      await at(day, Math.max(g.start, end, Math.min(g.start, end) + 15)),
+                    );
+                });
+              }}
               onClick={(e) => clickSlot(e, day)}
               onDragOver={(e) => {
                 if (Array.from(e.dataTransfer.types).includes(DRAG_TYPE)) e.preventDefault();
               }}
               onDrop={(e) => {
                 e.preventDefault();
-                onMove(e.dataTransfer.getData(DRAG_TYPE), day);
+                const id = e.dataTransfer.getData(DRAG_TYPE);
+                const minute = Math.min(1425, minuteAt(e.clientY, e.currentTarget));
+                perform(async () => onMove(id, await at(day, minute), true));
               }}
             >
               {Array.from({ length: 24 }, (_, hour) => (
                 <div className="hour-slot" key={hour} />
               ))}
+              {selection?.day === dateKey(day) && (
+                <div
+                  className="time-selection"
+                  style={{
+                    top: (Math.min(selection.start, selection.end) / 60) * HOUR_HEIGHT,
+                    height:
+                      (Math.max(15, Math.abs(selection.end - selection.start)) / 60) * HOUR_HEIGHT,
+                  }}
+                />
+              )}
               {layoutTimedEvents(events, day).map(({ event, start, end, lane, lanes }) => (
                 <button
                   key={event.id}
@@ -445,6 +720,10 @@ function TimeView({
                     width: `calc(${100 / lanes}% - 10px)`,
                   }}
                   onDragStart={(e) => {
+                    if (gesture.current?.id) {
+                      e.preventDefault();
+                      return;
+                    }
                     e.dataTransfer.setData(DRAG_TYPE, event.id);
                     e.dataTransfer.effectAllowed = 'move';
                   }}
@@ -459,6 +738,7 @@ function TimeView({
                       ? `${timeLabel(event.time.start)} – ${timeLabel(event.time.end)}`
                       : ''}
                   </span>
+                  <span className="resize-handle" data-resize={event.id} aria-hidden="true" />
                   {event.location && end - start >= 90 && (
                     <span className="time-event-location">
                       <MapPin size={11} />
@@ -776,7 +1056,12 @@ function EventEditor({
 
 export function App({ repository = null }: { repository?: PrototypeRepository | null }) {
   const [date, setDate] = useState<DateTime>(initialDate.startOf('day'));
-  const today = initialDate.startOf('day');
+  const [now, setNow] = useState(DateTime.local());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(DateTime.local()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const today = desktop || !params.get('date') ? now.startOf('day') : initialDate.startOf('day');
   const [view, setView] = useState<View>('month');
   const [sidebar, setSidebar] = useState(window.innerWidth >= 900);
   const [visible, setVisible] = useState(true);
@@ -869,28 +1154,37 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
         .catch(() => setRuntime('desktop-error'));
   }, []);
   const refresh = (message: string) => {
+    setFailure('');
     if (repository) {
       setEvents(repository.list());
       setCanUndo(repository.canUndo());
     } else setRevision((value) => value + 1);
     setAnnouncement(message);
   };
-  const create = useCallback((day: DateTime, anchor: HTMLElement, allDay = false) => {
-    editorAnchor.current = anchor;
-    setEditing({ event: makeEvent(day, allDay), existing: false });
-  }, []);
+  const create = useCallback(
+    (day: DateTime, anchor: HTMLElement, allDay = false, end?: DateTime) => {
+      editorAnchor.current = anchor;
+      const event = makeEvent(day, allDay);
+      if (end && event.time.kind === 'timed') event.time.end = end.toUTC().toISO()!;
+      if (end && event.time.kind === 'allDay') event.time.endDate = dateKey(end);
+      setEditing({ event, existing: false });
+    },
+    [],
+  );
   const edit = (event: CalendarEvent, anchor: HTMLElement) => {
     editorAnchor.current = anchor;
     setEditing({ event, existing: true });
   };
-  const move = async (id: string, target: DateTime) => {
+  const move = async (id: string, target: DateTime, precise = false) => {
     const event = events.find((item) => item.id === id);
     if (!event) return;
     try {
       const moved = moveEvent(event, target);
       if (event.time.kind === 'timed' && moved.time.kind === 'timed') {
         const oldStart = DateTime.fromISO(event.time.start);
-        const start = await resolveWallTime(`${dateKey(target)}T${oldStart.toFormat('HH:mm')}`);
+        const start = await resolveWallTime(
+          `${dateKey(target)}T${(precise ? target : oldStart).toFormat('HH:mm')}`,
+        );
         const duration = DateTime.fromISO(event.time.end).diff(oldStart).milliseconds;
         moved.time = {
           kind: 'timed',
@@ -901,7 +1195,24 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       }
       if (desktop) await calendarClient.save(moved, true);
       else repository!.save(moved);
+      setFailure('');
       refresh('Event moved. Undo is available.');
+    } catch (err) {
+      setFailure(errorMessage(err));
+    }
+  };
+  const resize = async (id: string, target: DateTime) => {
+    const event = events.find((item) => item.id === id);
+    if (!event || event.time.kind !== 'timed') return;
+    try {
+      const end = await resolveWallTime(`${dateKey(target)}T${target.toFormat('HH:mm')}`);
+      if (DateTime.fromISO(end).toMillis() <= DateTime.fromISO(event.time.start).toMillis())
+        throw new Error('End must be after start.');
+      const resized = { ...event, time: { ...event.time, end } };
+      if (desktop) await calendarClient.save(resized, true);
+      else repository!.save(resized);
+      setFailure('');
+      refresh('Event resized. Undo is available.');
     } catch (err) {
       setFailure(errorMessage(err));
     }
@@ -925,7 +1236,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('input, textarea, [contenteditable="true"]') || editing || settings)
+      if (
+        target.closest('input, textarea, select, [contenteditable="true"]') ||
+        editing ||
+        settings
+      )
         return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -1087,6 +1402,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               onCreate={create}
               onEdit={edit}
               onMove={move}
+              onResize={resize}
             />
           )}
         </div>
@@ -1190,6 +1506,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                 <option value="dark">Dark</option>
               </select>
             </div>
+            <p className="settings-footnote">
+              N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes. Enter
+              opens a focused event to edit its dates and times. Enter on a calendar date or time
+              column creates an event. Arrow keys navigate month dates.
+            </p>
             <div className="settings-row">
               <span>Time zone</span>
               <span className="muted">{DateTime.local().zoneName}</span>

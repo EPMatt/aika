@@ -4,6 +4,7 @@ import {
   dateKey,
   eventsOnDate,
   layoutTimedEvents,
+  layoutAllDaySpans,
   makeEvent,
   monthDays,
   moveEvent,
@@ -68,4 +69,27 @@ describe('calendar layout and prototype interactions', () => {
     repo.undo();
     expect(repo.list()).toEqual([]);
   });
+});
+
+it('clips all-day spans to a visible week and shares lanes at exclusive boundaries', () => {
+  const days = Array.from({ length: 7 }, (_, index) => day.plus({ days: index }));
+  const span = (start: string, end: string) => ({
+    ...makeEvent(day, true),
+    time: { kind: 'allDay' as const, startDate: start, endDate: end },
+  });
+  const result = layoutAllDaySpans(
+    [
+      span('2026-10-07', '2026-10-12'),
+      span('2026-10-10', '2026-10-20'),
+      span('2026-10-12', '2026-10-14'),
+      span('2026-10-01', '2026-10-09'),
+      span('2026-10-16', '2026-10-18'),
+    ],
+    days,
+  );
+  expect(result.map(({ start, end, lane }) => ({ start, end, lane }))).toEqual([
+    { start: 0, end: 3, lane: 0 },
+    { start: 1, end: 7, lane: 1 },
+    { start: 3, end: 5, lane: 0 },
+  ]);
 });

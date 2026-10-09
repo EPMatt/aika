@@ -38,7 +38,8 @@ test('desktop IPC errors preserve input and saved preferences hydrate on reload'
             case 'resolve_local_time':
               return new Date(args.local + '+02:00').toISOString();
             case 'save_event':
-              if (failSave) {
+              if (failSave || (window as any).testFailNextSave) {
+                (window as any).testFailNextSave = false;
                 failSave = false;
                 throw {
                   code: 'storage',
@@ -78,6 +79,27 @@ test('desktop IPC errors preserve input and saved preferences hydrate on reload'
   await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveValue('Persistent event');
   await page.getByRole('button', { name: 'Create event', exact: true }).click();
   await expect(page.getByRole('button', { name: /Persistent event,/ })).toBeVisible();
+  const before = await page.evaluate(() => localStorage.getItem('test.events'));
+  const transfer = await page.evaluateHandle(() => new DataTransfer());
+  const event = page.locator('.time-event').first();
+  await event.dispatchEvent('dragstart', { dataTransfer: transfer });
+  const column = page.locator('.time-column').filter({ has: event });
+  const rect = await column.boundingBox();
+  if (!rect) throw new Error('Missing event column');
+  await page.evaluate(() => {
+    (window as any).testFailNextSave = true;
+  });
+  await column.dispatchEvent('drop', { dataTransfer: transfer, clientY: rect.y + 12 * 72 });
+  await expect(page.getByRole('alert')).toContainText('temporarily unavailable');
+  expect(await page.evaluate(() => localStorage.getItem('test.events'))).toBe(before);
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeVisible();
+  const retryRect = await column.boundingBox();
+  if (!retryRect) throw new Error('Missing retry column');
+  await column.dispatchEvent('drop', { dataTransfer: transfer, clientY: retryRect.y + 12 * 72 });
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('test.events')!)[0].time.start))
+    .toContain('T10:00:00');
   await page.getByRole('button', { name: 'Month', exact: true }).click();
   await expect
     .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('test.preferences')!).view))
