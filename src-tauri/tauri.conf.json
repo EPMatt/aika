@@ -10,24 +10,45 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{
-      "title": "aika",
-      "width": 1280,
-      "height": 840,
-      "minWidth": 900,
-      "minHeight": 600,
-      "backgroundColor": "#F8F8F4"
-    }],
+    "windows": [
+      {
+        "title": "aika",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 900,
+        "minHeight": 600,
+        "backgroundColor": "#F8F8F4"
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "deb",
+      "appimage",
+      "nsis",
+      "dmg"
+    ],
     "category": "Productivity",
-    "shortDescription": "A quiet place for your time",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-    "macOS": { "minimumSystemVersion": "14.0", "signingIdentity": "-" }
+    "shortDescription": "A local desktop calendar",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

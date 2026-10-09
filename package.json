@@ -18,7 +18,9 @@
     "test:ui": "playwright test",
     "types:generate": "node scripts/tool.mjs cargo run --manifest-path src-tauri/Cargo.toml --bin export-types",
     "desktop:test:build": "node scripts/tool.mjs tauri build --debug --no-bundle --features native-test",
-    "test:native": "node scripts/native-test.mjs"
+    "test:native": "node scripts/native-test.mjs",
+    "alpha:build": "node scripts/alpha.mjs",
+    "test:packaging": "node --test scripts/alpha.test.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

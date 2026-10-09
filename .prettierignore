@@ -8,3 +8,4 @@ playwright-report/
 pnpm-lock.yaml
 docs/review/*.png
 *.tsbuildinfo
+artifacts/

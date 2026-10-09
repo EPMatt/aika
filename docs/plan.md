@@ -44,3 +44,7 @@ Phase 4 is next. Establish provider dispatch and credential boundaries behind th
 ## Implementation status after phase 4
 
 Provider dispatch now sits behind the unchanged IPC service. Production registers only the local SQLite adapter; a second adapter is confined to Rust tests. Read-only capabilities and calendar identity are enforced in the backend and reflected in the same renderer. Credentials use persistent OS stores without fallback or renderer exposure. Embedded native automation is confined to an explicit debug test feature; Linux CI includes it without re-enabling Windows/macOS jobs. See `docs/handoffs/phase-4.md` and `docs/quality.md` for the results and the remaining manual/platform gate. Phase 5 packaging can be prepared, but cross-platform/manual quality evidence is still required for alpha acceptance.
+
+## Implementation status after phase 5 preparation
+
+Private alpha build/collection tooling now prepares native release installers, SHA-256 checksums, provenance, and release notes; Linux CI uses the same path. Windows/macOS jobs remain disabled. Install/update/manual platform evidence and user alpha acceptance are tracked in `docs/alpha/verification.md` and `docs/handoffs/phase-5.md`; preparation does not mark those gates passed.

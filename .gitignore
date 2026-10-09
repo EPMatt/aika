@@ -8,3 +8,4 @@ playwright-report/
 *.tsbuildinfo
 src-tauri/gen/
 .DS_Store
+artifacts/

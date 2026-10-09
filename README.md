@@ -2,7 +2,7 @@
 
 A desktop calendar. Tauri 2, React, TypeScript, and Rust.
 
-**Current milestone: phase 4 provider proof and quality.** The desktop app saves one local calendar in SQLite, restores events and appearance/view/sidebar preferences after restart, and supports session undo. The browser preview remains an in-memory design harness with sample data.
+**Current milestone: phase 5 private alpha preparation; acceptance pending.** The desktop app saves one local calendar in SQLite, restores events and appearance/view/sidebar preferences after restart, and supports session undo. The browser preview remains an in-memory design harness with sample data.
 
 ## Run
 
@@ -46,4 +46,8 @@ Review URLs use a fixed date for reproducible screenshots:
 
 Shortcuts: **N** creates an event; **T** returns to today; **1/2/3** selects month/week/day; **Ctrl/Cmd+Z** undoes a session change; **Escape** dismisses the editor. In month view, dragging an event between dates preserves its local time and duration; DST gaps and repeated times require editing explicitly. Drag across month dates to create an all-day range, or across a time column to create a timed range. Timed drops and the bottom resize handle snap to 15 minutes. Escape cancels a selection. All-day events span visible dates; crowded month rows use overflow. Enter on a time column or all-day row creates an event; Enter on an event opens its dates/times for keyboard moving and resizing. Gesture failures leave saved data unchanged; retry the gesture or use the editor to select a DST offset.
 
-Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [latest handoff](docs/handoffs/phase-4.md) before continuing. The backend provider registry and OS credential service are in place; connected accounts remain deferred. Windows/macOS and manual assistive-technology checks remain pending before alpha acceptance.
+Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [latest handoff](docs/handoffs/phase-5.md) before continuing. The backend provider registry and OS credential service are in place; connected accounts remain deferred. Windows/macOS and manual assistive-technology checks remain pending before alpha acceptance.
+
+## Private alpha candidates
+
+Run `pnpm alpha:build <native-target-triple>` to build release installers and collect checksums, provenance, and release notes under `artifacts/`. Supported targets and installation/update evidence are documented in [alpha verification](docs/alpha/verification.md). `pnpm test:packaging` verifies artifact collection. Only Linux CI is active; Windows/macOS and the manual acceptance matrix remain pending. No candidate is published automatically.
