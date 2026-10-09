@@ -4,7 +4,7 @@ Status: **implemented and verified locally on Linux.** Phase 4 may proceed with 
 
 ## Source and scope
 
-Base revision: `1ce59e4` in the inherited `/home/srvadmin/Documents` Git repository. This handoff ships in the phase-3 commit. The pre-existing `.gitignore` modification and sibling projects are excluded.
+Base revision: `1ce59e4` in the inherited `/home/srvadmin/Documents` Git repository. Implementation revision: `433172a`. This handoff originally shipped in that phase-3 commit. The pre-existing `.gitignore` modification and sibling projects are excluded.
 
 Read the referenced planning task, `docs/plan.md`, `docs/architecture.md`, the earlier handoffs, and `.ai/plans/aika.md`. Phase 2 had already bound native startup to IPC; phase 3 extends that implementation without changing the persistence schema or contracts.
 
@@ -45,6 +45,10 @@ XDG_DATA_HOME=/tmp/aika-phase3-native timeout 8s src-tauri/target/debug/cal-desk
 ```
 
 The executable reported `runtime: desktop` and `rootChildren: 1`; exit 124 was the intentional timeout. No user database was modified.
+
+## Architectural decisions
+
+See `docs/architecture.md`, “Phase 3 decisions and rationale,” for the recorded choices: reuse normalized CRUD and session undo, refresh only after successful writes, resolve raw wall times before constructing instants, derive span lanes without persisting layout, and use pointer capture/HTML drag-and-drop with editor-based keyboard alternatives. Phase 3 adds no IPC commands, schema migration, or provider-specific view behavior.
 
 ## Limits and next phase
 

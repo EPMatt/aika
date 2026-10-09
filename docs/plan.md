@@ -34,3 +34,9 @@ CRUD/undo/restart; timed/all-day/overnight/multi-day ranges; leap days and year 
 ## Defaults
 
 System appearance; month on first launch; remember last view/sidebar/appearance in phase 2. New timed events last one hour; timed gestures snap to 15 minutes. Month gestures move by local date; time-grid gestures operate on time. Event type changes in the editor. All-day ranges use an exclusive end date internally. Google work begins only after the v0 alpha and a separate integration specification.
+
+## Implementation status after phase 3
+
+Phase 3 was delivered in `433172a`: native IPC remains the production data path, and gestures reuse normalized event CRUD and session undo. All-day spans and collision lanes are renderer-derived layout. Gesture wall times are resolved before constructing instants; failed writes retain committed data. See `docs/architecture.md` for the decision rationale and `docs/handoffs/phase-3.md` for checks and remaining platform limits.
+
+Phase 4 is next. Establish provider dispatch and credential boundaries behind the existing service, and verify native input/accessibility on the supported platforms. Preserve the distinction between renderer/mocked-IPC tests, actual SQLite tests, and embedded native automation when assessing the exit gate.
