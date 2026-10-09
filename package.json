@@ -16,7 +16,9 @@
     "rust": "node scripts/tool.mjs cargo",
     "test": "vitest run",
     "test:ui": "playwright test",
-    "types:generate": "node scripts/tool.mjs cargo run --manifest-path src-tauri/Cargo.toml --bin export-types"
+    "types:generate": "node scripts/tool.mjs cargo run --manifest-path src-tauri/Cargo.toml --bin export-types",
+    "desktop:test:build": "node scripts/tool.mjs tauri build --debug --no-bundle --features native-test",
+    "test:native": "node scripts/native-test.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
@@ -28,6 +30,7 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.56.0",
     "@tauri-apps/cli": "^2.9.0",
     "@types/luxon": "^3.7.1",
@@ -38,6 +41,7 @@
     "prettier": "3.6.2",
     "typescript": "~5.9.3",
     "vite": "^7.1.7",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "webdriverio": "^10.0.2"
   }
 }

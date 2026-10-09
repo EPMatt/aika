@@ -40,3 +40,7 @@ System appearance; month on first launch; remember last view/sidebar/appearance 
 Phase 3 was delivered in `433172a`: native IPC remains the production data path, and gestures reuse normalized event CRUD and session undo. All-day spans and collision lanes are renderer-derived layout. Gesture wall times are resolved before constructing instants; failed writes retain committed data. See `docs/architecture.md` for the decision rationale and `docs/handoffs/phase-3.md` for checks and remaining platform limits.
 
 Phase 4 is next. Establish provider dispatch and credential boundaries behind the existing service, and verify native input/accessibility on the supported platforms. Preserve the distinction between renderer/mocked-IPC tests, actual SQLite tests, and embedded native automation when assessing the exit gate.
+
+## Implementation status after phase 4
+
+Provider dispatch now sits behind the unchanged IPC service. Production registers only the local SQLite adapter; a second adapter is confined to Rust tests. Read-only capabilities and calendar identity are enforced in the backend and reflected in the same renderer. Credentials use persistent OS stores without fallback or renderer exposure. Embedded native automation is confined to an explicit debug test feature; Linux CI includes it without re-enabling Windows/macOS jobs. See `docs/handoffs/phase-4.md` and `docs/quality.md` for the results and the remaining manual/platform gate. Phase 5 packaging can be prepared, but cross-platform/manual quality evidence is still required for alpha acceptance.

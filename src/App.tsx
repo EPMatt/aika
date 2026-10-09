@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent, KeyboardEvent, MouseEvent } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -19,6 +19,7 @@ import {
 import { DateTime } from 'luxon';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { AppInfo } from './generated/AppInfo';
+import type { Calendar } from './generated/Calendar';
 import type { CalendarEvent } from './generated/CalendarEvent';
 import {
   dateKey,
@@ -38,6 +39,15 @@ import type { Appearance, View } from './calendar';
 import type { PrototypeRepository } from './prototype';
 import { calendarClient, desktop, errorMessage, resolveWallTime } from './client';
 import type { ServiceError } from './generated/ServiceError';
+
+const defaultCalendar: Calendar = {
+  id: 'local-default',
+  providerId: 'local',
+  name: 'Personal',
+  color: '#718675',
+  writable: true,
+};
+const CalendarContext = createContext(defaultCalendar);
 
 const HOUR_HEIGHT = 72;
 const DRAG_TYPE = 'application/x-cal-event';
@@ -145,11 +155,12 @@ function EventChip({
   compact?: boolean;
   day?: DateTime;
 }) {
+  const calendar = useContext(CalendarContext);
   return (
     <button
       type="button"
       className={`event-chip ${event.time.kind === 'allDay' ? 'all-day-chip' : ''} ${compact ? 'compact' : ''}`}
-      draggable
+      draggable={calendar.writable}
       onDragStart={(e) => {
         e.dataTransfer.setData(DRAG_TYPE, event.id);
         e.dataTransfer.effectAllowed = 'move';
@@ -192,6 +203,7 @@ function MonthView({
   onEdit: (event: CalendarEvent, anchor: HTMLElement) => void;
   onMove: (id: string, date: DateTime, precise?: boolean) => void;
 }) {
+  const calendar = useContext(CalendarContext);
   const days = monthDays(date);
   const [overflow, setOverflow] = useState<string | null>(null);
   const [capacity, setCapacity] = useState({ full: 3, overflow: 2 });
@@ -254,7 +266,7 @@ function MonthView({
     }
   };
   return (
-    <div className="month-view" aria-label="Month calendar">
+    <div className="month-view" role="region" aria-label="Month calendar">
       <div className="weekday-heading">
         {days.slice(0, 7).map((day) => (
           <span key={day.weekday}>{day.toFormat('ccc')}</span>
@@ -280,13 +292,16 @@ function MonthView({
               onMove(e.dataTransfer.getData(DRAG_TYPE), days[row * 7 + column]);
             }}
           >
-            <div className="month-spans" aria-label="All-day events">
+            <div className="month-spans">
               {layoutAllDaySpans(events, days.slice(row * 7, row * 7 + 7))
                 .filter((span) => span.lane < capacity.overflow)
                 .map(({ event, start, end, lane }) => (
                   <div
                     key={event.id}
                     className="month-span"
+                    role="gridcell"
+                    aria-colindex={start + 1}
+                    aria-colspan={end - start}
                     style={{ gridColumn: `${start + 1} / ${end + 1}`, gridRow: lane + 1 }}
                   >
                     <EventChip event={event} day={days[row * 7 + start]} onClick={onEdit} />
@@ -329,7 +344,12 @@ function MonthView({
                   className={`month-cell ${day.month !== date.month ? 'outside' : ''} ${day.hasSame(today, 'day') ? 'is-today' : ''} ${rangeStart.current && rangeEnd && key >= [dateKey(rangeStart.current), rangeEnd].sort()[0] && key <= [dateKey(rangeStart.current), rangeEnd].sort()[1] ? 'range-selected' : ''}`}
                   onKeyDown={(e) => keyNavigate(e, day)}
                   onPointerDown={(e) => {
-                    if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return;
+                    if (
+                      !calendar.writable ||
+                      e.button !== 0 ||
+                      (e.target as HTMLElement).closest('button')
+                    )
+                      return;
                     rangeStart.current = day;
                     e.currentTarget.setPointerCapture(e.pointerId);
                   }}
@@ -483,6 +503,7 @@ function TimeView({
   const [selection, setSelection] = useState<{ day: string; start: number; end: number } | null>(
     null,
   );
+  const calendar = useContext(CalendarContext);
   const gesture = useRef<{ start: number; y: number; id?: string } | null>(null);
   const suppressClick = useRef(false);
   useEffect(() => {
@@ -531,6 +552,7 @@ function TimeView({
     <div
       className="time-view"
       style={countStyle}
+      role="region"
       aria-label={`${view === 'week' ? 'Week' : 'Day'} calendar`}
     >
       {gestureFailure && (
@@ -633,7 +655,7 @@ function TimeView({
                 }
               }}
               onPointerDown={(e) => {
-                if (e.button !== 0) return;
+                if (!calendar.writable || e.button !== 0) return;
                 const handle = (e.target as HTMLElement).closest<HTMLElement>('[data-resize]');
                 if (!handle && (e.target as HTMLElement).closest('button')) return;
                 gesture.current = {
@@ -710,7 +732,7 @@ function TimeView({
                 <button
                   key={event.id}
                   className="time-event"
-                  draggable
+                  draggable={calendar.writable}
                   title={event.title}
                   aria-label={`${event.title}, ${event.time.kind === 'timed' ? timeLabel(event.time.start) : 'all day'}`}
                   style={{
@@ -738,7 +760,9 @@ function TimeView({
                       ? `${timeLabel(event.time.start)} – ${timeLabel(event.time.end)}`
                       : ''}
                   </span>
-                  <span className="resize-handle" data-resize={event.id} aria-hidden="true" />
+                  {calendar.writable && (
+                    <span className="resize-handle" data-resize={event.id} aria-hidden="true" />
+                  )}
                   {event.location && end - start >= 90 && (
                     <span className="time-event-location">
                       <MapPin size={11} />
@@ -782,6 +806,7 @@ function EventEditor({
   onDelete: () => Promise<void>;
   onClose: () => void;
 }) {
+  const calendar = useContext(CalendarContext);
   const [title, setTitle] = useState(event.title);
   const [allDay, setAllDay] = useState(event.time.kind === 'allDay');
   const start =
@@ -807,7 +832,7 @@ function EventEditor({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (busy) return;
+    if (busy || !calendar.writable) return;
     if (!title.trim()) {
       setError('Give your event a title.');
       return;
@@ -848,9 +873,14 @@ function EventEditor({
 
   return (
     <form className="editor" onSubmit={submit}>
-      <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+      <fieldset
+        disabled={busy || !calendar.writable}
+        style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
+      >
         <div className="editor-heading">
-          <span className="eyebrow">{existing ? 'Edit event' : 'New event'}</span>
+          <span className="eyebrow">
+            {!calendar.writable ? 'Event details' : existing ? 'Edit event' : 'New event'}
+          </span>
           <IconButton label="Close event editor" onClick={onClose}>
             <X size={16} />
           </IconButton>
@@ -866,8 +896,10 @@ function EventEditor({
         />
         <div className="editor-calendar">
           <span className="event-dot" />
-          <span>Personal</span>
-          <span className="muted">Local calendar</span>
+          <span>{calendar.name}</span>
+          <span className="muted">
+            {calendar.writable ? 'Editable calendar' : 'Read-only calendar'}
+          </span>
         </div>
         <div className="editor-rule" />
         <div className="all-day-control">
@@ -1050,6 +1082,11 @@ function EventEditor({
           </div>
         </div>
       </fieldset>
+      {!calendar.writable && (
+        <button type="button" className="text-button" onClick={onClose}>
+          Close
+        </button>
+      )}
     </form>
   );
 }
@@ -1069,6 +1106,8 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [settings, setSettings] = useState(false);
   const [runtime, setRuntime] = useState('browser');
 
+  const [calendar, setCalendar] = useState<Calendar>(defaultCalendar);
+  const [calendarReady, setCalendarReady] = useState(!desktop);
   const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
   const [editing, setEditing] = useState<{ event: CalendarEvent; existing: boolean } | null>(null);
   const editorAnchor = useRef<HTMLElement | null>(null);
@@ -1116,6 +1155,8 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       })
       .then((snapshot) => {
         if (token !== requestVersion.current) return;
+        setCalendar(snapshot.calendar);
+        setCalendarReady(true);
         setEvents(snapshot.events);
         setCanUndo(snapshot.canUndo);
         setFailure('');
@@ -1163,13 +1204,14 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   };
   const create = useCallback(
     (day: DateTime, anchor: HTMLElement, allDay = false, end?: DateTime) => {
+      if (!calendarReady || !calendar.writable) return;
       editorAnchor.current = anchor;
-      const event = makeEvent(day, allDay);
+      const event = { ...makeEvent(day, allDay), calendarId: calendar.id };
       if (end && event.time.kind === 'timed') event.time.end = end.toUTC().toISO()!;
       if (end && event.time.kind === 'allDay') event.time.endDate = dateKey(end);
       setEditing({ event, existing: false });
     },
-    [],
+    [calendar, calendarReady],
   );
   const edit = (event: CalendarEvent, anchor: HTMLElement) => {
     editorAnchor.current = anchor;
@@ -1177,7 +1219,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   };
   const move = async (id: string, target: DateTime, precise = false) => {
     const event = events.find((item) => item.id === id);
-    if (!event) return;
+    if (!event || !calendar.writable) return;
     try {
       const moved = moveEvent(event, target);
       if (event.time.kind === 'timed' && moved.time.kind === 'timed') {
@@ -1203,7 +1245,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   };
   const resize = async (id: string, target: DateTime) => {
     const event = events.find((item) => item.id === id);
-    if (!event || event.time.kind !== 'timed') return;
+    if (!event || !calendar.writable || event.time.kind !== 'timed') return;
     try {
       const end = await resolveWallTime(`${dateKey(target)}T${target.toFormat('HH:mm')}`);
       if (DateTime.fromISO(end).toMillis() <= DateTime.fromISO(event.time.start).toMillis())
@@ -1268,266 +1310,271 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const week = weekStart(date, firstWeekday());
 
   return (
-    <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'}`} data-runtime={runtime}>
-      {sidebar && (
-        <aside className="sidebar">
-          <div className="sidebar-brand">
-            <span className="wordmark">aika</span>
-            <IconButton label="Hide sidebar" onClick={() => setSidebar(false)}>
-              <PanelLeft size={17} />
-            </IconButton>
-          </div>
-          <div className="sidebar-date">
-            <div>{today.toFormat('cccc, LLLL d')}</div>
-          </div>
-          <MiniCalendar selected={date} today={today} onSelect={setDate} />
-          <div className="calendar-list">
-            <div className="section-label">Your calendars</div>
-            <button
-              className="calendar-toggle"
-              aria-pressed={visible}
-              onClick={() => setVisible(!visible)}
-            >
-              <span className={`calendar-check ${visible ? 'checked' : ''}`}>
-                {visible && <Check size={11} strokeWidth={3} />}
-              </span>
-              <span>Personal</span>
-              <span className="calendar-local">Local</span>
-            </button>
-          </div>
-          <div className="sidebar-bottom">
-            <div className="sidebar-footer">
-              <IconButton label="Open settings" onClick={() => setSettings(true)}>
-                <Settings2 size={16} />
+    <CalendarContext.Provider value={calendar}>
+      <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'}`} data-runtime={runtime}>
+        {sidebar && (
+          <aside className="sidebar">
+            <div className="sidebar-brand">
+              <span className="wordmark">aika</span>
+              <IconButton label="Hide sidebar" onClick={() => setSidebar(false)}>
+                <PanelLeft size={17} />
               </IconButton>
             </div>
-          </div>
-        </aside>
-      )}
-      <main className="main-content">
-        <header className="toolbar">
-          <div className="toolbar-start">
-            {!sidebar && (
-              <IconButton label="Show sidebar" onClick={() => setSidebar(true)}>
-                <PanelLeft size={18} />
-              </IconButton>
-            )}
-            <div className="heading">
-              <h1 aria-label={`${heading} ${subheading}`}>
-                {heading}
-                <span>{subheading}</span>
-              </h1>
-              {view === 'week' && (
-                <p>
-                  {week.toFormat('LLL d')} – {week.plus({ days: 6 }).toFormat('LLL d')}
-                </p>
-              )}
+            <div className="sidebar-date">
+              <div>{today.toFormat('cccc, LLLL d')}</div>
             </div>
-            <div className="navigation">
-              <button className="today-button" onClick={() => setDate(today)}>
-                Today
+            <MiniCalendar selected={date} today={today} onSelect={setDate} />
+            <div className="calendar-list">
+              <div className="section-label">Your calendars</div>
+              <button
+                className="calendar-toggle"
+                aria-pressed={visible}
+                onClick={() => setVisible(!visible)}
+              >
+                <span className={`calendar-check ${visible ? 'checked' : ''}`}>
+                  {visible && <Check size={11} strokeWidth={3} />}
+                </span>
+                <span>{calendar.name}</span>
+                <span className="calendar-local">
+                  {calendar.writable ? 'Editable' : 'Read only'}
+                </span>
               </button>
-              <IconButton label={`Previous ${view}`} onClick={() => navigate(-1)}>
-                <ChevronLeft size={17} />
-              </IconButton>
-              <IconButton label={`Next ${view}`} onClick={() => navigate(1)}>
-                <ChevronRight size={17} />
-              </IconButton>
             </div>
-          </div>
-          <div className="toolbar-end">
-            <div className="view-switcher" aria-label="Calendar view">
-              {(['month', 'week', 'day'] as const).map((item) => (
-                <button key={item} aria-pressed={view === item} onClick={() => setView(item)}>
-                  {item[0].toUpperCase() + item.slice(1)}
-                </button>
-              ))}
+            <div className="sidebar-bottom">
+              <div className="sidebar-footer">
+                <IconButton label="Open settings" onClick={() => setSettings(true)}>
+                  <Settings2 size={16} />
+                </IconButton>
+              </div>
             </div>
-            <button
-              className="new-event-button"
-              ref={newButton}
-              aria-label="New event"
-              onClick={(e) => create(date.set({ hour: 9 }), e.currentTarget)}
-            >
-              <Plus size={16} />
-              <span>New event</span>
-            </button>
-          </div>
-        </header>
-        {(failure || preferenceFailure) && (
-          <div role="alert" className="editor-error">
-            {failure || preferenceFailure}{' '}
-            <button
-              onClick={() => {
-                setRevision((value) => value + 1);
-                if (!ready)
-                  calendarClient
-                    .preferences()
-                    .then((p) => {
-                      setView(p.view as View);
-                      setSidebar(p.sidebar);
-                      setAppearance(p.appearance as Appearance);
-                      setReady(true);
-                      setPreferenceFailure('');
-                    })
-                    .catch((err) => setPreferenceFailure(errorMessage(err)));
-                else if (preferenceFailure)
-                  calendarClient
-                    .setPreferences({ appearance, view, sidebar })
-                    .then(() => setPreferenceFailure(''))
-                    .catch((err) => setPreferenceFailure(errorMessage(err)));
-              }}
-            >
-              Retry
-            </button>
-          </div>
+          </aside>
         )}
-        <div className="calendar-surface">
-          {view === 'month' ? (
-            <MonthView
-              date={date}
-              today={today}
-              events={shownEvents}
-              onSelect={setDate}
-              onCreate={create}
-              onEdit={edit}
-              onMove={move}
-            />
-          ) : (
-            <TimeView
-              date={date}
-              today={today}
-              view={view}
-              events={shownEvents}
-              onCreate={create}
-              onEdit={edit}
-              onMove={move}
-              onResize={resize}
-            />
-          )}
-        </div>
-        <footer className="main-footer">
-          <span>
-            {selectedCount === 0
-              ? `No events on ${date.toFormat('LLL d')}`
-              : `${selectedCount} ${selectedCount === 1 ? 'event' : 'events'} on ${date.toFormat('LLL d')}`}
-          </span>
-          <div>
-            {canUndo && (
-              <button className="undo-button" onClick={undo}>
-                <Undo2 size={13} />
-                Undo
+        <main className="main-content">
+          <header className="toolbar">
+            <div className="toolbar-start">
+              {!sidebar && (
+                <IconButton label="Show sidebar" onClick={() => setSidebar(true)}>
+                  <PanelLeft size={18} />
+                </IconButton>
+              )}
+              <div className="heading">
+                <h1 aria-label={`${heading} ${subheading}`}>
+                  {heading}
+                  <span>{subheading}</span>
+                </h1>
+                {view === 'week' && (
+                  <p>
+                    {week.toFormat('LLL d')} – {week.plus({ days: 6 }).toFormat('LLL d')}
+                  </p>
+                )}
+              </div>
+              <div className="navigation">
+                <button className="today-button" onClick={() => setDate(today)}>
+                  Today
+                </button>
+                <IconButton label={`Previous ${view}`} onClick={() => navigate(-1)}>
+                  <ChevronLeft size={17} />
+                </IconButton>
+                <IconButton label={`Next ${view}`} onClick={() => navigate(1)}>
+                  <ChevronRight size={17} />
+                </IconButton>
+              </div>
+            </div>
+            <div className="toolbar-end">
+              <div className="view-switcher" role="group" aria-label="Calendar view">
+                {(['month', 'week', 'day'] as const).map((item) => (
+                  <button key={item} aria-pressed={view === item} onClick={() => setView(item)}>
+                    {item[0].toUpperCase() + item.slice(1)}
+                  </button>
+                ))}
+              </div>
+              <button
+                className="new-event-button"
+                ref={newButton}
+                disabled={!calendarReady || !calendar.writable}
+                aria-label="New event"
+                onClick={(e) => create(date.set({ hour: 9 }), e.currentTarget)}
+              >
+                <Plus size={16} />
+                <span>New event</span>
               </button>
-            )}
-            <span className="footer-zone">{DateTime.local().zoneName?.replaceAll('_', ' ')}</span>
-          </div>
-        </footer>
-      </main>
-      <Popover.Root
-        open={Boolean(editing)}
-        onOpenChange={(open) => {
-          if (!open && !mutating) setEditing(null);
-        }}
-      >
-        <Popover.Anchor virtualRef={editorAnchor} />
-        <Popover.Portal>
-          <Popover.Content
-            className="event-popover"
-            side="right"
-            align="start"
-            sideOffset={12}
-            collisionPadding={18}
-            onOpenAutoFocus={(e) => {
-              e.preventDefault();
-              requestAnimationFrame(() =>
-                document.querySelector<HTMLInputElement>('.event-title-input')?.focus(),
-              );
-            }}
-            onCloseAutoFocus={(e) => {
-              e.preventDefault();
-              editorAnchor.current?.focus();
-            }}
-            aria-label="Event editor"
-          >
-            {editing && (
-              <EventEditor
-                key={editing.event.id}
-                event={editing.event}
-                existing={editing.existing}
-                onClose={() => setEditing(null)}
-                onSave={async (event) => {
-                  setMutating(true);
-                  try {
-                    if (desktop) await calendarClient.save(event, editing.existing);
-                    else repository!.save(event);
-                    setEditing(null);
-                    refresh(editing.existing ? 'Event updated.' : 'Event created.');
-                  } finally {
-                    setMutating(false);
-                  }
+            </div>
+          </header>
+          {(failure || preferenceFailure) && (
+            <div role="alert" className="editor-error">
+              {failure || preferenceFailure}{' '}
+              <button
+                onClick={() => {
+                  setRevision((value) => value + 1);
+                  if (!ready)
+                    calendarClient
+                      .preferences()
+                      .then((p) => {
+                        setView(p.view as View);
+                        setSidebar(p.sidebar);
+                        setAppearance(p.appearance as Appearance);
+                        setReady(true);
+                        setPreferenceFailure('');
+                      })
+                      .catch((err) => setPreferenceFailure(errorMessage(err)));
+                  else if (preferenceFailure)
+                    calendarClient
+                      .setPreferences({ appearance, view, sidebar })
+                      .then(() => setPreferenceFailure(''))
+                      .catch((err) => setPreferenceFailure(errorMessage(err)));
                 }}
-                onDelete={async () => {
-                  setMutating(true);
-                  try {
-                    if (desktop) await calendarClient.delete(editing.event.id);
-                    else repository!.delete(editing.event.id);
-                    setEditing(null);
-                    refresh('Event deleted. Undo is available.');
-                  } finally {
-                    setMutating(false);
-                  }
-                }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          <div className="calendar-surface">
+            {view === 'month' ? (
+              <MonthView
+                date={date}
+                today={today}
+                events={shownEvents}
+                onSelect={setDate}
+                onCreate={create}
+                onEdit={edit}
+                onMove={move}
+              />
+            ) : (
+              <TimeView
+                date={date}
+                today={today}
+                view={view}
+                events={shownEvents}
+                onCreate={create}
+                onEdit={edit}
+                onMove={move}
+                onResize={resize}
               />
             )}
-          </Popover.Content>
-        </Popover.Portal>
-      </Popover.Root>
-      <Dialog.Root open={settings} onOpenChange={setSettings}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="dialog-overlay" />
-          <Dialog.Content className="settings-dialog" aria-describedby={undefined}>
-            <div className="settings-heading">
-              <Dialog.Title>Settings</Dialog.Title>
-              <Dialog.Close asChild>
-                <button className="icon-button" aria-label="Close settings">
-                  <X size={17} />
+          </div>
+          <footer className="main-footer">
+            <span>
+              {selectedCount === 0
+                ? `No events on ${date.toFormat('LLL d')}`
+                : `${selectedCount} ${selectedCount === 1 ? 'event' : 'events'} on ${date.toFormat('LLL d')}`}
+            </span>
+            <div>
+              {canUndo && (
+                <button className="undo-button" onClick={undo}>
+                  <Undo2 size={13} />
+                  Undo
                 </button>
-              </Dialog.Close>
+              )}
+              <span className="footer-zone">{DateTime.local().zoneName?.replaceAll('_', ' ')}</span>
             </div>
-            <div className="settings-row">
-              <span>Appearance</span>
-              <select
-                aria-label="Appearance preference"
-                value={appearance}
-                onChange={(e) => setAppearance(e.target.value as Appearance)}
-              >
-                <option value="system">Follow system</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-              </select>
-            </div>
-            <p className="settings-footnote">
-              N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes. Enter
-              opens a focused event to edit its dates and times. Enter on a calendar date or time
-              column creates an event. Arrow keys navigate month dates.
-            </p>
-            <div className="settings-row">
-              <span>Time zone</span>
-              <span className="muted">{DateTime.local().zoneName}</span>
-            </div>
-            <div className="settings-row">
-              <span>Region</span>
-              <span className="muted">{resolveLocale()}</span>
-            </div>
-            <p className="settings-footnote">
-              Dates and times follow your device’s regional preferences.
-            </p>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
-      <div className="sr-only" role="status" aria-live="polite">
-        {announcement}
+          </footer>
+        </main>
+        <Popover.Root
+          open={Boolean(editing)}
+          onOpenChange={(open) => {
+            if (!open && !mutating) setEditing(null);
+          }}
+        >
+          <Popover.Anchor virtualRef={editorAnchor} />
+          <Popover.Portal>
+            <Popover.Content
+              className="event-popover"
+              side="right"
+              align="start"
+              sideOffset={12}
+              collisionPadding={18}
+              onOpenAutoFocus={(e) => {
+                e.preventDefault();
+                requestAnimationFrame(() =>
+                  document.querySelector<HTMLInputElement>('.event-title-input')?.focus(),
+                );
+              }}
+              onCloseAutoFocus={(e) => {
+                e.preventDefault();
+                editorAnchor.current?.focus();
+              }}
+              aria-label="Event editor"
+            >
+              {editing && (
+                <EventEditor
+                  key={editing.event.id}
+                  event={editing.event}
+                  existing={editing.existing}
+                  onClose={() => setEditing(null)}
+                  onSave={async (event) => {
+                    setMutating(true);
+                    try {
+                      if (desktop) await calendarClient.save(event, editing.existing);
+                      else repository!.save(event);
+                      setEditing(null);
+                      refresh(editing.existing ? 'Event updated.' : 'Event created.');
+                    } finally {
+                      setMutating(false);
+                    }
+                  }}
+                  onDelete={async () => {
+                    setMutating(true);
+                    try {
+                      if (desktop) await calendarClient.delete(editing.event.id);
+                      else repository!.delete(editing.event.id);
+                      setEditing(null);
+                      refresh('Event deleted. Undo is available.');
+                    } finally {
+                      setMutating(false);
+                    }
+                  }}
+                />
+              )}
+            </Popover.Content>
+          </Popover.Portal>
+        </Popover.Root>
+        <Dialog.Root open={settings} onOpenChange={setSettings}>
+          <Dialog.Portal>
+            <Dialog.Overlay className="dialog-overlay" />
+            <Dialog.Content className="settings-dialog" aria-describedby={undefined}>
+              <div className="settings-heading">
+                <Dialog.Title>Settings</Dialog.Title>
+                <Dialog.Close asChild>
+                  <button className="icon-button" aria-label="Close settings">
+                    <X size={17} />
+                  </button>
+                </Dialog.Close>
+              </div>
+              <div className="settings-row">
+                <span>Appearance</span>
+                <select
+                  aria-label="Appearance preference"
+                  value={appearance}
+                  onChange={(e) => setAppearance(e.target.value as Appearance)}
+                >
+                  <option value="system">Follow system</option>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                </select>
+              </div>
+              <p className="settings-footnote">
+                N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes.
+                Enter opens a focused event to edit its dates and times. Enter on a calendar date or
+                time column creates an event. Arrow keys navigate month dates.
+              </p>
+              <div className="settings-row">
+                <span>Time zone</span>
+                <span className="muted">{DateTime.local().zoneName}</span>
+              </div>
+              <div className="settings-row">
+                <span>Region</span>
+                <span className="muted">{resolveLocale()}</span>
+              </div>
+              <p className="settings-footnote">
+                Dates and times follow your device’s regional preferences.
+              </p>
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
+        <div className="sr-only" role="status" aria-live="polite">
+          {announcement}
+        </div>
       </div>
-    </div>
+    </CalendarContext.Provider>
   );
 }

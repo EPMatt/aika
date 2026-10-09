@@ -5,7 +5,7 @@ test('renders when a desktop webview exposes a POSIX locale', async ({ page }) =
     Object.defineProperty(navigator, 'language', { value: 'en_US.UTF-8' }),
   );
   await page.goto('/?date=2026-10-09&theme=light');
-  await expect(page.getByRole('gridcell')).toHaveCount(42);
+  await expect(page.locator('.month-cell[role="gridcell"]')).toHaveCount(42);
   await page.getByRole('button', { name: 'New event' }).click();
   await expect(page.getByRole('textbox', { name: 'Event title' })).toBeVisible();
 });
@@ -15,7 +15,7 @@ test('renders all views and both appearances without runtime errors', async ({ p
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/?date=2026-10-09&theme=light');
   await expect(page.getByRole('heading', { name: 'October 2026' })).toBeVisible();
-  await expect(page.getByRole('gridcell')).toHaveCount(42);
+  await expect(page.locator('.month-cell[role="gridcell"]')).toHaveCount(42);
   await page.getByRole('button', { name: 'Week', exact: true }).click();
   await expect(page.getByLabel('Week calendar')).toBeVisible();
   await page.getByRole('button', { name: 'Day', exact: true }).click();

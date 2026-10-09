@@ -86,11 +86,68 @@ pub fn resolve_local(local: &str, time_zone: &str, offset: Option<i32>) -> Resul
     Ok(iso(chosen.with_timezone(&Utc)))
 }
 
-pub struct CalendarService {
+/// Shared normalized validation used before provider dispatch.
+pub(crate) fn validate_event(mut event: CalendarEvent) -> Result<CalendarEvent> {
+    if uuid::Uuid::parse_str(&event.id).is_err() {
+        return Err(error("validation", "Invalid event identity."));
+    }
+    event.title = event.title.trim().into();
+    if event.title.is_empty() || event.title.chars().count() > 300 {
+        return Err(error("validation", "Enter a title of 1 to 300 characters."));
+    }
+    match &mut event.time {
+        EventTime::Timed {
+            start,
+            end,
+            time_zone,
+        } => {
+            zone(time_zone)?;
+            let from = instant(start)?;
+            let until = instant(end)?;
+            if until <= from {
+                return Err(error("validation", "The event must end after it starts."));
+            }
+            *start = iso(from);
+            *end = iso(until);
+        }
+        EventTime::AllDay {
+            start_date,
+            end_date,
+        } => {
+            if date(end_date)? <= date(start_date)? {
+                return Err(error(
+                    "validation",
+                    "The exclusive end date must follow the start date.",
+                ));
+            }
+        }
+    }
+    Ok(event)
+}
+pub(crate) fn validate_range(range: &EventRange) -> Result<()> {
+    let start = instant(&range.start)?;
+    let end = instant(&range.end)?;
+    let dates = date(&range.end_date)?
+        .signed_duration_since(date(&range.start_date)?)
+        .num_days();
+    if end <= start
+        || dates <= 0
+        || dates > 366
+        || end.signed_duration_since(start).num_hours() > 24 * 367
+    {
+        return Err(error(
+            "validation",
+            "Choose an event range of at most 366 days.",
+        ));
+    }
+    Ok(())
+}
+
+pub struct LocalProvider {
     db: Connection,
     history: Vec<(String, Option<CalendarEvent>)>,
 }
-impl CalendarService {
+impl LocalProvider {
     pub fn open(path: &Path) -> Result<Self> {
         let mut db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -143,12 +200,13 @@ impl CalendarService {
         Ok(())
     }
     pub fn snapshot(&self, range: EventRange) -> Result<CalendarSnapshot> {
+        validate_range(&range)?;
         let start = instant(&range.start)?;
         let end = instant(&range.end)?;
         if end <= start || date(&range.end_date)? <= date(&range.start_date)? {
             return Err(error("validation", "Invalid event range."));
         }
-        let mut statement = self.db.prepare("SELECT payload FROM events WHERE (kind='timed' AND start < ?2 AND end > ?1) OR (kind='allDay' AND start < ?4 AND end > ?3) ORDER BY start,id")?;
+        let mut statement = self.db.prepare("SELECT payload FROM events WHERE calendar_id='local-default' AND ((kind='timed' AND start < ?2 AND end > ?1) OR (kind='allDay' AND start < ?4 AND end > ?3)) ORDER BY start,id")?;
         let rows = statement.query_map(
             params![iso(start), iso(end), range.start_date, range.end_date],
             |r| r.get::<_, String>(0),
@@ -171,7 +229,11 @@ impl CalendarService {
     fn get(&self, id: &str) -> Result<Option<CalendarEvent>> {
         let json: Option<String> = self
             .db
-            .query_row("SELECT payload FROM events WHERE id=?1", [id], |r| r.get(0))
+            .query_row(
+                "SELECT payload FROM events WHERE id=?1 AND calendar_id='local-default'",
+                [id],
+                |r| r.get(0),
+            )
             .optional()?;
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
@@ -184,44 +246,17 @@ impl CalendarService {
                 end_date,
             } => ("allDay", start_date, end_date),
         };
-        db.execute("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?])?;
+        let changed = db.execute("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload WHERE events.calendar_id=excluded.calendar_id", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?])?;
+        if changed != 1 {
+            return Err(error("conflict", "Event belongs to another calendar."));
+        }
         Ok(())
     }
     pub fn save(&mut self, mut event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
         if uuid::Uuid::parse_str(&event.id).is_err() || event.calendar_id != "local-default" {
             return Err(error("validation", "Invalid event or calendar identity."));
         }
-        event.title = event.title.trim().into();
-        if event.title.is_empty() || event.title.chars().count() > 300 {
-            return Err(error("validation", "Enter a title of 1 to 300 characters."));
-        }
-        match &mut event.time {
-            EventTime::Timed {
-                start,
-                end,
-                time_zone,
-            } => {
-                zone(time_zone)?;
-                let from = instant(start)?;
-                let until = instant(end)?;
-                if until <= from {
-                    return Err(error("validation", "The event must end after it starts."));
-                }
-                *start = iso(from);
-                *end = iso(until);
-            }
-            EventTime::AllDay {
-                start_date,
-                end_date,
-            } => {
-                if date(end_date)? <= date(start_date)? {
-                    return Err(error(
-                        "validation",
-                        "The exclusive end date must follow the start date.",
-                    ));
-                }
-            }
-        }
+        event = validate_event(event)?;
         let previous = self.get(&event.id)?;
         if existing != previous.is_some() {
             return Err(error(
@@ -260,6 +295,36 @@ impl CalendarService {
     }
 }
 
+/// Production facade keeps the renderer contract stable while dispatching providers.
+pub struct CalendarService {
+    providers: crate::providers::ProviderRegistry,
+}
+impl CalendarService {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut providers = crate::providers::ProviderRegistry::default();
+        providers.register(Box::new(LocalProvider::open(path)?))?;
+        Ok(Self { providers })
+    }
+    pub fn preferences(&self) -> Result<Preferences> {
+        self.providers.preferences()
+    }
+    pub fn set_preferences(&mut self, value: Preferences) -> Result<()> {
+        self.providers.set_preferences(value)
+    }
+    pub fn snapshot(&self, range: EventRange) -> Result<CalendarSnapshot> {
+        self.providers.snapshot("local-default", range)
+    }
+    pub fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
+        self.providers.save(event, existing)
+    }
+    pub fn delete(&mut self, id: &str) -> Result<()> {
+        self.providers.delete("local-default", id)
+    }
+    pub fn undo(&mut self) -> Result<()> {
+        self.providers.undo("local-default")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,8 +350,8 @@ mod tests {
             end_date: "2024-03-02".into(),
         }
     }
-    fn service() -> CalendarService {
-        CalendarService::open(Path::new(":memory:")).unwrap()
+    fn service() -> LocalProvider {
+        LocalProvider::open(Path::new(":memory:")).unwrap()
     }
     #[test]
     fn crud_restart_preferences_and_session_undo() {
@@ -298,13 +363,13 @@ mod tests {
             sidebar: false,
         };
         {
-            let mut s = CalendarService::open(&path).unwrap();
+            let mut s = LocalProvider::open(&path).unwrap();
             assert!(s.snapshot(range()).unwrap().events.is_empty());
             s.save(e.clone(), false).unwrap();
             s.set_preferences(preferences.clone()).unwrap();
         }
         {
-            let mut s = CalendarService::open(&path).unwrap();
+            let mut s = LocalProvider::open(&path).unwrap();
             assert_eq!(s.preferences().unwrap(), preferences);
             assert!(!s.snapshot(range()).unwrap().can_undo);
             let stored = s.snapshot(range()).unwrap().events.pop().unwrap();
@@ -321,7 +386,7 @@ mod tests {
             assert!(s.undo().is_err());
             s.delete(&e.id).unwrap();
         }
-        assert!(CalendarService::open(&path)
+        assert!(LocalProvider::open(&path)
             .unwrap()
             .snapshot(range())
             .unwrap()
@@ -386,7 +451,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aika-{}.sqlite3", uuid::Uuid::new_v4()));
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('preserve'); PRAGMA user_version=99;").unwrap();
-        assert!(CalendarService::open(&path).is_err());
+        assert!(LocalProvider::open(&path).is_err());
         assert_eq!(
             db.query_row("SELECT value FROM marker", [], |r| r.get::<_, String>(0))
                 .unwrap(),
@@ -394,7 +459,7 @@ mod tests {
         );
         db.execute_batch("PRAGMA user_version=0; CREATE TABLE events(id TEXT);")
             .unwrap();
-        assert!(CalendarService::open(&path).is_err());
+        assert!(LocalProvider::open(&path).is_err());
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
@@ -412,9 +477,37 @@ mod tests {
         drop(db);
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not a database").unwrap();
-        assert!(CalendarService::open(&path).is_err());
+        assert!(LocalProvider::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"not a database");
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn database_calendar_identity_isolation() {
+        let mut s = service();
+        let mut foreign = event();
+        foreign.calendar_id = "foreign".into();
+        s.db.execute("INSERT INTO calendars VALUES('foreign','Other')", [])
+            .unwrap();
+        LocalProvider::write(&s.db, &foreign).unwrap();
+        assert!(s.snapshot(range()).unwrap().events.is_empty());
+        assert!(s.delete(&foreign.id).is_err());
+        let mut impostor = foreign.clone();
+        impostor.calendar_id = "local-default".into();
+        assert!(s.save(impostor, false).is_err());
+        assert!(!s.snapshot(range()).unwrap().can_undo);
+        let stored: String =
+            s.db.query_row(
+                "SELECT payload FROM events WHERE id=?1",
+                [&foreign.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<CalendarEvent>(&stored)
+                .unwrap()
+                .calendar_id,
+            "foreign"
+        );
     }
     #[test]
     fn shared_wall_time_fixtures() {

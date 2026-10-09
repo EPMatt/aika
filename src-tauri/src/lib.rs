@@ -1,4 +1,6 @@
 pub mod contracts;
+pub mod credentials;
+pub mod providers;
 pub mod service;
 
 use contracts::*;
@@ -93,10 +95,21 @@ fn get_app_info() -> AppInfo {
     }
 }
 
+#[cfg(all(feature = "native-test", not(debug_assertions)))]
+compile_error!("native-test is restricted to debug test builds");
+
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "native-test")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+    builder
         .setup(|app| {
+            #[cfg(not(feature = "native-test"))]
             let directory = app.path().app_data_dir().map_err(|_| error("storage", "Could not locate application data."));
+            #[cfg(feature = "native-test")]
+            let directory = std::env::var_os("AIKA_TEST_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| error("storage", "Native tests require AIKA_TEST_DATA_DIR."));
             app.manage(Arc::new(Mutex::new(LocalState { directory, service: None })) as ServiceState);
             Ok(())
         })
