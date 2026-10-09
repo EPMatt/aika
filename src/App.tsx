@@ -560,7 +560,7 @@ function EventEditor({
   return (
     <form className="editor" onSubmit={submit}>
       <div className="editor-heading">
-        <span className="eyebrow">{existing ? 'Your event' : 'A little time for'}</span>
+        <span className="eyebrow">{existing ? 'Edit event' : 'New event'}</span>
         <IconButton label="Close event editor" onClick={onClose}>
           <X size={16} />
         </IconButton>
@@ -568,7 +568,7 @@ function EventEditor({
       <input
         className="event-title-input"
         aria-label="Event title"
-        placeholder="What’s on your mind?"
+        placeholder="Event title"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         maxLength={300}
@@ -660,7 +660,7 @@ function EventEditor({
               Location
             </span>
             <input
-              placeholder="Add a place"
+              placeholder="Location"
               value={location}
               onChange={(e) => setLocation(e.target.value)}
             />
@@ -668,7 +668,7 @@ function EventEditor({
           <label>
             <span>Notes</span>
             <textarea
-              placeholder="Anything you’d like to remember"
+              placeholder="Notes"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               rows={3}

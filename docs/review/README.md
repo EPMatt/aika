@@ -1,6 +1,8 @@
 # Phase 1 design review
 
-Interactive preview: http://127.0.0.1:1420. The images use sample data and a fixed October 9, 2026 review date.
+Current images were refreshed on October 9, 2026 after the aika rename, Settings-only appearance controls, and functional editor copy pass. Run `pnpm desktop` to review the native app.
+
+Browser review aid: http://127.0.0.1:1420. The images use sample data and a fixed October 9, 2026 review date.
 
 | View                  | Light                            | Dark                           |
 | --------------------- | -------------------------------- | ------------------------------ |

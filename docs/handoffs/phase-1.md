@@ -2,8 +2,13 @@
 
 Status: **ready for user review; design acceptance pending.** Phase 2 must wait for this gate, as agreed in the planning conversation.
 
+## Source and current review
+
+Base revision: `22f14fa` in the inherited parent repository. Phase-1 refinements are uncommitted. Latest decisions from the referenced planning task and `.ai/plans/aika.md` supersede the earlier Cal naming: visible branding is **aika**, appearance controls live only in Settings, and editor copy is functional. Linux CI uses ubuntu-latest; Windows/macOS matrix entries remain commented out.
+
 ## Delivered
 
+- Functional editor labels/placeholders, refreshed aika review images, and public plan/architecture documentation aligned with the latest decisions.
 - Custom month/week/day layouts with warm-neutral/sage light and dark themes, plus automatic system appearance.
 - Collapsible sidebar, mini calendar, one local-calendar visibility toggle, restrained toolbar, and Settings dialog.
 - Anchored editor with title, timed/all-day ranges, optional location/notes, save/cancel, and prototype delete/undo.
@@ -14,11 +19,10 @@ Status: **ready for user review; design acceptance pending.** Phase 2 must wait 
 ## Run and review
 
 ```sh
-pnpm dev
 pnpm desktop
 ```
 
-Browser preview: http://127.0.0.1:1420. Fixed review date: `/?date=2026-10-09`. Use `theme=light`, `theme=dark`, `scenario=empty`, or `scenario=dense` for repeatable scenes. The native shell runs the same UI in the OS webview.
+For a browser review aid, run `pnpm dev`: http://127.0.0.1:1420. Fixed review date: `/?date=2026-10-09`. Use `theme=light`, `theme=dark`, `scenario=empty`, or `scenario=dense` for repeatable scenes. The native shell runs the same UI in the OS webview.
 
 See [the screenshot gallery](../review/README.md). Review the balance of spacing and typography, palette, month/week/day readability, editor placement, crowded cells, overlapping events, and both themes. Approval may be given with specific refinements; record the accepted design before phase 2.
 
@@ -28,8 +32,13 @@ See [the screenshot gallery](../review/README.md). Review the balance of spacing
 pnpm build
 pnpm format:check
 pnpm test
+pnpm rust fmt --manifest-path src-tauri/Cargo.toml --check
+pnpm rust clippy --manifest-path src-tauri/Cargo.toml --all-targets --offline -- -D warnings
+pnpm desktop:build --debug --no-bundle
 CAL_CHROMIUM_PATH=/usr/bin/chromium pnpm test:ui
 ```
+
+Reverified October 9, 2026 on Linux. Browser checks required sandbox escalation because local port binding was denied (`listen EPERM`); the rerun passed. Native debug startup reported `rootChildren: 1` and `runtime: desktop`; the rebuilt aika window is open for review. The 13 current screenshots are preserved under `docs/review/`. Windows/macOS and hosted CI remain unverified.
 
 Results: **7 unit tests and 5 browser scenarios passed**, along with the production frontend build, formatting checks, Rust formatting, and Clippy with warnings denied. The unit suite covers locale normalization, six-week/leap-month boundaries, overlap lanes, touching events, overnight/exclusive all-day ranges, DST date spans, and undo snapshots. Browser scenarios cover POSIX-locale startup, three views, two themes and system changes, appearance persistence, sidebar controls, CRUD/notes/delete/undo, keyboard focus, dense overflow, reduced motion, and window sizing. Screenshots are renderer evidence; the separate native startup check confirms Linux mounting/IPC.
 

@@ -1,6 +1,6 @@
 # aika
 
-A desktop calendar with room to breathe. Tauri 2, React, TypeScript, and Rust.
+A desktop calendar. Tauri 2, React, TypeScript, and Rust.
 
 **Current milestone: phase 1 design prototype.** Events are sample data, and edits live only in memory. Reloading resets them. Appearance is saved on this device. This is not yet the persistent local-calendar alpha.
 
@@ -10,14 +10,10 @@ Use Node 24 LTS and pnpm 12.10.1:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm dev
-```
-
-Open http://127.0.0.1:1420. For the desktop application, install Rust 1.99.0 and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/), then run:
-
-```sh
 pnpm desktop
 ```
+
+Desktop development requires Rust 1.99.0 and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). For a browser preview, run `pnpm dev` and open http://127.0.0.1:1420.
 
 The tooling wrapper also detects a workspace-local Rust installation in `.tools/`. It does not alter global shell configuration. This workspace already has that installation; on another machine use the normal Rust toolchain setup.
 

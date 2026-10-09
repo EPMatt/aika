@@ -43,11 +43,13 @@ test('creates, edits, deletes, and undoes events through the editor', async ({ p
   await page.getByRole('button', { name: 'New event' }).click();
   await page.getByRole('textbox', { name: 'Event title' }).fill('A considered afternoon');
   await page.getByRole('button', { name: 'Add location or notes' }).click();
-  await page.getByPlaceholder('Add a place').fill('At the studio');
-  await page.getByPlaceholder('Anything you’d like to remember').fill('Bring the sketchbook');
+  await page.getByRole('textbox', { name: 'Location', exact: true }).fill('At the studio');
+  await page.getByRole('textbox', { name: 'Notes', exact: true }).fill('Bring the sketchbook');
   await page.getByRole('button', { name: 'Create event', exact: true }).click();
   await page.getByRole('button', { name: /A considered afternoon,/ }).click();
-  await expect(page.getByPlaceholder('Add a place')).toHaveValue('At the studio');
+  await expect(page.getByRole('textbox', { name: 'Location', exact: true })).toHaveValue(
+    'At the studio',
+  );
   await page.getByRole('textbox', { name: 'Event title' }).fill('A lovely afternoon');
   await page.getByRole('button', { name: 'Save changes' }).click();
   await page.getByRole('button', { name: /A lovely afternoon,/ }).click();
@@ -89,7 +91,7 @@ test('captures the review scenes', async ({ page }, testInfo) => {
       });
     }
     await page.getByRole('button', { name: 'New event' }).click();
-    await page.getByRole('textbox', { name: 'Event title' }).fill('A little time for yourself');
+    await page.getByRole('textbox', { name: 'Event title' }).fill('Project planning');
     await page.screenshot({
       path: testInfo.outputPath(`editor-${theme}.png`),
       animations: 'disabled',

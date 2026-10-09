@@ -1,12 +1,12 @@
-# Cal implementation plan
+# aika implementation plan
 
 ## Agreed product
 
-Personal desktop alpha for Windows 11 x64, macOS 14+ Intel/Apple Silicon, and Linux x64 (Ubuntu 24.04+ and Arch). Tauri 2 + React/TypeScript, Rust backend. Custom calendar views and a distinct warm-neutral/sage visual identity. Spacious, minimal, premium UI. Light, dark, and system appearance from v0.
+Personal desktop alpha for Windows 11 x64, macOS 14+ Intel/Apple Silicon, and Linux x64 (Ubuntu 24.04+ and Arch). Tauri 2 + React/TypeScript, Rust backend. Custom calendar views and a distinct warm-neutral/sage visual identity. Spacious, minimal, premium UI. Light, dark, and system appearance from v0, controlled only from Settings. The sidebar footer contains only Settings. Use functional copy throughout.
 
 One local calendar; month/week/day; title, start/end, timed/all-day, optional location and plain-text notes. Anchored editor, collapsible sidebar, mini calendar, drag manipulation with keyboard alternatives, and undo. English UI with OS/webview regional formatting and week start. Follow the device zone: retain timed instants and all-day dates.
 
-Exclude recurrence, reminders, search, backup/restore, ICS exchange, multiple user-created calendars, connected accounts, application servers, analytics, auto-updates, and paid signing from v0. Private alpha installers use ad-hoc macOS signing. Working name Cal; identifier `dev.projectcal.desktop`.
+Exclude recurrence, reminders, search, backup/restore, ICS exchange, multiple user-created calendars, connected accounts, application servers, analytics, auto-updates, and paid signing from v0. Private alpha installers use ad-hoc macOS signing. App name aika; identifier `dev.projectcal.desktop`.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ Credential service uses macOS Keychain, Windows Credential Store, and Linux Secr
 
 ## Phases and exit gates
 
-0. **Foundation:** scaffold, toolchain pinning, typed contracts, least-privilege shell, reproducible local build, four-target CI artifact workflow. Exit: launchable shell and target build evidence; report any unexecuted external checks explicitly.
+0. **Foundation:** scaffold, toolchain pinning, typed contracts, least-privilege shell, reproducible local build, Linux CI artifact workflow on ubuntu-latest (Windows/macOS entries remain commented out). Exit: launchable shell and target build evidence; report any unexecuted external checks explicitly.
 1. **Design:** interactive sample-data prototype, three views, editor, two themes, empty/dense/overlap/multi-day layouts, responsive desktop sizing, focus and reduced motion. Exit: user accepts visual direction and interaction flows. **User gate.**
 2. **Local domain:** default calendar, Rust validation, SQLite persistence/migrations, preferences, session undo, IPC. Handle DST gaps/ambiguity explicitly and keep failed editor input. Exit: CRUD/restart/undo/range/time-zone integration tests pass.
 3. **Calendar experience:** bind UI to IPC; complete navigation, editing, drag creation/moving/resizing, keyboard alternatives, overflow, all-day spans, now indicator. Exit: essential actions work with mouse and keyboard, persist, and recover from failures.
