@@ -4,7 +4,7 @@ Status: **implemented and verified locally on Linux.** The user’s October 9, 2
 
 ## Source and scope
 
-Base revision: `c1b7fdf` in the inherited `/home/srvadmin/Documents` Git repository. This handoff ships in the phase-2 commit. The pre-existing `.gitignore` modification and sibling projects are excluded from that commit.
+Base revision: `c1b7fdf` in the inherited `/home/srvadmin/Documents` Git repository. Implementation revision: `1ce59e4`. This handoff shipped in that phase-2 commit. The pre-existing `.gitignore` modification and sibling projects are excluded from that commit.
 
 ## Delivered
 
@@ -15,6 +15,10 @@ Base revision: `c1b7fdf` in the inherited `/home/srvadmin/Documents` Git reposit
 - Session undo compensates successful event mutations; failed validation/writes do not consume undo. Undo history clears on restart. Appearance, view, and sidebar preferences persist independently.
 - Raw wall-clock validation rejects nonexistent DST times. Repeated times require explicit UTC-offset selection. Failed save/delete input remains open, with visible errors and controls disabled while saving. Date moves also reject gaps/folds; choosing a repeated-hour offset is available through the editor.
 - Browser fixtures remain an in-memory review harness. No SQLite, credentials, SQL, or filesystem access is exposed to the renderer.
+
+## Design decision record
+
+The [phase-2 decisions and rationale](../architecture.md#phase-2-decisions-and-rationale) document the storage representation, instant/date query bounds, mutation ordering, per-event compensation, existence-only conflict checks, preference behavior, and fixed local-calendar identity. The later documentation audit records these implementation choices without changing phase-3 behavior.
 
 ## Verification
 
