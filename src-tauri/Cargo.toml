@@ -1,0 +1,22 @@
+[package]
+name = "cal-desktop"
+version = "0.1.0-alpha.1"
+description = "A quiet place for your time"
+edition = "2021"
+default-run = "cal-desktop"
+
+[lib]
+name = "cal_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+ts-rs = { version = "12", features = ["serde-compat"] }
+
+[[bin]]
+name = "export-types"
+path = "src/bin/export-types.rs"

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.tools/
+src-tauri/
+src/generated/
+test-results/
+playwright-report/
+pnpm-lock.yaml
+docs/review/*.png
+*.tsbuildinfo
