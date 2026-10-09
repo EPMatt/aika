@@ -4,7 +4,7 @@ use chrono::{
     DateTime, LocalResult, NaiveDate, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc,
 };
 use chrono_tz::Tz;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, ServiceError>;
@@ -87,7 +87,7 @@ pub fn resolve_local(local: &str, time_zone: &str, offset: Option<i32>) -> Resul
 }
 
 /// Shared normalized validation used before provider dispatch.
-pub(crate) fn validate_event(mut event: CalendarEvent) -> Result<CalendarEvent> {
+pub fn validate_event(mut event: CalendarEvent) -> Result<CalendarEvent> {
     if uuid::Uuid::parse_str(&event.id).is_err() {
         return Err(error("validation", "Invalid event identity."));
     }
@@ -124,7 +124,7 @@ pub(crate) fn validate_event(mut event: CalendarEvent) -> Result<CalendarEvent> 
     }
     Ok(event)
 }
-pub(crate) fn validate_range(range: &EventRange) -> Result<()> {
+pub fn validate_range(range: &EventRange) -> Result<()> {
     let start = instant(&range.start)?;
     let end = instant(&range.end)?;
     let dates = date(&range.end_date)?
@@ -143,16 +143,22 @@ pub(crate) fn validate_range(range: &EventRange) -> Result<()> {
     Ok(())
 }
 
+struct HistoryEntry {
+    id: String,
+    before: Option<CalendarEvent>,
+    after: Option<CalendarEvent>,
+}
+
 pub struct LocalProvider {
     db: Connection,
-    history: Vec<(String, Option<CalendarEvent>)>,
+    history: Vec<HistoryEntry>,
 }
 impl LocalProvider {
     pub fn open(path: &Path) -> Result<Self> {
         let mut db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > 1 {
             return Err(error(
@@ -226,9 +232,11 @@ impl LocalProvider {
             can_undo: !self.history.is_empty(),
         })
     }
-    fn get(&self, id: &str) -> Result<Option<CalendarEvent>> {
-        let json: Option<String> = self
-            .db
+    pub fn get(&self, id: &str) -> Result<Option<CalendarEvent>> {
+        Self::read(&self.db, id)
+    }
+    fn read(db: &Connection, id: &str) -> Result<Option<CalendarEvent>> {
+        let json: Option<String> = db
             .query_row(
                 "SELECT payload FROM events WHERE id=?1 AND calendar_id='local-default'",
                 [id],
@@ -252,41 +260,95 @@ impl LocalProvider {
         }
         Ok(())
     }
-    pub fn save(&mut self, mut event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
-        if uuid::Uuid::parse_str(&event.id).is_err() || event.calendar_id != "local-default" {
-            return Err(error("validation", "Invalid event or calendar identity."));
+    pub fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
+        let expected = if existing { self.get(&event.id)? } else { None };
+        self.save_checked(event, existing, expected)
+    }
+    pub fn save_checked(
+        &mut self,
+        event: CalendarEvent,
+        existing: bool,
+        expected: Option<CalendarEvent>,
+    ) -> Result<CalendarEvent> {
+        if event.calendar_id != "local-default" {
+            return Err(error("validation", "Invalid calendar identity."));
         }
-        event = validate_event(event)?;
-        let previous = self.get(&event.id)?;
-        if existing != previous.is_some() {
+        let event = validate_event(event)?;
+        if existing != expected.is_some() {
             return Err(error(
                 "conflict",
-                "The event no longer matches the editor. Reload the calendar.",
+                "An update requires the original event. Reload the calendar.",
             ));
         }
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = Self::read(&tx, &event.id)?;
+        if previous != expected {
+            return Err(error(
+                "conflict",
+                "The event changed. Reload the calendar before saving.",
+            ));
+        }
         Self::write(&tx, &event)?;
         tx.commit()?;
-        self.history.push((event.id.clone(), previous));
+        self.history.push(HistoryEntry {
+            id: event.id.clone(),
+            before: previous,
+            after: Some(event.clone()),
+        });
         Ok(event)
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        let previous = self
+        let expected = self
             .get(id)?
             .ok_or_else(|| error("notFound", "This event no longer exists."))?;
-        self.db.execute("DELETE FROM events WHERE id=?1", [id])?;
-        self.history.push((id.into(), Some(previous)));
+        self.delete_checked(id, &expected)
+    }
+    pub fn delete_checked(&mut self, id: &str, expected: &CalendarEvent) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = Self::read(&tx, id)?
+            .ok_or_else(|| error("notFound", "This event no longer exists."))?;
+        if &previous != expected {
+            return Err(error(
+                "conflict",
+                "The event changed. Reload the calendar before deleting.",
+            ));
+        }
+        tx.execute(
+            "DELETE FROM events WHERE id=?1 AND calendar_id='local-default'",
+            [id],
+        )?;
+        tx.commit()?;
+        self.history.push(HistoryEntry {
+            id: id.into(),
+            before: Some(previous),
+            after: None,
+        });
         Ok(())
     }
     pub fn undo(&mut self) -> Result<()> {
-        let Some((id, previous)) = self.history.last() else {
+        let Some(entry) = self.history.last() else {
             return Err(error("nothingToUndo", "There is no change to undo."));
         };
-        let tx = self.db.transaction()?;
-        match previous {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::read(&tx, &entry.id)? != entry.after {
+            return Err(error(
+                "conflict",
+                "The event changed outside this action. Undo cannot overwrite it.",
+            ));
+        }
+        match &entry.before {
             Some(event) => Self::write(&tx, event)?,
             None => {
-                tx.execute("DELETE FROM events WHERE id=?1", [id])?;
+                tx.execute(
+                    "DELETE FROM events WHERE id=?1 AND calendar_id='local-default'",
+                    [&entry.id],
+                )?;
             }
         }
         tx.commit()?;
@@ -319,6 +381,20 @@ impl CalendarService {
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
         self.providers.delete("local-default", id)
+    }
+    pub fn get(&self, id: &str) -> Result<CalendarEvent> {
+        self.providers.get("local-default", id)
+    }
+    pub fn save_checked(
+        &mut self,
+        event: CalendarEvent,
+        existing: bool,
+        expected: Option<CalendarEvent>,
+    ) -> Result<CalendarEvent> {
+        self.providers.save_checked(event, existing, expected)
+    }
+    pub fn delete_checked(&mut self, id: &str, expected: &CalendarEvent) -> Result<()> {
+        self.providers.delete_checked("local-default", id, expected)
     }
     pub fn undo(&mut self) -> Result<()> {
         self.providers.undo("local-default")
@@ -394,6 +470,76 @@ mod tests {
             .is_empty());
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn concurrent_changes_reject_stale_writes_and_undo() {
+        let path =
+            std::env::temp_dir().join(format!("aika-concurrent-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut desktop = CalendarService::open(&path).unwrap();
+        let mut cli = CalendarService::open(&path).unwrap();
+        let original = desktop.save_checked(event(), false, None).unwrap();
+        let mut changed = original.clone();
+        changed.title = "CLI changed".into();
+        let changed = cli
+            .save_checked(changed, true, Some(original.clone()))
+            .unwrap();
+        let mut stale = original.clone();
+        stale.notes = "Desktop draft".into();
+        assert_eq!(
+            desktop
+                .save_checked(stale, true, Some(original.clone()))
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        assert_eq!(
+            desktop
+                .delete_checked(&original.id, &original)
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        assert_eq!(desktop.undo().unwrap_err().code, "conflict");
+        assert_eq!(desktop.get(&original.id).unwrap(), changed);
+        // An unrelated external change does not block safe undo of another event.
+        let other = desktop.save_checked(event(), false, None).unwrap();
+        desktop.undo().unwrap();
+        assert_eq!(cli.get(&other.id).unwrap_err().code, "notFound");
+        desktop.delete_checked(&changed.id, &changed).unwrap();
+        cli.save_checked(changed.clone(), false, None).unwrap();
+        assert_eq!(desktop.undo().unwrap_err().code, "conflict");
+        assert_eq!(cli.get(&changed.id).unwrap(), changed);
+        drop(desktop);
+        drop(cli);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transaction_contention_preserves_event_and_history() {
+        let path = std::env::temp_dir().join(format!("aika-lock-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut local = LocalProvider::open(&path).unwrap();
+        let original = local.save(event(), false).unwrap();
+        local
+            .db
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            local
+                .delete_checked(&original.id, &original)
+                .unwrap_err()
+                .code,
+            "storage"
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(local.get(&original.id).unwrap(), Some(original));
+        local.undo().unwrap();
+        assert!(local.snapshot(range()).unwrap().events.is_empty());
+        drop(local);
+        drop(other);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn ranges_exclude_touching_and_include_multiday() {
         let mut s = service();
@@ -512,7 +658,7 @@ mod tests {
     #[test]
     fn shared_wall_time_fixtures() {
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/time.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tests/fixtures/time.json")).unwrap();
         for fixture in fixtures.as_array().unwrap() {
             let result = resolve_local(
                 fixture["local"].as_str().unwrap(),

@@ -169,3 +169,85 @@ test('normalized calendar metadata and read-only capability control the same vie
   await page.keyboard.press('n');
   await expect(page.getByLabel('Event editor')).not.toBeVisible();
 });
+
+test('focus refresh preserves an editor draft and sends its original event on conflicts', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'isTauri', { value: true });
+    const startDate = new Date().toLocaleDateString('en-CA');
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const original = {
+      id: 'cd13e32c-8183-4a1b-9eb5-eebdca77a2fe',
+      calendarId: 'local-default',
+      title: 'Original event',
+      location: '',
+      notes: '',
+      time: { kind: 'allDay', startDate, endDate: tomorrow.toLocaleDateString('en-CA') },
+    };
+    (window as any).testStoredEvent = original;
+    (window as any).testSnapshots = 0;
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      value: {
+        invoke: async (command: string, args: Record<string, any>) => {
+          switch (command) {
+            case 'get_app_info':
+              return { name: 'aika', version: 'test', provider: 'local' };
+            case 'get_preferences':
+              return { appearance: 'light', view: 'month', sidebar: true };
+            case 'set_preferences':
+              return;
+            case 'calendar_snapshot':
+              (window as any).testSnapshots++;
+              return {
+                calendar: {
+                  id: 'local-default',
+                  providerId: 'local',
+                  name: 'Personal',
+                  color: '#718675',
+                  writable: true,
+                },
+                events: [structuredClone((window as any).testStoredEvent)],
+                canUndo: false,
+              };
+            case 'save_event':
+            case 'delete_event':
+              (window as any).testLastMutation = { command, args };
+              if (JSON.stringify(args.expected) !== JSON.stringify((window as any).testStoredEvent))
+                throw { code: 'conflict', message: 'The event changed. Reload the calendar.' };
+              throw new Error('Expected a stale-event conflict');
+            default:
+              throw new Error(`Unexpected command: ${command}`);
+          }
+        },
+      },
+    });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: /Original event,/ }).click();
+  await page.getByRole('textbox', { name: 'Event title' }).fill('Unsaved draft');
+  const snapshots = await page.evaluate(() => (window as any).testSnapshots);
+  await page.evaluate(() => {
+    (window as any).testStoredEvent = { ...(window as any).testStoredEvent, title: 'CLI changed' };
+    window.dispatchEvent(new Event('focus'));
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).testSnapshots))
+    .toBeGreaterThan(snapshots);
+  await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveValue('Unsaved draft');
+  await expect(page.getByRole('button', { name: /CLI changed,/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('event changed');
+  await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveValue('Unsaved draft');
+  const mutation = await page.evaluate(() => (window as any).testLastMutation);
+  expect(mutation.command).toBe('save_event');
+  expect(mutation.args.expected.title).toBe('Original event');
+  expect(mutation.args.event.title).toBe('Unsaved draft');
+  await page.getByRole('button', { name: 'Delete event', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('event changed');
+  expect(await page.evaluate(() => (window as any).testLastMutation.args.expected.title)).toBe(
+    'Original event',
+  );
+  expect(await page.evaluate(() => (window as any).testStoredEvent.title)).toBe('CLI changed');
+});

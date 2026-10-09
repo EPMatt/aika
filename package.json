@@ -16,9 +16,11 @@
     "rust": "node scripts/tool.mjs cargo",
     "test": "vitest run",
     "test:ui": "playwright test",
+    "cli": "node scripts/tool.mjs cargo run --manifest-path src-tauri/Cargo.toml -p aika-cli --",
+    "cli:build": "node scripts/tool.mjs cargo build --manifest-path src-tauri/Cargo.toml -p aika-cli --release",
     "types:generate": "node scripts/tool.mjs cargo run --manifest-path src-tauri/Cargo.toml --bin export-types",
     "desktop:test:build": "node scripts/tool.mjs tauri build --debug --no-bundle --features native-test",
-    "test:native": "node scripts/native-test.mjs",
+    "test:native": "node scripts/tool.mjs cargo build --manifest-path src-tauri/Cargo.toml -p aika-cli && node scripts/native-test.mjs",
     "alpha:build": "node scripts/alpha.mjs",
     "test:packaging": "node --test scripts/alpha.test.mjs"
   },

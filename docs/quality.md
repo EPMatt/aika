@@ -2,14 +2,14 @@
 
 ## Automated checks
 
-`pnpm test` exercises renderer layout and time handling. `pnpm test:ui` covers browser interactions, mocked IPC failures, normalized read-only calendars, and axe WCAG A/AA audits in both themes. These checks do not establish native platform input behavior or full screen-reader usability.
+`pnpm test` exercises renderer layout and time handling. `pnpm test:ui` covers browser interactions, mocked IPC failures, focus refresh with stale editor drafts, normalized read-only calendars, and axe WCAG A/AA audits in both themes. These checks do not establish native platform input behavior or full screen-reader usability.
 
-`pnpm rust test --manifest-path src-tauri/Cargo.toml` covers real SQLite/reopening/undo/migrations, the shared local/test-adapter contract, capability and identity isolation, and unavailable credential-store behavior. Test adapters and injected credential stores are compiled only under `cfg(test)`.
+`pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace` covers real SQLite/reopening/undo/migrations, the shared local/test-adapter contract, capability and identity isolation, and unavailable credential-store behavior. CLI process tests cover CRUD persistence, range boundaries, time zones, DST input, and migration rejection; shared service tests cover concurrent mutations and undo conflicts. Test adapters and injected credential stores are compiled only under `cfg(test)`.
 
 The OS-store check is opt-in and uses a disposable account, deleting the entry after reading it:
 
 ```sh
-pnpm rust test --manifest-path src-tauri/Cargo.toml real_os_store_roundtrip -- --ignored
+pnpm rust test --manifest-path src-tauri/Cargo.toml -p aika-core real_os_store_roundtrip -- --ignored
 ```
 
 Build and run the embedded native suite on Linux, Windows, or macOS:
@@ -18,6 +18,8 @@ Build and run the embedded native suite on Linux, Windows, or macOS:
 pnpm desktop:test:build
 pnpm test:native
 ```
+
+The native runner builds the CLI and checks it against the same disposable database while the desktop is running, including preservation of editor drafts and rejection of stale saves/undo. Focus refresh is triggered by a synthetic webview focus event; physical OS focus behavior remains a manual check.
 
 The suite starts the debug executable with `AIKA_TEST_DATA_DIR` set to an isolated temporary directory, connects WebdriverIO directly to the embedded loopback server, and uses real IPC and SQLite without mocks. It restarts the application to distinguish durable data/preferences from session undo. `AIKA_TEST_BINARY` can override the executable path; `TAURI_WEBDRIVER_PORT` can override port 4445. Captures go to ignored `test-results/native/`. Linux CI runs under Xvfb; Windows/macOS jobs remain disabled. The scripts support those platforms but require execution there before claiming verification.
 

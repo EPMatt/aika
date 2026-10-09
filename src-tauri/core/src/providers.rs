@@ -17,8 +17,14 @@ pub trait Provider: Send {
     fn descriptor(&self) -> ProviderDescriptor;
     fn calendars(&self) -> Result<Vec<Calendar>>;
     fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot>;
-    fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent>;
-    fn delete(&mut self, calendar: &str, id: &str) -> Result<()>;
+    fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent>;
+    fn save_checked(
+        &mut self,
+        event: CalendarEvent,
+        existing: bool,
+        expected: Option<CalendarEvent>,
+    ) -> Result<CalendarEvent>;
+    fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()>;
     fn undo(&mut self) -> Result<()> {
         Err(error("unsupported", "This provider does not support undo."))
     }
@@ -74,14 +80,26 @@ impl Provider for LocalProvider {
         }
         LocalProvider::snapshot(self, range)
     }
-    fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
-        LocalProvider::save(self, event, existing)
-    }
-    fn delete(&mut self, calendar: &str, id: &str) -> Result<()> {
+    fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
         if calendar != "local-default" {
             return Err(error("notFound", "Unknown calendar."));
         }
-        LocalProvider::delete(self, id)
+        LocalProvider::get(self, id)?
+            .ok_or_else(|| error("notFound", "This event no longer exists."))
+    }
+    fn save_checked(
+        &mut self,
+        event: CalendarEvent,
+        existing: bool,
+        expected: Option<CalendarEvent>,
+    ) -> Result<CalendarEvent> {
+        LocalProvider::save_checked(self, event, existing, expected)
+    }
+    fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()> {
+        if calendar != "local-default" {
+            return Err(error("notFound", "Unknown calendar."));
+        }
+        LocalProvider::delete_checked(self, id, expected)
     }
     fn undo(&mut self) -> Result<()> {
         LocalProvider::undo(self)
@@ -161,17 +179,73 @@ impl ProviderRegistry {
         result.calendar = self.calendars[calendar].clone();
         Ok(result)
     }
+    pub fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(error("validation", "Use the full event UUID."));
+        }
+        let owner = self.owner(calendar, false)?;
+        let event = self.providers[&owner].get(calendar, id)?;
+        if event.calendar_id != calendar || event.id != id {
+            return Err(error(
+                "providerIdentity",
+                "Provider returned an event from another identity.",
+            ));
+        }
+        Ok(event)
+    }
     pub fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
+        let expected = if existing {
+            Some(self.get(&event.calendar_id, &event.id)?)
+        } else {
+            None
+        };
+        self.save_checked(event, existing, expected)
+    }
+    pub fn save_checked(
+        &mut self,
+        event: CalendarEvent,
+        existing: bool,
+        expected: Option<CalendarEvent>,
+    ) -> Result<CalendarEvent> {
         let owner = self.owner(&event.calendar_id, true)?;
+        if existing != expected.is_some()
+            || expected
+                .as_ref()
+                .is_some_and(|e| e.id != event.id || e.calendar_id != event.calendar_id)
+        {
+            return Err(error(
+                "conflict",
+                "An update requires the original event identity.",
+            ));
+        }
         let event = validate_event(event)?;
         self.providers
             .get_mut(&owner)
             .unwrap()
-            .save(event, existing)
+            .save_checked(event, existing, expected)
     }
     pub fn delete(&mut self, calendar: &str, id: &str) -> Result<()> {
+        self.owner(calendar, true)?;
+        let expected = self.get(calendar, id)?;
+        self.delete_checked(calendar, id, &expected)
+    }
+    pub fn delete_checked(
+        &mut self,
+        calendar: &str,
+        id: &str,
+        expected: &CalendarEvent,
+    ) -> Result<()> {
         let owner = self.owner(calendar, true)?;
-        self.providers.get_mut(&owner).unwrap().delete(calendar, id)
+        if expected.id != id || expected.calendar_id != calendar {
+            return Err(error(
+                "conflict",
+                "Deletion requires the original event identity.",
+            ));
+        }
+        self.providers
+            .get_mut(&owner)
+            .unwrap()
+            .delete_checked(calendar, id, expected)
     }
     pub fn undo(&mut self, calendar: &str) -> Result<()> {
         let owner = self.owner(calendar, true)?;
@@ -265,9 +339,22 @@ mod tests {
                 can_undo: false,
             })
         }
-        fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
+        fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
+            self.events
+                .get(id)
+                .filter(|e| self.leak || e.calendar_id == calendar)
+                .cloned()
+                .ok_or_else(|| error("notFound", "Event not in calendar."))
+        }
+        fn save_checked(
+            &mut self,
+            event: CalendarEvent,
+            existing: bool,
+            expected: Option<CalendarEvent>,
+        ) -> Result<CalendarEvent> {
             let previous = self.events.get(&event.id);
-            if existing != previous.is_some()
+            if previous != expected.as_ref()
+                || existing != previous.is_some()
                 || previous.is_some_and(|p| p.calendar_id != event.calendar_id)
             {
                 return Err(error("conflict", "Event identity mismatch."));
@@ -275,13 +362,21 @@ mod tests {
             self.events.insert(event.id.clone(), event.clone());
             Ok(event)
         }
-        fn delete(&mut self, calendar: &str, id: &str) -> Result<()> {
+        fn delete_checked(
+            &mut self,
+            calendar: &str,
+            id: &str,
+            expected: &CalendarEvent,
+        ) -> Result<()> {
             if !self
                 .events
                 .get(id)
                 .is_some_and(|e| e.calendar_id == calendar)
             {
                 return Err(error("notFound", "Event not in calendar."));
+            }
+            if self.events.get(id) != Some(expected) {
+                return Err(error("conflict", "Event changed."));
             }
             self.events.remove(id);
             Ok(())
@@ -404,10 +499,15 @@ mod tests {
         // A broken adapter is rejected even if it returns foreign events under its own metadata.
         let mut p = TestProvider::new();
         let foreign = event("local-default");
+        let foreign_id = foreign.id.clone();
         p.events.insert(foreign.id.clone(), foreign);
         p.leak = true;
         let mut leaking = ProviderRegistry::default();
         leaking.register(Box::new(p)).unwrap();
+        assert_eq!(
+            leaking.get("test-write", &foreign_id).unwrap_err().code,
+            "providerIdentity"
+        );
         assert_eq!(
             leaking.snapshot("test-write", range()).err().unwrap().code,
             "providerIdentity"

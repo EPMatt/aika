@@ -15,9 +15,9 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 }
 export const calendarClient = {
   snapshot: (range: EventRange) => invoke<CalendarSnapshot>('calendar_snapshot', { range }),
-  save: (event: CalendarEvent, existing: boolean) =>
-    mutate<CalendarEvent>('save_event', { event, existing }),
-  delete: (id: string) => mutate<void>('delete_event', { id }),
+  save: (event: CalendarEvent, existing: boolean, expected: CalendarEvent | null) =>
+    mutate<CalendarEvent>('save_event', { event, existing, expected }),
+  delete: (id: string, expected: CalendarEvent) => mutate<void>('delete_event', { id, expected }),
   undo: () => mutate<void>('undo_event'),
   preferences: () => invoke<Preferences>('get_preferences'),
   setPreferences: (preferences: Preferences) => mutate<void>('set_preferences', { preferences }),

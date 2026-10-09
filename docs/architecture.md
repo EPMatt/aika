@@ -14,7 +14,7 @@ Current local data flow: React calendar → typed IPC client → Rust `CalendarS
 
 The browser design harness uses `PrototypeRepository` explicitly. It is in-memory and independently undoable; this is a design harness, not the permanent provider implementation. Native startup binds the typed IPC client and never loads the browser fixture repository. No sample events should seed a user's database.
 
-Contracts originate in `src-tauri/src/contracts.rs`. `pnpm types:generate` uses ts-rs to export declarations to `src/generated`; CI rejects drift. Stable internal UUIDs differ from future remote IDs. Timed values cross IPC as UTC ISO strings with an IANA source zone; all-day values cross as ISO calendar dates, with exclusive end dates. Keep optional fields empty strings in the v0 contract.
+Contracts originate in `src-tauri/core/src/contracts.rs`. `pnpm types:generate` uses ts-rs to export declarations to `src/generated`; CI rejects drift. Stable internal UUIDs differ from future remote IDs. Timed values cross IPC as UTC ISO strings with an IANA source zone; all-day values cross as ISO calendar dates, with exclusive end dates. Keep optional fields empty strings in the v0 contract.
 
 ## Persistence and undo, phase 2
 
@@ -109,3 +109,11 @@ Installer execution and version upgrades require disposable OS accounts and actu
 - **Keep evidence proportional to the executed check.** The Arch AppImage passed portable startup and same-version replacement; the deb passed metadata, executable, launcher, and icon inspection. Empty-calendar/default-preference reopening does not establish saved-event CRUD or changed-preference persistence in an installed release. Same-version replacement does not establish a version upgrade. Arch packaging does not establish Ubuntu runtime compatibility. Ubuntu, Windows/macOS installer execution, true upgrades, manual input/accessibility/high-DPI checks, and final user acceptance remain pending in the verification matrix and handoff. Windows/macOS CI entries remain disabled per the existing user decision.
 
 Phase 5 changes packaging and verification tooling, with no event contract, SQLite schema, provider, credential, or renderer behavior changes. Exact commands, candidate paths, and observed results are recorded in `docs/handoffs/phase-5.md`.
+
+## Shared core and standalone CLI
+
+The Cargo workspace contains the Tauri desktop package, `aika-core`, and `aika-cli`. Contracts, SQLite migrations/validation, provider dispatch, and native credential support live in the core. The desktop re-exports its existing Rust module paths; the CLI links the core directly without Tauri or a webview dependency. Both resolve `dirs::data_dir()/dev.projectcal.desktop/calendar.sqlite3`, matching the desktop's previous Tauri convention. The CLI has an explicit database-path flag; the desktop retains its isolated native-test directory behavior.
+
+Provider lookup is calendar-scoped and checks returned identities. Checked updates carry the original complete event; checked deletes carry that same expectation. SQLite acquires an immediate transaction before reading and comparing the stored payload, then commits the mutation atomically. Creation expects absence. Busy connections retain the existing five-second timeout; migrations also use immediate transactions to serialize first launch. Convenience Rust save/delete methods read a fresh expectation and delegate to the checked operations; desktop IPC and CLI edits use explicit expectations. No database schema change is required.
+
+Session undo records each mutation's before and after payloads and compares the stored event with the after state inside an immediate transaction. A mismatch rejects undo without discarding history or overwriting another process's work. CLI history is process-local and inaccessible through commands; its mutations never join desktop session history. The desktop refreshes its visible range on window focus, preserving open editor drafts and their original events for comparison. See [CLI usage](cli.md) for the public command contract.

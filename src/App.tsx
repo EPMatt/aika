@@ -1122,6 +1122,12 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const requestVersion = useRef(0);
   useEffect(() => {
     if (!desktop) return;
+    const refreshOnFocus = () => setRevision((value) => value + 1);
+    window.addEventListener('focus', refreshOnFocus);
+    return () => window.removeEventListener('focus', refreshOnFocus);
+  }, []);
+  useEffect(() => {
+    if (!desktop) return;
     calendarClient
       .preferences()
       .then((p) => {
@@ -1235,7 +1241,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
           timeZone: DateTime.local().zoneName!,
         };
       }
-      if (desktop) await calendarClient.save(moved, true);
+      if (desktop) await calendarClient.save(moved, true, event);
       else repository!.save(moved);
       setFailure('');
       refresh('Event moved. Undo is available.');
@@ -1251,7 +1257,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       if (DateTime.fromISO(end).toMillis() <= DateTime.fromISO(event.time.start).toMillis())
         throw new Error('End must be after start.');
       const resized = { ...event, time: { ...event.time, end } };
-      if (desktop) await calendarClient.save(resized, true);
+      if (desktop) await calendarClient.save(resized, true, event);
       else repository!.save(resized);
       setFailure('');
       refresh('Event resized. Undo is available.');
@@ -1504,7 +1510,12 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                   onSave={async (event) => {
                     setMutating(true);
                     try {
-                      if (desktop) await calendarClient.save(event, editing.existing);
+                      if (desktop)
+                        await calendarClient.save(
+                          event,
+                          editing.existing,
+                          editing.existing ? editing.event : null,
+                        );
                       else repository!.save(event);
                       setEditing(null);
                       refresh(editing.existing ? 'Event updated.' : 'Event created.');
@@ -1515,7 +1526,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                   onDelete={async () => {
                     setMutating(true);
                     try {
-                      if (desktop) await calendarClient.delete(editing.event.id);
+                      if (desktop) await calendarClient.delete(editing.event.id, editing.event);
                       else repository!.delete(editing.event.id);
                       setEditing(null);
                       refresh('Event deleted. Undo is available.');

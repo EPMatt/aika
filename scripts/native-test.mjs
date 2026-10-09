@@ -1,6 +1,7 @@
 // Drive the actual embedded OS webview and Rust/SQLite IPC. No command mocks.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -10,7 +11,20 @@ const binary = resolve(
   process.env.AIKA_TEST_BINARY ??
     `src-tauri/target/debug/cal-desktop${process.platform === 'win32' ? '.exe' : ''}`,
 );
+const cliBinary = resolve(
+  `src-tauri/target/debug/aika-cli${process.platform === 'win32' ? '.exe' : ''}`,
+);
+const runFile = promisify(execFile);
 const directory = await mkdtemp(join(tmpdir(), 'aika-native-'));
+async function cli(...args) {
+  const { stdout } = await runFile(cliBinary, [
+    '--database',
+    join(directory, 'calendar.sqlite3'),
+    'events',
+    ...args,
+  ]);
+  return stdout;
+}
 const port = Number(process.env.TAURI_WEBDRIVER_PORT ?? 4445);
 await mkdir('test-results/native', { recursive: true });
 let app;
@@ -115,6 +129,55 @@ try {
   await browser.waitUntil(async () =>
     (await browser.$('.event-chip').getText()).includes('Native updated event'),
   );
+  // Exercise the independent CLI while the actual native service holds the database open.
+  const bounds = await browser.execute(() => {
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return {
+      from: today.toLocaleDateString('en-CA'),
+      to: tomorrow.toLocaleDateString('en-CA'),
+      zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    };
+  });
+  const listed = await cli(
+    'list',
+    '--from',
+    bounds.from,
+    '--to',
+    bounds.to,
+    '--time-zone',
+    bounds.zone,
+  );
+  const id = listed
+    .split('\n')
+    .find((line) => line.includes('Native updated event'))
+    ?.split(' ')[0];
+  assert.ok(id, 'CLI must read the desktop-created event');
+  await click('.event-chip');
+  await fill('[aria-label="Event title"]', 'Native unsaved draft');
+  await cli('update', id, '--title', 'CLI changed event');
+  await browser.execute(() => window.dispatchEvent(new Event('focus')));
+  await browser.waitUntil(async () =>
+    (await browser.$('.event-chip').getText()).includes('CLI changed event'),
+  );
+  assert.equal(await browser.$('[aria-label="Event title"]').getValue(), 'Native unsaved draft');
+  await click('button[type="submit"]');
+  await browser.waitUntil(async () =>
+    (await browser.$('[role="alert"]').getText()).includes('event changed'),
+  );
+  assert.match(await cli('get', id), /Title: CLI changed event/);
+  await browser.keys('Escape');
+  await click('button=Undo');
+  await browser.waitUntil(async () =>
+    (await browser.$('[role="alert"]').getText()).includes('Undo cannot overwrite'),
+  );
+  assert.match(await cli('get', id), /Title: CLI changed event/);
+  await cli('update', id, '--title', 'Native updated event');
+  await browser.execute(() => window.dispatchEvent(new Event('focus')));
+  await browser.waitUntil(async () =>
+    (await browser.$('.event-chip').getText()).includes('Native updated event'),
+  );
   await browser.saveScreenshot('test-results/native/month-light.png');
   await stop();
   await start();
@@ -166,7 +229,7 @@ try {
   assert.equal((await browser.$$('.time-event')).length, 0);
   await eventCount(0);
   console.log(
-    'Native timed/all-day CRUD, restart, session undo, views, keyboard dismissal, and appearance passed.',
+    'Native timed/all-day CRUD, CLI interoperability, stale edits/undo, restart, views, keyboard dismissal, and appearance passed.',
   );
 } catch (error) {
   if (browser)

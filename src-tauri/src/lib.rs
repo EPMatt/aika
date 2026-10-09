@@ -1,7 +1,4 @@
-pub mod contracts;
-pub mod credentials;
-pub mod providers;
-pub mod service;
+pub use aika_core::{contracts, credentials, providers, service};
 
 use contracts::*;
 use service::{error, CalendarService};
@@ -45,15 +42,23 @@ async fn save_event(
     state: tauri::State<'_, ServiceState>,
     event: CalendarEvent,
     existing: bool,
+    expected: Option<CalendarEvent>,
 ) -> Result<CalendarEvent, ServiceError> {
-    with_service(state.inner().clone(), move |s| s.save(event, existing)).await
+    with_service(state.inner().clone(), move |s| {
+        s.save_checked(event, existing, expected)
+    })
+    .await
 }
 #[tauri::command]
 async fn delete_event(
     state: tauri::State<'_, ServiceState>,
     id: String,
+    expected: CalendarEvent,
 ) -> Result<(), ServiceError> {
-    with_service(state.inner().clone(), move |s| s.delete(&id)).await
+    with_service(state.inner().clone(), move |s| {
+        s.delete_checked(&id, &expected)
+    })
+    .await
 }
 #[tauri::command]
 async fn undo_event(state: tauri::State<'_, ServiceState>) -> Result<(), ServiceError> {
@@ -105,7 +110,7 @@ pub fn run() {
     builder
         .setup(|app| {
             #[cfg(not(feature = "native-test"))]
-            let directory = app.path().app_data_dir().map_err(|_| error("storage", "Could not locate application data."));
+            let directory = aika_core::storage::app_data_dir();
             #[cfg(feature = "native-test")]
             let directory = std::env::var_os("AIKA_TEST_DATA_DIR")
                 .map(std::path::PathBuf::from)

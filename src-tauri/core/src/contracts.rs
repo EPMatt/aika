@@ -18,7 +18,7 @@ pub struct Calendar {
     pub writable: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum EventTime {
     #[serde(rename_all = "camelCase")]
@@ -34,7 +34,7 @@ pub enum EventTime {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarEvent {
     pub id: String,

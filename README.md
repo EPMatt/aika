@@ -17,6 +17,27 @@ Desktop development requires Rust 1.99.0 and the [Tauri prerequisites](https://v
 
 The tooling wrapper also detects a workspace-local Rust installation in `.tools/`. It does not alter global shell configuration. This workspace already has that installation; on another machine use the normal Rust toolchain setup.
 
+## CLI
+
+The standalone `aika-cli` uses the same Rust core and local Personal calendar as the desktop app. It works with the desktop open or closed, without launching a GUI. See [CLI usage](docs/cli.md) for time formats, exit codes, and concurrency behavior.
+
+```sh
+pnpm cli --help
+pnpm cli events list --from 2026-10-01 --to 2026-11-01
+pnpm cli events create --title "Lunch" --start 2026-10-10T12:00 --end 2026-10-10T13:00 --time-zone Europe/Zurich
+pnpm cli events get <event-uuid>
+pnpm cli events update <event-uuid> --title "Lunch with Sam"
+pnpm cli events delete <event-uuid>
+```
+
+Build a standalone release binary with `pnpm cli:build` (`src-tauri/target/release/aika-cli`, `.exe` on Windows), or install it onto Cargo's bin path with:
+
+```sh
+pnpm rust install --path src-tauri/cli --locked
+```
+
+Desktop installers remain unchanged; the CLI is installed separately.
+
 ## Verify
 
 ```sh
@@ -24,9 +45,9 @@ pnpm build
 pnpm test
 pnpm exec playwright install chromium
 pnpm test:ui
-pnpm rust test --manifest-path src-tauri/Cargo.toml
-pnpm rust fmt --manifest-path src-tauri/Cargo.toml --check
-pnpm rust clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace
+pnpm rust fmt --manifest-path src-tauri/Cargo.toml --all --check
+pnpm rust clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
 pnpm types:generate
 pnpm desktop:build --no-bundle
 ```
