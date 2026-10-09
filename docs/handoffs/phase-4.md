@@ -4,7 +4,7 @@ Status: **implemented, with local Linux verification; other-platform/manual chec
 
 ## Source and scope
 
-Base revision: `634ce36` in the inherited parent repository. This handoff ships with the phase-4 implementation commit. The user's follow-up requests relocating Git into `project-cal`, rewriting history to put app files at the repository root, renaming the branch to `main`, and force-pushing origin. Historical source revisions in earlier handoffs refer to the pre-rewrite history; the repository relocation record provides their mapping. The pre-existing `.gitignore` edit is preserved separately; sibling folders are untouched.
+Base revision: `634ce36` in the inherited parent repository. Implementation revision: `491f076`, rewritten from `7dc2fcb`. Git now lives in `project-cal/.git`, history places app files directly at the root, and the working branch is `main`, as requested in the user's follow-up. Historical source revisions in earlier handoffs refer to the pre-rewrite history; `docs/repository-history.md` provides their mapping. The pre-existing `.gitignore` edit is preserved separately; sibling folders are untouched.
 
 Read the referenced planning task, `docs/plan.md`, `docs/architecture.md`, and earlier handoffs. Production remains one local calendar with no connected accounts, remote sync, recurrence, reminders, search, export, or backup.
 

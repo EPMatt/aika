@@ -10,7 +10,7 @@ Canonicalize OS/webview locales before formatting: Linux can expose POSIX tags s
 
 ## Boundaries
 
-Current local data flow: React calendar → typed IPC client → Rust `CalendarService` → SQLite. Phase 4 introduces registered provider dispatch between the service and persistence or remote adapters. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
+Current local data flow: React calendar → typed IPC client → Rust `CalendarService` → SQLite. Phase 4 adds registered provider dispatch between the service and persistence or remote adapters. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
 
 The browser design harness uses `PrototypeRepository` explicitly. It is in-memory and independently undoable; this is a design harness, not the permanent provider implementation. Native startup binds the typed IPC client and never loads the browser fixture repository. No sample events should seed a user's database.
 
@@ -34,7 +34,7 @@ The credential service stays behind the backend boundary. Use persistent OS stor
 
 Vitest covers layout and prototype repository behavior; Playwright covers renderer flows and captures review images. Browser checks are not evidence of native integration. Phase 4 adds WebdriverIO embedded Tauri automation on Windows/macOS/Linux, with plugins enabled only in test builds, plus real-platform checks.
 
-The active CI desktop target is Linux on ubuntu-latest; Windows/macOS entries remain commented out per the latest user decision. CI is ready for a repository rooted at this project. This workspace currently inherits a parent Git repository; no external repository is created or connected automatically. Cross-platform CI runs cannot be claimed until such a repository runs the workflow. Windows/macOS launch checks remain external verification tasks.
+The active CI desktop target is Linux on ubuntu-latest; Windows/macOS entries remain commented out per the latest user decision. The repository is now rooted at `project-cal`, so workflow paths match the app layout. Origin is `EPMatt/aika`, with `main` as the publication branch. Hosted CI and cross-platform execution still require observing actual workflow results. See `docs/repository-history.md` for the relocation and rewritten revision mapping. Windows/macOS launch checks remain external verification tasks.
 
 Private distribution uses Windows installers, per-architecture macOS DMGs with ad-hoc signing, and Linux AppImage/deb. There is no public signing, notarization, updater, analytics, or server in v0.
 
@@ -87,3 +87,7 @@ These decisions were implemented in `433172a`. Service tests prove SQLite behavi
 - **Choose a Linux rendering compatibility default based on native evidence.** On this Arch/Wayland host the default WebKitGTK DMA-BUF path left the editor fade at opacity zero and produced stale captures. `WEBKIT_DISABLE_DMABUF_RENDERER=1` allowed the complete native suite to pass. Linux startup sets this default before GTK/WebKit/threads start, preserving any explicit environment value. It trades accelerated buffer transport for reliable calendar rendering; other hardware still needs the manual platform checks. This uses [Tauri's documented Linux graphics workaround](https://v2.tauri.app/develop/debug/linux-graphics/); it changes neither the user's desktop configuration nor their system environment.
 
 No schema or generated IPC contract changed in phase 4. Existing SQLite data, preferences, session undo, and source-zone behavior retain their contracts. Native integration results, renderer results, OS-store results, and unexecuted platform/manual checks are recorded separately in the phase-4 handoff.
+
+## Repository structure decision
+
+At the user's request after phase 4, Git metadata lives physically in `project-cal/.git`, and all retained commit trees place the app files directly at the repository root. The branch is `main`; origin retains its existing URL. Filtering only the original app subtree preserves the complete app history while keeping neighboring projects outside the repository. Every rewritten tree was compared with its original subtree before moving metadata. Original metadata/bundle recovery copies remain in `/tmp`, and the pre-existing uncommitted `.gitignore` change remains local. `docs/repository-history.md` maps earlier handoff revisions. This resolves the previous workflow-root mismatch without changing packaging or silently enabling disabled platform jobs.
