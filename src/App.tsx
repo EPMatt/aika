@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent, KeyboardEvent, MouseEvent } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -34,25 +34,21 @@ import {
   weekStart,
 } from './calendar';
 import type { Appearance, View } from './calendar';
-import { PrototypeRepository, sampleEvents } from './prototype';
-import type { Scenario } from './prototype';
+import type { PrototypeRepository } from './prototype';
+import { calendarClient, desktop, errorMessage, resolveWallTime } from './client';
+import type { ServiceError } from './generated/ServiceError';
 
 const HOUR_HEIGHT = 72;
 const DRAG_TYPE = 'application/x-cal-event';
 const params = new URLSearchParams(window.location.search);
-const fixtureDate = params.get('date');
 const initialDate =
-  fixtureDate && DateTime.fromISO(fixtureDate).isValid
-    ? DateTime.fromISO(fixtureDate)
+  !desktop && params.get('date') && DateTime.fromISO(params.get('date')!).isValid
+    ? DateTime.fromISO(params.get('date')!)
     : DateTime.local();
-const scenario: Scenario =
-  params.get('scenario') === 'empty'
-    ? 'empty'
-    : params.get('scenario') === 'dense'
-      ? 'dense'
-      : 'standard';
 const initialAppearance = (): Appearance => {
-  const value = params.get('theme') ?? localStorage.getItem('cal.appearance');
+  const value = desktop
+    ? 'system'
+    : (params.get('theme') ?? localStorage.getItem('cal.appearance'));
   return value === 'light' || value === 'dark' ? value : 'system';
 };
 
@@ -502,8 +498,8 @@ function EventEditor({
 }: {
   event: CalendarEvent;
   existing: boolean;
-  onSave: (event: CalendarEvent) => void;
-  onDelete: () => void;
+  onSave: (event: CalendarEvent) => Promise<void>;
+  onDelete: () => Promise<void>;
   onClose: () => void;
 }) {
   const [title, setTitle] = useState(event.title);
@@ -525,189 +521,260 @@ function EventEditor({
   const [details, setDetails] = useState(Boolean(location || notes));
   const [error, setError] = useState('');
 
-  const submit = (e: FormEvent) => {
+  const [busy, setBusy] = useState(false);
+  const [offsets, setOffsets] = useState<{ start?: number[]; end?: number[] }>({});
+  const [chosenOffsets, setChosenOffsets] = useState<{ start?: number; end?: number }>({});
+
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     if (!title.trim()) {
       setError('Give your event a title.');
       return;
     }
-    const from = DateTime.fromISO(allDay ? startDate : `${startDate}T${startTime}`);
-    const until = DateTime.fromISO(allDay ? endDate : `${endDate}T${endTime}`);
-    if (!from.isValid || !until.isValid || (allDay ? until < from : until <= from)) {
-      setError(
-        allDay
-          ? 'The end date must be on or after the start date.'
-          : 'The event must end after it starts.',
-      );
-      return;
+    setBusy(true);
+    setError('');
+    try {
+      let time: CalendarEvent['time'];
+      if (allDay) {
+        const until = DateTime.fromISO(endDate).plus({ days: 1 });
+        if (!until.isValid || endDate < startDate)
+          throw new Error('The end date must be on or after the start date.');
+        time = { kind: 'allDay', startDate, endDate: dateKey(until) };
+      } else {
+        const resolve = async (field: 'start' | 'end', local: string) => {
+          try {
+            return await resolveWallTime(local, chosenOffsets[field]);
+          } catch (err) {
+            const failure = err as ServiceError;
+            if (failure.code === 'ambiguousTime')
+              setOffsets((current) => ({ ...current, [field]: failure.offsets }));
+            throw err;
+          }
+        };
+        const from = await resolve('start', `${startDate}T${startTime}`);
+        const until = await resolve('end', `${endDate}T${endTime}`);
+        if (DateTime.fromISO(until) <= DateTime.fromISO(from))
+          throw new Error('The event must end after it starts.');
+        time = { kind: 'timed', start: from, end: until, timeZone: DateTime.local().zoneName! };
+      }
+      await onSave({ ...event, title: title.trim(), location: location.trim(), notes, time });
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
     }
-    onSave({
-      ...event,
-      title: title.trim(),
-      location: location.trim(),
-      notes,
-      time: allDay
-        ? { kind: 'allDay', startDate, endDate: dateKey(until.plus({ days: 1 })) }
-        : {
-            kind: 'timed',
-            start: from.toUTC().toISO()!,
-            end: until.toUTC().toISO()!,
-            timeZone: from.zoneName!,
-          },
-    });
   };
 
   return (
     <form className="editor" onSubmit={submit}>
-      <div className="editor-heading">
-        <span className="eyebrow">{existing ? 'Edit event' : 'New event'}</span>
-        <IconButton label="Close event editor" onClick={onClose}>
-          <X size={16} />
-        </IconButton>
-      </div>
-      <input
-        className="event-title-input"
-        aria-label="Event title"
-        placeholder="Event title"
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        maxLength={300}
-        autoFocus
-      />
-      <div className="editor-calendar">
-        <span className="event-dot" />
-        <span>Personal</span>
-        <span className="muted">Local calendar</span>
-      </div>
-      <div className="editor-rule" />
-      <div className="all-day-control">
-        <span>
-          <CalendarDays size={16} />
-          All-day
-        </span>
-        <button
-          type="button"
-          role="switch"
-          aria-label="All-day event"
-          aria-checked={allDay}
-          className={`switch ${allDay ? 'on' : ''}`}
-          onClick={() => {
-            setAllDay(!allDay);
-            if (allDay) {
-              setStartTime('09:00');
-              setEndTime('10:00');
-            }
-          }}
-        >
-          <span />
-        </button>
-      </div>
-      <div className="date-fields">
-        <Clock3 size={16} />
-        <div>
-          <div className="date-field-row">
-            <label htmlFor="event-start-date">Starts</label>
-            <input
-              id="event-start-date"
-              type="date"
-              required
-              value={startDate}
-              onChange={(e) => {
-                setStartDate(e.target.value);
-                if (endDate < e.target.value) setEndDate(e.target.value);
-              }}
-            />
-            {!allDay && (
-              <input
-                aria-label="Start time"
-                type="time"
-                required
-                value={startTime}
-                onChange={(e) => setStartTime(e.target.value)}
-              />
-            )}
-          </div>
-          <div className="date-field-row">
-            <label htmlFor="event-end-date">Ends</label>
-            <input
-              id="event-end-date"
-              type="date"
-              required
-              value={endDate}
-              min={startDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-            {!allDay && (
-              <input
-                aria-label="End time"
-                type="time"
-                required
-                value={endTime}
-                onChange={(e) => setEndTime(e.target.value)}
-              />
-            )}
-          </div>
-        </div>
-      </div>
-      {!allDay && (
-        <p className="timezone-note">{DateTime.local().zoneName?.replaceAll('_', ' ')}</p>
-      )}
-      {details ? (
-        <div className="optional-fields">
-          <label>
-            <span>
-              <MapPin size={14} />
-              Location
-            </span>
-            <input
-              placeholder="Location"
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-            />
-          </label>
-          <label>
-            <span>Notes</span>
-            <textarea
-              placeholder="Notes"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              rows={3}
-            />
-          </label>
-        </div>
-      ) : (
-        <button type="button" className="details-button" onClick={() => setDetails(true)}>
-          <Plus size={13} />
-          Add location or notes
-        </button>
-      )}
-      {error && (
-        <p role="alert" className="editor-error">
-          {error}
-        </p>
-      )}
-      <div className="editor-footer">
-        {existing ? (
-          <IconButton label="Delete event" className="delete-button" onClick={onDelete}>
-            <Trash2 size={16} />
+      <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+        <div className="editor-heading">
+          <span className="eyebrow">{existing ? 'Edit event' : 'New event'}</span>
+          <IconButton label="Close event editor" onClick={onClose}>
+            <X size={16} />
           </IconButton>
-        ) : (
-          <span />
-        )}
-        <div>
-          <button type="button" className="text-button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary-button">
-            {existing ? 'Save changes' : 'Create event'}
+        </div>
+        <input
+          className="event-title-input"
+          aria-label="Event title"
+          placeholder="Event title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          maxLength={300}
+          autoFocus
+        />
+        <div className="editor-calendar">
+          <span className="event-dot" />
+          <span>Personal</span>
+          <span className="muted">Local calendar</span>
+        </div>
+        <div className="editor-rule" />
+        <div className="all-day-control">
+          <span>
+            <CalendarDays size={16} />
+            All-day
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-label="All-day event"
+            aria-checked={allDay}
+            className={`switch ${allDay ? 'on' : ''}`}
+            onClick={() => {
+              setAllDay(!allDay);
+              if (allDay) {
+                setStartTime('09:00');
+                setEndTime('10:00');
+              }
+            }}
+          >
+            <span />
           </button>
         </div>
-      </div>
+        <div className="date-fields">
+          <Clock3 size={16} />
+          <div>
+            <div className="date-field-row">
+              <label htmlFor="event-start-date">Starts</label>
+              <input
+                id="event-start-date"
+                type="date"
+                required
+                value={startDate}
+                onChange={(e) => {
+                  setOffsets({});
+                  setChosenOffsets({});
+                  setStartDate(e.target.value);
+                  if (endDate < e.target.value) setEndDate(e.target.value);
+                }}
+              />
+              {!allDay && (
+                <input
+                  aria-label="Start time"
+                  type="time"
+                  required
+                  value={startTime}
+                  onChange={(e) => {
+                    setStartTime(e.target.value);
+                    setOffsets({});
+                    setChosenOffsets({});
+                  }}
+                />
+              )}
+            </div>
+            <div className="date-field-row">
+              <label htmlFor="event-end-date">Ends</label>
+              <input
+                id="event-end-date"
+                type="date"
+                required
+                value={endDate}
+                min={startDate}
+                onChange={(e) => {
+                  setEndDate(e.target.value);
+                  setOffsets({});
+                  setChosenOffsets({});
+                }}
+              />
+              {!allDay && (
+                <input
+                  aria-label="End time"
+                  type="time"
+                  required
+                  value={endTime}
+                  onChange={(e) => {
+                    setEndTime(e.target.value);
+                    setOffsets({});
+                    setChosenOffsets({});
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        </div>
+        {!allDay && (
+          <p className="timezone-note">{DateTime.local().zoneName?.replaceAll('_', ' ')}</p>
+        )}
+        {details ? (
+          <div className="optional-fields">
+            <label>
+              <span>
+                <MapPin size={14} />
+                Location
+              </span>
+              <input
+                placeholder="Location"
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+              />
+            </label>
+            <label>
+              <span>Notes</span>
+              <textarea
+                placeholder="Notes"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                rows={3}
+              />
+            </label>
+          </div>
+        ) : (
+          <button type="button" className="details-button" onClick={() => setDetails(true)}>
+            <Plus size={13} />
+            Add location or notes
+          </button>
+        )}
+        {!allDay &&
+          (['start', 'end'] as const).map(
+            (field) =>
+              offsets[field] && (
+                <label key={field} className="timezone-note">
+                  {field === 'start' ? 'Start' : 'End'} UTC offset
+                  <select
+                    aria-label={`${field} UTC offset`}
+                    value={chosenOffsets[field] ?? ''}
+                    onChange={(e) =>
+                      setChosenOffsets((current) => ({
+                        ...current,
+                        [field]: Number(e.target.value),
+                      }))
+                    }
+                  >
+                    <option value="" disabled>
+                      Choose offset
+                    </option>
+                    {offsets[field]!.map((offset) => (
+                      <option
+                        key={offset}
+                        value={offset}
+                      >{`UTC${offset >= 0 ? '+' : '-'}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0')}:${String(Math.abs(offset) % 60).padStart(2, '0')}`}</option>
+                    ))}
+                  </select>
+                </label>
+              ),
+          )}
+        {error && (
+          <p role="alert" className="editor-error">
+            {error}
+          </p>
+        )}
+        <div className="editor-footer">
+          {existing ? (
+            <IconButton
+              label="Delete event"
+              className="delete-button"
+              onClick={async () => {
+                setBusy(true);
+                try {
+                  await onDelete();
+                } catch (err) {
+                  setError(errorMessage(err));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              <Trash2 size={16} />
+            </IconButton>
+          ) : (
+            <span />
+          )}
+          <div>
+            <button type="button" className="text-button" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="primary-button">
+              {existing ? 'Save changes' : 'Create event'}
+            </button>
+          </div>
+        </div>
+      </fieldset>
     </form>
   );
 }
 
-export function App() {
+export function App({ repository = null }: { repository?: PrototypeRepository | null }) {
   const [date, setDate] = useState<DateTime>(initialDate.startOf('day'));
   const today = initialDate.startOf('day');
   const [view, setView] = useState<View>('month');
@@ -716,12 +783,65 @@ export function App() {
   const [appearance, setAppearance] = useState<Appearance>(initialAppearance);
   const [settings, setSettings] = useState(false);
   const [runtime, setRuntime] = useState('browser');
-  const repository = useMemo(() => new PrototypeRepository(sampleEvents(today, scenario)), []);
-  const [events, setEvents] = useState(() => repository.list());
+
+  const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
   const [editing, setEditing] = useState<{ event: CalendarEvent; existing: boolean } | null>(null);
   const editorAnchor = useRef<HTMLElement | null>(null);
   const newButton = useRef<HTMLButtonElement>(null);
   const [announcement, setAnnouncement] = useState('');
+  const [failure, setFailure] = useState('');
+  const [preferenceFailure, setPreferenceFailure] = useState('');
+  const [canUndo, setCanUndo] = useState(false);
+  const [ready, setReady] = useState(!desktop);
+  const [revision, setRevision] = useState(0);
+  const [mutating, setMutating] = useState(false);
+  const requestVersion = useRef(0);
+  useEffect(() => {
+    if (!desktop) return;
+    calendarClient
+      .preferences()
+      .then((p) => {
+        setView(p.view as View);
+        setSidebar(window.innerWidth >= 900 && p.sidebar);
+        setAppearance(p.appearance as Appearance);
+        setReady(true);
+        setPreferenceFailure('');
+      })
+      .catch((err) => setPreferenceFailure(errorMessage(err)));
+  }, []);
+  useEffect(() => {
+    if (!desktop || !ready) return;
+    calendarClient
+      .setPreferences({ appearance, view, sidebar })
+      .then(() => setPreferenceFailure(''))
+      .catch((err) => setPreferenceFailure(errorMessage(err)));
+  }, [appearance, view, sidebar, ready]);
+  useEffect(() => {
+    if (!desktop) return;
+    const token = ++requestVersion.current;
+    const days = daysForView(date, view);
+    const start = days[0].startOf('day');
+    const end = days[days.length - 1].plus({ days: 1 }).startOf('day');
+    calendarClient
+      .snapshot({
+        start: start.toUTC().toISO()!,
+        end: end.toUTC().toISO()!,
+        startDate: dateKey(start),
+        endDate: dateKey(end),
+      })
+      .then((snapshot) => {
+        if (token !== requestVersion.current) return;
+        setEvents(snapshot.events);
+        setCanUndo(snapshot.canUndo);
+        setFailure('');
+      })
+      .catch((err) => {
+        if (token === requestVersion.current) setFailure(errorMessage(err));
+      });
+    return () => {
+      requestVersion.current++;
+    };
+  }, [date, view, revision]);
 
   useEffect(() => {
     const adaptToWindow = () => {
@@ -738,7 +858,7 @@ export function App() {
         appearance === 'system' ? (media.matches ? 'dark' : 'light') : appearance;
     };
     update();
-    localStorage.setItem('cal.appearance', appearance);
+    if (!desktop) localStorage.setItem('cal.appearance', appearance);
     media.addEventListener('change', update);
     return () => media.removeEventListener('change', update);
   }, [appearance]);
@@ -749,7 +869,10 @@ export function App() {
         .catch(() => setRuntime('desktop-error'));
   }, []);
   const refresh = (message: string) => {
-    setEvents(repository.list());
+    if (repository) {
+      setEvents(repository.list());
+      setCanUndo(repository.canUndo());
+    } else setRevision((value) => value + 1);
     setAnnouncement(message);
   };
   const create = useCallback((day: DateTime, anchor: HTMLElement, allDay = false) => {
@@ -760,16 +883,37 @@ export function App() {
     editorAnchor.current = anchor;
     setEditing({ event, existing: true });
   };
-  const move = (id: string, target: DateTime) => {
+  const move = async (id: string, target: DateTime) => {
     const event = events.find((item) => item.id === id);
-    if (event) {
-      repository.save(moveEvent(event, target));
+    if (!event) return;
+    try {
+      const moved = moveEvent(event, target);
+      if (event.time.kind === 'timed' && moved.time.kind === 'timed') {
+        const oldStart = DateTime.fromISO(event.time.start);
+        const start = await resolveWallTime(`${dateKey(target)}T${oldStart.toFormat('HH:mm')}`);
+        const duration = DateTime.fromISO(event.time.end).diff(oldStart).milliseconds;
+        moved.time = {
+          kind: 'timed',
+          start,
+          end: DateTime.fromISO(start).plus({ milliseconds: duration }).toUTC().toISO()!,
+          timeZone: DateTime.local().zoneName!,
+        };
+      }
+      if (desktop) await calendarClient.save(moved, true);
+      else repository!.save(moved);
       refresh('Event moved. Undo is available.');
+    } catch (err) {
+      setFailure(errorMessage(err));
     }
   };
-  const undo = () => {
-    repository.undo();
-    refresh('Change undone.');
+  const undo = async () => {
+    try {
+      if (desktop) await calendarClient.undo();
+      else repository!.undo();
+      refresh('Change undone.');
+    } catch (err) {
+      setFailure(errorMessage(err));
+    }
   };
   const navigate = (direction: number) =>
     setDate((current) =>
@@ -895,6 +1039,34 @@ export function App() {
             </button>
           </div>
         </header>
+        {(failure || preferenceFailure) && (
+          <div role="alert" className="editor-error">
+            {failure || preferenceFailure}{' '}
+            <button
+              onClick={() => {
+                setRevision((value) => value + 1);
+                if (!ready)
+                  calendarClient
+                    .preferences()
+                    .then((p) => {
+                      setView(p.view as View);
+                      setSidebar(p.sidebar);
+                      setAppearance(p.appearance as Appearance);
+                      setReady(true);
+                      setPreferenceFailure('');
+                    })
+                    .catch((err) => setPreferenceFailure(errorMessage(err)));
+                else if (preferenceFailure)
+                  calendarClient
+                    .setPreferences({ appearance, view, sidebar })
+                    .then(() => setPreferenceFailure(''))
+                    .catch((err) => setPreferenceFailure(errorMessage(err)));
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
         <div className="calendar-surface">
           {view === 'month' ? (
             <MonthView
@@ -925,7 +1097,7 @@ export function App() {
               : `${selectedCount} ${selectedCount === 1 ? 'event' : 'events'} on ${date.toFormat('LLL d')}`}
           </span>
           <div>
-            {repository.canUndo() && (
+            {canUndo && (
               <button className="undo-button" onClick={undo}>
                 <Undo2 size={13} />
                 Undo
@@ -938,7 +1110,7 @@ export function App() {
       <Popover.Root
         open={Boolean(editing)}
         onOpenChange={(open) => {
-          if (!open) setEditing(null);
+          if (!open && !mutating) setEditing(null);
         }}
       >
         <Popover.Anchor virtualRef={editorAnchor} />
@@ -967,15 +1139,27 @@ export function App() {
                 event={editing.event}
                 existing={editing.existing}
                 onClose={() => setEditing(null)}
-                onSave={(event) => {
-                  repository.save(event);
-                  setEditing(null);
-                  refresh(editing.existing ? 'Event updated.' : 'Event created.');
+                onSave={async (event) => {
+                  setMutating(true);
+                  try {
+                    if (desktop) await calendarClient.save(event, editing.existing);
+                    else repository!.save(event);
+                    setEditing(null);
+                    refresh(editing.existing ? 'Event updated.' : 'Event created.');
+                  } finally {
+                    setMutating(false);
+                  }
                 }}
-                onDelete={() => {
-                  repository.delete(editing.event.id);
-                  setEditing(null);
-                  refresh('Event deleted. Undo is available.');
+                onDelete={async () => {
+                  setMutating(true);
+                  try {
+                    if (desktop) await calendarClient.delete(editing.event.id);
+                    else repository!.delete(editing.event.id);
+                    setEditing(null);
+                    refresh('Event deleted. Undo is available.');
+                  } finally {
+                    setMutating(false);
+                  }
                 }}
               />
             )}

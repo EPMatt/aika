@@ -1,6 +1,86 @@
 pub mod contracts;
+pub mod service;
 
-use contracts::AppInfo;
+use contracts::*;
+use service::{error, CalendarService};
+use std::sync::{Arc, Mutex};
+use tauri::Manager;
+struct LocalState {
+    directory: Result<std::path::PathBuf, ServiceError>,
+    service: Option<CalendarService>,
+}
+type ServiceState = Arc<Mutex<LocalState>>;
+
+async fn with_service<T: Send + 'static>(
+    state: ServiceState,
+    work: impl FnOnce(&mut CalendarService) -> Result<T, ServiceError> + Send + 'static,
+) -> Result<T, ServiceError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = state
+            .lock()
+            .map_err(|_| error("service", "The calendar service is unavailable."))?;
+        if guard.service.is_none() {
+            let directory = guard.directory.as_ref().map_err(Clone::clone)?;
+            std::fs::create_dir_all(directory)
+                .map_err(|_| error("storage", "Could not create application data directory."))?;
+            guard.service = Some(CalendarService::open(&directory.join("calendar.sqlite3"))?);
+        }
+        work(guard.service.as_mut().expect("service initialized"))
+    })
+    .await
+    .map_err(|_| error("service", "The calendar operation could not finish."))?
+}
+
+#[tauri::command]
+async fn calendar_snapshot(
+    state: tauri::State<'_, ServiceState>,
+    range: EventRange,
+) -> Result<CalendarSnapshot, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.snapshot(range)).await
+}
+#[tauri::command]
+async fn save_event(
+    state: tauri::State<'_, ServiceState>,
+    event: CalendarEvent,
+    existing: bool,
+) -> Result<CalendarEvent, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.save(event, existing)).await
+}
+#[tauri::command]
+async fn delete_event(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| s.delete(&id)).await
+}
+#[tauri::command]
+async fn undo_event(state: tauri::State<'_, ServiceState>) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), |s| s.undo()).await
+}
+#[tauri::command]
+async fn get_preferences(
+    state: tauri::State<'_, ServiceState>,
+) -> Result<Preferences, ServiceError> {
+    with_service(state.inner().clone(), |s| s.preferences()).await
+}
+#[tauri::command]
+async fn set_preferences(
+    state: tauri::State<'_, ServiceState>,
+    preferences: Preferences,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.set_preferences(preferences)
+    })
+    .await
+}
+#[tauri::command]
+fn resolve_local_time(
+    local: String,
+    time_zone: String,
+    offset: Option<i32>,
+) -> Result<String, ServiceError> {
+    service::resolve_local(&local, &time_zone, offset)
+}
 
 #[tauri::command]
 fn get_app_info() -> AppInfo {
@@ -15,6 +95,11 @@ fn get_app_info() -> AppInfo {
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let directory = app.path().app_data_dir().map_err(|_| error("storage", "Could not locate application data."));
+            app.manage(Arc::new(Mutex::new(LocalState { directory, service: None })) as ServiceState);
+            Ok(())
+        })
         .on_page_load(|_window, _payload| {
             #[cfg(debug_assertions)]
             if _payload.event() == tauri::webview::PageLoadEvent::Finished {
@@ -28,7 +113,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info])
+        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, save_event, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

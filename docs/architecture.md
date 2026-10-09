@@ -10,9 +10,9 @@ Canonicalize OS/webview locales before formatting: Linux can expose POSIX tags s
 
 ## Boundaries
 
-Planned data flow: React calendar → typed IPC client → application calendar service → registered provider → persistence or remote adapter. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
+Data flow: React calendar → typed IPC client → application calendar service → registered provider → persistence or remote adapter. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
 
-Phase 1 uses `PrototypeRepository` explicitly. It is in-memory and independently undoable; this is a design harness, not the permanent provider implementation. The harness is removed from the production entrypoint when phase 2 binds the real service. No sample events should seed a user's database.
+The browser design harness uses `PrototypeRepository` explicitly. It is in-memory and independently undoable; this is a design harness, not the permanent provider implementation. Native startup binds the typed IPC client and never loads the browser fixture repository. No sample events should seed a user's database.
 
 Contracts originate in `src-tauri/src/contracts.rs`. `pnpm types:generate` uses ts-rs to export declarations to `src/generated`; CI rejects drift. Stable internal UUIDs differ from future remote IDs. Timed values cross IPC as UTC ISO strings with an IANA source zone; all-day values cross as ISO calendar dates, with exclusive end dates. Keep optional fields empty strings in the v0 contract.
 
@@ -37,3 +37,11 @@ Vitest covers layout and prototype repository behavior; Playwright covers render
 The active CI desktop target is Linux on ubuntu-latest; Windows/macOS entries remain commented out per the latest user decision. CI is ready for a repository rooted at this project. This workspace currently inherits a parent Git repository; no external repository is created or connected automatically. Cross-platform CI runs cannot be claimed until such a repository runs the workflow. Windows/macOS launch checks remain external verification tasks.
 
 Private distribution uses Windows installers, per-architecture macOS DMGs with ad-hoc signing, and Linux AppImage/deb. There is no public signing, notarization, updater, analytics, or server in v0.
+
+## Phase 2 implementation
+
+`CalendarService` owns the SQLite connection and session compensation stack. Tauri lazily opens `calendar.sqlite3` in `app_data_dir` from a blocking worker, including directory creation and transactional migration. A shared mutex serializes access; renderer mutations also queue in invocation order. Initialization failures are returned as typed errors and may be retried; no reset fallback exists. Schema version 1 stores the default calendar, normalized event payloads with indexed range columns, and validated preferences. Future schema versions are rejected. Browser fixture URL parameters are ignored in native startup.
+
+IPC commands are `calendar_snapshot`, `save_event` (explicit create/update intent), `delete_event`, `undo_event`, `get_preferences`, `set_preferences`, and `resolve_local_time`. Snapshot queries use exclusive instant/date bounds and include overlapping events. Event IDs are UUIDs; the default calendar retains the contract identity `local-default`. UTC instants are canonicalized before persistence. Errors carry code/message/offset choices without exposing database paths or SQL.
+
+The editor submits raw local wall-clock values to Rust before building its UTC contract. Gaps are rejected and folds require explicit UTC-offset selection. A UTC instant already determines its offset unambiguously; `save_event` validates that normalized contract and the source IANA zone. Shared fixtures in `tests/fixtures/time.json` verify Rust and Luxon resolution. Failed save/delete input remains open. Undo compensates only committed mutations, remains available after failed writes, and clears on application restart. Preferences are durable and do not enter event undo history.

@@ -61,10 +61,12 @@ test('creates, edits, deletes, and undoes events through the editor', async ({ p
 
 test('provides keyboard creation, cancellation, view switching, and undo', async ({ page }) => {
   await page.goto('/?date=2026-10-09&scenario=empty');
+  await expect(page.getByRole('button', { name: 'New event' })).toBeVisible();
   await page.keyboard.press('n');
   await expect(page.getByRole('textbox', { name: 'Event title' })).toBeFocused();
   await page.keyboard.type('Keyboard event');
   await page.getByRole('button', { name: 'Create event', exact: true }).click();
+  await expect(page.getByRole('button', { name: /Keyboard event,/ })).toBeVisible();
   await page.keyboard.press('Control+z');
   await expect(page.getByRole('button', { name: /Keyboard event,/ })).toHaveCount(0);
   await page.getByRole('gridcell', { name: '9 October 2026', exact: true }).focus();
@@ -135,4 +137,23 @@ test('captures the review scenes', async ({ page }, testInfo) => {
   await expect(page.getByRole('button', { name: 'Show sidebar' })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('window-tiled.png') });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+});
+
+test('keeps DST gap input and requires an offset for repeated hours', async ({ page }) => {
+  await page.goto('/?date=2026-03-29&scenario=empty');
+  await page.getByRole('button', { name: 'New event' }).click();
+  await page.getByRole('textbox', { name: 'Event title' }).fill('DST event');
+  await page.getByLabel('Start time', { exact: true }).fill('02:30');
+  await page.getByRole('button', { name: 'Create event', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('does not exist');
+  await expect(page.getByLabel('Start time', { exact: true })).toHaveValue('02:30');
+  await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveValue('DST event');
+  await page.locator('#event-start-date').fill('2026-10-25');
+  await page.locator('#event-end-date').fill('2026-10-25');
+  await page.getByLabel('End time', { exact: true }).fill('03:30');
+  await page.getByRole('button', { name: 'Create event', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('occurs twice');
+  await page.getByLabel('start UTC offset').selectOption('60');
+  await page.getByRole('button', { name: 'Create event', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveCount(0);
 });

@@ -1,6 +1,6 @@
 # Phase 1 — Design prototype
 
-Status: **ready for user review; design acceptance pending.** Phase 2 must wait for this gate, as agreed in the planning conversation.
+Status: **design gate cleared by the user’s October 9 instruction to proceed with phase 2.** The notes below preserve the phase-1 review state; see phase-2.md for current behavior.
 
 ## Source and current review
 
