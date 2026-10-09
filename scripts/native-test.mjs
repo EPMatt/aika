@@ -38,16 +38,24 @@ async function start() {
   app.on('error', (error) => {
     spawnError = error;
   });
-  for (let attempt = 0; attempt < 100; attempt++) {
+  const deadline = Date.now() + 60000;
+  let ready = false;
+  while (Date.now() < deadline) {
     if (spawnError) throw spawnError;
     if (app.exitCode !== null) throw new Error(`Native test app exited: ${app.exitCode}`);
     try {
-      if ((await fetch(`http://127.0.0.1:${port}/status`)).ok) break;
+      if (
+        (await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(1000) })).ok
+      ) {
+        ready = true;
+        break;
+      }
     } catch {
       /* startup */
     }
     await new Promise((done) => setTimeout(done, 100));
   }
+  if (!ready) throw new Error(`Native WebDriver did not become ready on port ${port} within 60s`);
   browser = await remote({
     hostname: '127.0.0.1',
     port,

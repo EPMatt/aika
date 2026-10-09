@@ -78,7 +78,7 @@ jobs:
         run: pnpm desktop:test:build
       - name: Native webview and SQLite integration
         if: runner.os == 'Linux'
-        run: xvfb-run -a pnpm test:native
+        run: dbus-run-session -- xvfb-run -a pnpm test:native
         env:
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
       - uses: actions/upload-artifact@v4
