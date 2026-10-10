@@ -60,6 +60,33 @@ function calendarStyle(calendar: Calendar): CSSProperties {
 }
 
 const HOUR_HEIGHT = 72;
+const EDITOR_MARGIN = 18;
+type ClickPosition = { x: number; y: number };
+type CreateEvent = (
+  date: DateTime,
+  anchor: HTMLElement,
+  allDay?: boolean,
+  end?: DateTime,
+  position?: ClickPosition,
+) => void;
+
+function editorPosition(anchor: HTMLElement, position?: ClickPosition) {
+  return {
+    getBoundingClientRect: () => {
+      const rect = position
+        ? new DOMRect(position.x, position.y, 0, 0)
+        : anchor.getBoundingClientRect();
+      const clampX = (x: number) =>
+        Math.max(EDITOR_MARGIN, Math.min(x, window.innerWidth - EDITOR_MARGIN));
+      const clampY = (y: number) =>
+        Math.max(EDITOR_MARGIN, Math.min(y, window.innerHeight - EDITOR_MARGIN));
+      const left = clampX(rect.left);
+      const top = clampY(rect.top);
+      return new DOMRect(left, top, clampX(rect.right) - left, clampY(rect.bottom) - top);
+    },
+  };
+}
+
 const DRAG_TYPE = 'application/x-cal-event';
 const params = new URLSearchParams(window.location.search);
 const initialDate =
@@ -210,7 +237,7 @@ function MonthView({
   today: DateTime;
   events: CalendarEvent[];
   onSelect: (date: DateTime) => void;
-  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean, end?: DateTime) => void;
+  onCreate: CreateEvent;
   onEdit: (event: CalendarEvent, anchor: HTMLElement) => void;
   onMove: (id: string, date: DateTime, precise?: boolean) => void;
 }) {
@@ -392,13 +419,17 @@ function MonthView({
                       DateTime.max(first, last).plus({ days: 1 }),
                     );
                   }}
-                  onClick={() => {
-                    if (suppressClick.current) suppressClick.current = false;
-                    else onSelect(day);
-                  }}
-                  onDoubleClick={(e) => {
-                    if (!(e.target as HTMLElement).closest('button'))
-                      onCreate(day.set({ hour: 9 }), e.currentTarget, true);
+                  onClick={(e) => {
+                    if (suppressClick.current) {
+                      suppressClick.current = false;
+                      return;
+                    }
+                    if ((e.target as HTMLElement).closest('button')) return;
+                    onSelect(day);
+                    onCreate(day.set({ hour: 9 }), e.currentTarget, true, undefined, {
+                      x: e.clientX,
+                      y: e.clientY,
+                    });
                   }}
                   onDragOver={(e) => {
                     if (Array.from(e.dataTransfer.types).includes(DRAG_TYPE)) {
@@ -501,7 +532,7 @@ function TimeView({
   today: DateTime;
   view: 'week' | 'day';
   events: CalendarEvent[];
-  onCreate: (date: DateTime, anchor: HTMLElement, allDay?: boolean, end?: DateTime) => void;
+  onCreate: CreateEvent;
   onEdit: (event: CalendarEvent, anchor: HTMLElement) => void;
   onMove: (id: string, date: DateTime, precise?: boolean) => void;
   onResize: (id: string, end: DateTime) => void;
@@ -558,7 +589,8 @@ function TimeView({
       Math.max(0, Math.floor(((e.clientY - rect.top) / HOUR_HEIGHT) * 4) * 15),
     );
     const anchor = e.currentTarget;
-    perform(async () => onCreate(await at(day, minute), anchor));
+    const position = { x: e.clientX, y: e.clientY };
+    perform(async () => onCreate(await at(day, minute), anchor, false, undefined, position));
   };
   return (
     <div
@@ -1189,6 +1221,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
   const [editing, setEditing] = useState<{ event: CalendarEvent; existing: boolean } | null>(null);
   const editorAnchor = useRef<HTMLElement | null>(null);
+  const editorPositionRef = useRef<ReturnType<typeof editorPosition> | null>(null);
   const newButton = useRef<HTMLButtonElement>(null);
   const [announcement, setAnnouncement] = useState('');
   const [failure, setFailure] = useState('');
@@ -1309,9 +1342,16 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     }
   };
   const create = useCallback(
-    (day: DateTime, anchor: HTMLElement, allDay = false, end?: DateTime) => {
+    (
+      day: DateTime,
+      anchor: HTMLElement,
+      allDay = false,
+      end?: DateTime,
+      position?: ClickPosition,
+    ) => {
       if (!calendarReady || !calendar.writable) return;
       editorAnchor.current = anchor;
+      editorPositionRef.current = editorPosition(anchor, position);
       const event = { ...makeEvent(day, allDay), calendarId: calendar.id };
       if (end && event.time.kind === 'timed') event.time.end = end.toUTC().toISO()!;
       if (end && event.time.kind === 'allDay') event.time.endDate = dateKey(end);
@@ -1321,6 +1361,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   );
   const edit = (event: CalendarEvent, anchor: HTMLElement) => {
     editorAnchor.current = anchor;
+    editorPositionRef.current = editorPosition(anchor);
     setEditing({ event, existing: true });
   };
   const move = async (id: string, target: DateTime, precise = false) => {
@@ -1682,14 +1723,16 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               if (!open && !mutating) setEditing(null);
             }}
           >
-            <Popover.Anchor virtualRef={editorAnchor} />
+            <Popover.Anchor virtualRef={editorPositionRef} />
             <Popover.Portal>
               <Popover.Content
                 className="event-popover"
                 side="right"
                 align="start"
                 sideOffset={12}
-                collisionPadding={18}
+                collisionPadding={EDITOR_MARGIN}
+                sticky="always"
+                updatePositionStrategy="always"
                 onOpenAutoFocus={(e) => {
                   e.preventDefault();
                   requestAnimationFrame(() =>

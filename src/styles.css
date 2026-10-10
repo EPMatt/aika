@@ -745,8 +745,8 @@ input {
   background: var(--surface-raised);
   border: 1px solid var(--line-strong);
   border-radius: 14px;
-  width: 362px;
-  max-height: calc(100dvh - 36px);
+  width: min(362px, calc(100dvw - 36px), var(--radix-popover-content-available-width));
+  max-height: min(calc(100dvh - 36px), var(--radix-popover-content-available-height));
   overflow-y: auto;
   box-shadow: var(--shadow);
   animation: appear 0.15s ease-out;
