@@ -34,9 +34,9 @@ The credential service stays behind the backend boundary. Use persistent OS stor
 
 Vitest covers layout and prototype repository behavior; Playwright covers renderer flows and captures review images. Browser checks are not evidence of native integration. Phase 4 adds WebdriverIO embedded Tauri automation on Windows/macOS/Linux, with plugins enabled only in test builds, plus real-platform checks.
 
-The active CI desktop target is Linux on ubuntu-latest; Windows/macOS entries remain commented out per the latest user decision. The repository is now rooted at `project-cal`, so workflow paths match the app layout. Origin is `EPMatt/aika`, with `main` as the publication branch. Hosted CI and cross-platform execution still require observing actual workflow results. See `docs/repository-history.md` for the relocation and rewritten revision mapping. Windows/macOS launch checks remain external verification tasks.
+The active CI desktop target is Linux on Ubuntu 24.04; Windows/macOS entries remain commented out per the latest user decision. The repository is now rooted at `project-cal`, so workflow paths match the app layout. Origin is `EPMatt/aika`, with `main` as the publication branch. Hosted CI and cross-platform execution still require observing actual workflow results. See `docs/repository-history.md` for the relocation and rewritten revision mapping. Windows/macOS launch checks remain external verification tasks.
 
-Private distribution uses Windows installers, per-architecture macOS DMGs with ad-hoc signing, and Linux AppImage/deb. There is no public signing, notarization, updater, analytics, or server in v0.
+Private distribution uses Windows installers, per-architecture macOS DMGs with ad-hoc signing, and Linux AppImage/deb/RPM. There is no public signing, notarization, updater, analytics, or server in v0.
 
 ## Phase 2 implementation
 
@@ -94,7 +94,9 @@ At the user's request after phase 4, Git metadata lives physically in `project-c
 
 ## Phase 5 private distribution boundary
 
-`pnpm alpha:build` maps four explicit target triples to Linux deb/AppImage, Windows current-user NSIS, and separate Intel/Apple Silicon macOS DMGs. macOS remains ad-hoc signed, with minimum version 14.0; Windows/Linux candidates are unsigned. The command builds release mode without test features, removes only generated bundle output, rejects target-directory overrides and version drift, and refuses to overwrite an existing candidate. The existing Rust release guard prevents a test-driver feature from shipping.
+`pnpm alpha:build` maps four explicit target triples to Linux deb/RPM/AppImage, Windows current-user NSIS, and separate Intel/Apple Silicon macOS DMGs. macOS remains ad-hoc signed, with minimum version 14.0; Windows/Linux candidates are unsigned. The command builds release mode without test features, removes only generated bundle output, rejects target-directory overrides and version drift, and refuses to overwrite an existing candidate. The existing Rust release guard prevents a test-driver feature from shipping.
+
+RPM uses Tauri's built-in bundler and GTK 3/WebKitGTK 4.1 shared-library requirements. The Linux release CI baseline is pinned to Ubuntu 24.04 and runs `scripts/linux-rpm-check.py` before upload, checking candidate checksums, RPM metadata/dependencies, the x86_64 executable and permissions, launcher, and icons without installing the package. Fedora DNF installation and desktop/restart checks remain separate pending acceptance evidence. The standalone CLI is not included in desktop installers.
 
 Collection requires exactly one installer per expected extension and excludes other generated files. Candidate names include version and architecture; the manifest records source revision (including dirty state), sizes, hashes, signing, and pending acceptance. SHA256SUMS also covers the manifest and release notes. Hashes establish byte integrity, not publisher authenticity. CI uploads this private candidate directory separately from debug automation evidence, retaining the user's disabled Windows/macOS jobs. No updater, publishing, signing service, credential access, or production data-directory override is introduced.
 

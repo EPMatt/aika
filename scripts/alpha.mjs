@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 export const targets = {
   'x86_64-unknown-linux-gnu': {
     platform: 'linux',
-    bundles: ['deb', 'appimage'],
-    extensions: ['.deb', '.AppImage'],
+    bundles: ['deb', 'rpm', 'appimage'],
+    extensions: ['.deb', '.rpm', '.AppImage'],
   },
   'x86_64-pc-windows-msvc': { platform: 'win32', bundles: ['nsis'], extensions: ['.exe'] },
   'aarch64-apple-darwin': { platform: 'darwin', bundles: ['dmg'], extensions: ['.dmg'] },
