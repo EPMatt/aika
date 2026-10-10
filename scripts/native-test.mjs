@@ -244,7 +244,7 @@ try {
   await fill('[aria-label="Calendar description"]', 'Native persisted description');
   await click('[aria-label="Blue"]');
   await click('.calendar-form button[type="submit"]');
-  await browser.$('[aria-label="Native Work"]').waitForDisplayed();
+  await browser.$('.calendar-name[title="Native Work"]').waitForDisplayed();
   async function calendarMenu(name) {
     const trigger = await browser.$(`[aria-label="Options for ${name}"]`);
     await trigger.waitForEnabled();
@@ -275,12 +275,21 @@ try {
   await fill('[aria-label="Event title"]', 'Native Work event');
   await click('button[type="submit"]');
   await eventCount(1);
-  await click('[aria-label="Native Work"]');
+  await click('[aria-label="Hide Native Work calendar"]');
   await eventCount(0);
   await stop();
   await start();
-  assert.equal(await browser.$('[aria-label="Native Work"]').getAttribute('aria-pressed'), 'false');
-  assert.match(await browser.$('[aria-label="Native Work"]').getText(), /Default/);
+  assert.equal(
+    await browser.$('[aria-label="Show Native Work calendar"]').getAttribute('aria-pressed'),
+    'false',
+  );
+  assert.match(
+    await browser.execute(
+      (element) => element.parentElement.textContent,
+      await browser.$('.calendar-name[title="Native Work"]'),
+    ),
+    /Default/,
+  );
   await calendarMenu('Native Work');
   await click('[role="menuitem"]=Settings');
   assert.equal(

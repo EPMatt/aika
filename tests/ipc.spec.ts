@@ -168,7 +168,7 @@ test('normalized calendar metadata and read-only capability control the same vie
   });
   await page.goto('/');
   await expect(page.getByRole('button', { name: 'New event' })).toBeDisabled();
-  await expect(page.locator('.calendar-toggle')).toContainText('Shared schedule');
+  await expect(page.locator('.calendar-label')).toContainText('Shared schedule');
   await page.locator('.event-chip').click();
   await expect(page.getByRole('textbox', { name: 'Event title' })).toBeDisabled();
   await expect(page.locator('.editor-calendar')).toContainText('Shared schedule');

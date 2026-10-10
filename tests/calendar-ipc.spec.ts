@@ -105,7 +105,7 @@ test('calendar write failures retain drafts and visibility; reload hydrates meta
     .click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   const openMenu = async (name: string) => {
-    await page.getByRole('button', { name, exact: true }).hover();
+    await page.locator('.calendar-name').getByText(name, { exact: true }).hover();
     await page.getByRole('button', { name: `Options for ${name}` }).click();
   };
   await openMenu('Work');
@@ -119,32 +119,32 @@ test('calendar write failures retain drafts and visibility; reload hydrates meta
     'database is unavailable',
   );
   await expect(page.getByLabel('Calendar name')).toHaveValue('Office');
-  await expect(page.locator('.calendar-toggle[aria-label="Work"]')).toHaveCount(1);
+  await expect(page.locator('.calendar-name').getByText('Work', { exact: true })).toHaveCount(1);
   await page.getByRole('button', { name: 'Save changes' }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await openMenu('Office');
   await page.getByRole('menuitem', { name: 'Set as default' }).click();
-  await expect(page.getByRole('button', { name: 'Office', exact: true })).toContainText('Default');
+  const officeRow = page
+    .locator('.calendar-row')
+    .filter({ has: page.getByText('Office', { exact: true }) });
+  await expect(officeRow).toContainText('Default');
   await page.evaluate(() => {
     (window as any).calendarFailCommand = 'set_calendar_visibility';
   });
-  await page.getByRole('button', { name: 'Office', exact: true }).click();
+  await page.getByRole('button', { name: 'Hide Office calendar', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('database is unavailable');
-  await expect(page.getByRole('button', { name: 'Office', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'true',
-  );
-  await page.getByRole('button', { name: 'Office', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Office', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'false',
-  );
+  await expect(
+    page.getByRole('button', { name: 'Hide Office calendar', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: 'Hide Office calendar', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Show Office calendar', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'false');
   await page.reload();
-  await expect(page.getByRole('button', { name: 'Office', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'false',
-  );
-  await expect(page.getByRole('button', { name: 'Office', exact: true })).toContainText('Default');
+  await expect(
+    page.getByRole('button', { name: 'Show Office calendar', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'false');
+  await expect(officeRow).toContainText('Default');
   await openMenu('Office');
   await page.getByRole('menuitem', { name: 'Settings', exact: true }).click();
   await expect(page.getByLabel('Calendar description')).toHaveValue('Office schedule');
@@ -177,7 +177,9 @@ test('focus refresh preserves calendar settings drafts and rejects stale metadat
     (window as any).calendarTestState.calendars[0].name = 'External name';
     window.dispatchEvent(new Event('focus'));
   });
-  await expect(page.locator('.calendar-toggle[aria-label="External name"]')).toHaveCount(1);
+  await expect(
+    page.locator('.calendar-name').getByText('External name', { exact: true }),
+  ).toHaveCount(1);
   await expect(page.getByLabel('Calendar name')).toHaveValue('Unsaved draft');
   await page.getByRole('button', { name: 'Save changes' }).click();
   await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Reopen its settings');

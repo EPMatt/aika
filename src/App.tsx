@@ -4,10 +4,11 @@ import * as Popover from '@radix-ui/react-popover';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
   CalendarDays,
-  Check,
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Eye,
+  EyeOff,
   Keyboard,
   MapPin,
   PanelLeft,
@@ -1499,77 +1500,86 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     <Plus size={15} />
                   </button>
                 </div>
-                {calendars.map((item) => (
-                  <div className="calendar-row" key={item.id} style={calendarStyle(item)}>
-                    <button
-                      className="calendar-toggle"
-                      aria-label={item.name}
-                      aria-pressed={!hiddenCalendarIds.includes(item.id)}
-                      disabled={calendarBusy}
-                      onClick={() => {
-                        const visible = hiddenCalendarIds.includes(item.id);
-                        void calendarAction(
-                          async () => {
-                            if (desktop)
-                              await calendarClient.setCalendarVisibility(item.id, visible);
-                            else repository!.setCalendarVisibility(item.id, visible);
-                            setHiddenCalendarIds((current) =>
-                              visible
-                                ? current.filter((id) => id !== item.id)
-                                : [...current.filter((id) => id !== item.id), item.id],
-                            );
-                          },
-                          visible ? `${item.name} shown.` : `${item.name} hidden.`,
-                        );
-                      }}
-                    >
-                      <span
-                        className={`calendar-check ${!hiddenCalendarIds.includes(item.id) ? 'checked' : ''}`}
-                      >
-                        {!hiddenCalendarIds.includes(item.id) && (
-                          <Check size={11} strokeWidth={3} />
+                {calendars.map((item) => {
+                  const isVisible = !hiddenCalendarIds.includes(item.id);
+                  const visibilityLabel = `${isVisible ? 'Hide' : 'Show'} ${item.name} calendar`;
+                  return (
+                    <div className="calendar-row" key={item.id} style={calendarStyle(item)}>
+                      <div className="calendar-label">
+                        <span className="calendar-dot" aria-hidden="true" />
+                        <span className="calendar-name" title={item.name}>
+                          {item.name}
+                        </span>
+                        {item.id === defaultCalendarId && (
+                          <span className="calendar-local">Default</span>
                         )}
-                      </span>
-                      <span className="calendar-name">{item.name}</span>
-                      {item.id === defaultCalendarId && (
-                        <span className="calendar-local">Default</span>
-                      )}
-                    </button>
-                    <CalendarMenu
-                      calendar={item}
-                      isDefault={item.id === defaultCalendarId}
-                      busy={calendarBusy}
-                      onDefault={() =>
-                        void calendarAction(async () => {
-                          if (desktop) await calendarClient.setDefaultCalendar(item.id);
-                          else repository!.setDefaultCalendar(item.id);
-                          setDefaultCalendarId(item.id);
-                        }, `${item.name} is the default calendar.`)
-                      }
-                      onSettings={(anchor) => {
-                        calendarDialogAnchor.current = anchor;
-                        setCalendarFailure('');
-                        setCalendarDialog({ calendar: item });
-                      }}
-                      onDelete={async (anchor) => {
-                        calendarDialogAnchor.current = anchor;
-                        setCalendarBusy(true);
-                        try {
-                          const count = desktop
-                            ? await calendarClient.calendarEventCount(item.id)
-                            : repository!.calendarEventCount(item.id);
-                          setCalendarBusy(false);
-                          setCalendarFailure('');
-                          setDeletingCalendar({ calendar: item, count });
-                        } catch (err) {
-                          setFailure(errorMessage(err));
-                          setCalendarBusy(false);
-                          requestAnimationFrame(() => anchor.focus());
+                      </div>
+                      <CalendarMenu
+                        calendar={item}
+                        isDefault={item.id === defaultCalendarId}
+                        busy={calendarBusy}
+                        onDefault={() =>
+                          void calendarAction(async () => {
+                            if (desktop) await calendarClient.setDefaultCalendar(item.id);
+                            else repository!.setDefaultCalendar(item.id);
+                            setDefaultCalendarId(item.id);
+                          }, `${item.name} is the default calendar.`)
                         }
-                      }}
-                    />
-                  </div>
-                ))}
+                        onSettings={(anchor) => {
+                          calendarDialogAnchor.current = anchor;
+                          setCalendarFailure('');
+                          setCalendarDialog({ calendar: item });
+                        }}
+                        onDelete={async (anchor) => {
+                          calendarDialogAnchor.current = anchor;
+                          setCalendarBusy(true);
+                          try {
+                            const count = desktop
+                              ? await calendarClient.calendarEventCount(item.id)
+                              : repository!.calendarEventCount(item.id);
+                            setCalendarBusy(false);
+                            setCalendarFailure('');
+                            setDeletingCalendar({ calendar: item, count });
+                          } catch (err) {
+                            setFailure(errorMessage(err));
+                            setCalendarBusy(false);
+                            requestAnimationFrame(() => anchor.focus());
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="icon-button calendar-visibility"
+                        aria-label={visibilityLabel}
+                        title={visibilityLabel}
+                        aria-pressed={isVisible}
+                        disabled={calendarBusy}
+                        onClick={() => {
+                          const visible = !isVisible;
+                          void calendarAction(
+                            async () => {
+                              if (desktop)
+                                await calendarClient.setCalendarVisibility(item.id, visible);
+                              else repository!.setCalendarVisibility(item.id, visible);
+                              setHiddenCalendarIds((current) =>
+                                visible
+                                  ? current.filter((id) => id !== item.id)
+                                  : [...current.filter((id) => id !== item.id), item.id],
+                              );
+                            },
+                            visible ? `${item.name} shown.` : `${item.name} hidden.`,
+                          );
+                        }}
+                      >
+                        {isVisible ? (
+                          <Eye size={16} aria-hidden="true" />
+                        ) : (
+                          <EyeOff size={16} aria-hidden="true" />
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
                 {calendarReady && calendars.length === 0 && (
                   <p className="calendar-empty">No calendars yet. Use + to create one.</p>
                 )}
