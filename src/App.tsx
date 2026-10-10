@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Keyboard,
   MapPin,
   PanelLeft,
   Plus,
@@ -41,6 +42,7 @@ import type { Appearance, View } from './calendar';
 import type { PrototypeRepository } from './prototype';
 import { calendarClient, desktop, errorMessage, resolveWallTime } from './client';
 import { CalendarForm, CalendarMenu } from './CalendarControls';
+import { SidebarPopup } from './SidebarPopup';
 import type { ServiceError } from './generated/ServiceError';
 
 const defaultCalendar = personalCalendar;
@@ -109,7 +111,7 @@ function IconButton({
 }: {
   label: string;
   children: React.ReactNode;
-  onClick?: () => void;
+  onClick?: (event: MouseEvent<HTMLButtonElement>) => void;
   disabled?: boolean;
   className?: string;
 }) {
@@ -1213,7 +1215,8 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [calendarBusy, setCalendarBusy] = useState(false);
   const [calendarFailure, setCalendarFailure] = useState('');
   const [appearance, setAppearance] = useState<Appearance>(initialAppearance);
-  const [settings, setSettings] = useState(false);
+  const [activePopup, setActivePopup] = useState<'settings' | 'shortcuts' | null>(null);
+  const popupOpener = useRef<HTMLElement | null>(null);
   const [runtime, setRuntime] = useState('browser');
 
   const calendar = calendars.find((c) => c.id === defaultCalendarId) ?? emptyCalendar;
@@ -1433,7 +1436,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       if (
         target.closest('input, textarea, select, [contenteditable="true"]') ||
         editing ||
-        settings ||
+        activePopup ||
         calendarDialog ||
         deletingCalendar ||
         document.querySelector('[role="menu"]')
@@ -1456,7 +1459,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [date, editing, settings, calendarDialog, deletingCalendar, create]);
+  }, [date, editing, activePopup, calendarDialog, deletingCalendar, create]);
 
   const heading = view === 'day' ? date.toFormat('cccc') : date.toFormat('LLLL');
   const subheading = view === 'day' ? date.toFormat('d LLLL yyyy') : String(date.year);
@@ -1573,8 +1576,23 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               </div>
               <div className="sidebar-bottom">
                 <div className="sidebar-footer">
-                  <IconButton label="Open settings" onClick={() => setSettings(true)}>
+                  <IconButton
+                    label="Open settings"
+                    onClick={(event) => {
+                      popupOpener.current = event.currentTarget;
+                      setActivePopup('settings');
+                    }}
+                  >
                     <Settings2 size={16} />
+                  </IconButton>
+                  <IconButton
+                    label="Open keyboard shortcuts"
+                    onClick={(event) => {
+                      popupOpener.current = event.currentTarget;
+                      setActivePopup('shortcuts');
+                    }}
+                  >
+                    <Keyboard size={16} />
                   </IconButton>
                 </div>
               </div>
@@ -1908,49 +1926,50 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               </Dialog.Content>
             </Dialog.Portal>
           </Dialog.Root>
-          <Dialog.Root open={settings} onOpenChange={setSettings}>
-            <Dialog.Portal>
-              <Dialog.Overlay className="dialog-overlay" />
-              <Dialog.Content className="settings-dialog" aria-describedby={undefined}>
-                <div className="settings-heading">
-                  <Dialog.Title>Settings</Dialog.Title>
-                  <Dialog.Close asChild>
-                    <button className="icon-button" aria-label="Close settings">
-                      <X size={17} />
-                    </button>
-                  </Dialog.Close>
-                </div>
-                <div className="settings-row">
-                  <span>Appearance</span>
-                  <select
-                    aria-label="Appearance preference"
-                    value={appearance}
-                    onChange={(e) => setAppearance(e.target.value as Appearance)}
-                  >
-                    <option value="system">Follow system</option>
-                    <option value="light">Light</option>
-                    <option value="dark">Dark</option>
-                  </select>
-                </div>
-                <p className="settings-footnote">
-                  N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes.
-                  Enter opens a focused event to edit its dates and times. Enter on a calendar date
-                  or time column creates an event. Arrow keys navigate month dates.
-                </p>
-                <div className="settings-row">
-                  <span>Time zone</span>
-                  <span className="muted">{DateTime.local().zoneName}</span>
-                </div>
-                <div className="settings-row">
-                  <span>Region</span>
-                  <span className="muted">{resolveLocale()}</span>
-                </div>
-                <p className="settings-footnote">
-                  Dates and times follow your device’s regional preferences.
-                </p>
-              </Dialog.Content>
-            </Dialog.Portal>
-          </Dialog.Root>
+          <SidebarPopup
+            open={activePopup === 'settings'}
+            onOpenChange={(open) => setActivePopup(open ? 'settings' : null)}
+            title="Settings"
+            closeLabel="Close settings"
+            opener={popupOpener}
+          >
+            <div className="settings-row">
+              <span>Appearance</span>
+              <select
+                aria-label="Appearance preference"
+                value={appearance}
+                onChange={(e) => setAppearance(e.target.value as Appearance)}
+              >
+                <option value="system">Follow system</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </div>
+            <div className="settings-row">
+              <span>Time zone</span>
+              <span className="muted">{DateTime.local().zoneName}</span>
+            </div>
+            <div className="settings-row">
+              <span>Region</span>
+              <span className="muted">{resolveLocale()}</span>
+            </div>
+            <p className="settings-footnote">
+              Dates and times follow your device’s regional preferences.
+            </p>
+          </SidebarPopup>
+          <SidebarPopup
+            open={activePopup === 'shortcuts'}
+            onOpenChange={(open) => setActivePopup(open ? 'shortcuts' : null)}
+            title="Keyboard shortcuts"
+            closeLabel="Close keyboard shortcuts"
+            opener={popupOpener}
+          >
+            <p className="settings-footnote">
+              N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes. Enter
+              opens a focused event to edit its dates and times. Enter on a calendar date or time
+              column creates an event. Arrow keys navigate month dates.
+            </p>
+          </SidebarPopup>
           <div className="sr-only" role="status" aria-live="polite">
             {announcement}
           </div>

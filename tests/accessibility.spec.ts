@@ -21,7 +21,7 @@ async function openCalendarMenu(page: Page) {
 }
 
 for (const theme of ['light', 'dark']) {
-  test(`${theme} calendar views, editor, and settings have no serious accessibility violations`, async ({
+  test(`${theme} calendar views, editor, settings, and shortcuts have no serious accessibility violations`, async ({
     page,
   }) => {
     test.setTimeout(60_000);
@@ -37,6 +37,9 @@ for (const theme of ['light', 'dark']) {
     await audit(page);
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+    await audit(page);
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Open keyboard shortcuts', exact: true }).click();
     await audit(page);
   });
 

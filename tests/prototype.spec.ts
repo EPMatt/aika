@@ -81,6 +81,53 @@ test('provides keyboard creation, cancellation, view switching, and undo', async
   await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveCount(0);
 });
 
+for (const popup of ['Settings', 'Keyboard shortcuts']) {
+  test(`${popup} dismisses, restores focus, and suppresses calendar shortcuts`, async ({
+    page,
+  }) => {
+    await page.goto('/?date=2026-10-09&scenario=empty&theme=light');
+    await page.getByRole('button', { name: 'New event' }).click();
+    await page.getByRole('textbox', { name: 'Event title' }).fill('Keep this event');
+    await page.getByRole('button', { name: 'Create event', exact: true }).click();
+    await page.getByRole('button', { name: 'Previous month' }).click();
+
+    const opener = page.getByRole('button', { name: `Open ${popup.toLowerCase()}`, exact: true });
+    const dialog = page.getByRole('dialog', { name: popup, exact: true });
+    const close = page.getByRole('button', { name: `Close ${popup.toLowerCase()}`, exact: true });
+    const shortcutText = 'N creates an event; T returns to today;';
+
+    for (const dismissal of ['Escape', 'outside', 'close']) {
+      await opener.click();
+      await expect(page.getByRole('dialog')).toHaveCount(1);
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByText(shortcutText, { exact: false })).toHaveCount(
+        popup === 'Keyboard shortcuts' ? 1 : 0,
+      );
+      await expect(dialog.getByLabel('Appearance preference')).toHaveCount(
+        popup === 'Settings' ? 1 : 0,
+      );
+      await close.focus();
+      for (const key of ['n', 't', '1', '2', '3', 'Control+z', 'Meta+z']) {
+        await page.keyboard.press(key);
+      }
+      await expect(page.getByRole('textbox', { name: 'Event title' })).toHaveCount(0);
+
+      if (dismissal === 'outside') await page.mouse.click(10, 10);
+      else if (dismissal === 'close') await close.click();
+      else await page.keyboard.press('Escape');
+      await expect(dialog).toHaveCount(0);
+      await expect(opener).toBeFocused();
+      await expect(page.getByRole('heading', { name: 'September 2026' })).toBeVisible();
+      await expect(page.locator('.month-cell[role="gridcell"]')).toHaveCount(42);
+    }
+
+    await page.keyboard.press('t');
+    await expect(page.getByRole('button', { name: /Keep this event,/ })).toBeVisible();
+    await page.keyboard.press('Control+z');
+    await expect(page.getByRole('button', { name: /Keep this event,/ })).toHaveCount(0);
+  });
+}
+
 test('captures the review scenes', async ({ page }, testInfo) => {
   test.setTimeout(60_000);
   for (const theme of ['light', 'dark']) {
