@@ -491,3 +491,270 @@ fn cli_uses_default_and_preserves_calendar_after_original_is_deleted() {
         .calendars
         .is_empty());
 }
+
+#[test]
+fn calendar_crud_settings_and_desktop_persistence() {
+    let f = Fixture::new();
+    let personal = f.success(&["calendars", "get", "local-default"]);
+    assert!(personal.contains("Name: Personal\n"));
+    assert!(personal.contains("Default: true\n"));
+    assert!(personal.contains("Visible: true\n"));
+    let created = f.success(&[
+        "calendars",
+        "create",
+        "--name",
+        "  Work  ",
+        "--description",
+        "Office",
+        "--color",
+        "#5B7FA3",
+    ]);
+    let calendar_id = id(&created);
+    assert!(uuid::Uuid::parse_str(calendar_id).is_ok());
+    assert!(created.contains("Name: Work\n"));
+    assert!(created.contains("Default: false\n"));
+    let mut desktop = CalendarService::open(&f.0).unwrap();
+    let original = desktop.calendar_management_snapshot().unwrap().calendars[1].clone();
+    let updated = f.success(&[
+        "calendars",
+        "update",
+        calendar_id,
+        "--name",
+        "Office calendar",
+    ]);
+    assert!(updated.contains("Description: Office\n"));
+    assert!(updated.contains("Color: #5B7FA3\n"));
+    assert_eq!(
+        desktop
+            .update_calendar(
+                calendar_id,
+                aika_core::contracts::CalendarDetails {
+                    name: "Stale".into(),
+                    description: "".into(),
+                    color: "#718675".into(),
+                },
+                original
+            )
+            .unwrap_err()
+            .code,
+        "conflict"
+    );
+    let cleared = f.success(&["calendars", "update", calendar_id, "--description", ""]);
+    assert!(cleared.contains("Description: \n"));
+    f.success(&["calendars", "set-default", calendar_id]);
+    f.success(&["calendars", "hide", calendar_id]);
+    let snapshot = desktop.calendar_management_snapshot().unwrap();
+    assert_eq!(snapshot.default_calendar_id.as_deref(), Some(calendar_id));
+    assert_eq!(snapshot.hidden_calendar_ids, vec![calendar_id]);
+    let listed = f.success(&["calendars", "list"]);
+    assert!(listed.find("local-default").unwrap() < listed.find(calendar_id).unwrap());
+    assert!(listed.contains(&format!(
+        "{calendar_id}  Office calendar  #5B7FA3  default=true  visible=false"
+    )));
+    let event = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Uses default",
+        "--all-day",
+        "--start",
+        "2026-10-10",
+        "--end",
+        "2026-10-11",
+    ]);
+    assert_eq!(desktop.get(id(&event)).unwrap().calendar_id, calendar_id);
+    // Event creation reveals its calendar; hiding still does not affect CLI event listing.
+    f.success(&["calendars", "hide", calendar_id]);
+    assert!(f
+        .success(&[
+            "events",
+            "list",
+            "--from",
+            "2026-10-10",
+            "--to",
+            "2026-10-11"
+        ])
+        .contains(id(&event)));
+    f.success(&["calendars", "show", calendar_id]);
+    assert!(desktop
+        .calendar_management_snapshot()
+        .unwrap()
+        .hidden_calendar_ids
+        .is_empty());
+    drop(desktop);
+    let reopened = CalendarService::open(&f.0).unwrap();
+    let snapshot = reopened.calendar_management_snapshot().unwrap();
+    assert_eq!(snapshot.calendars[1].name, "Office calendar");
+    assert!(snapshot.calendars[1].description.is_empty());
+    assert_eq!(snapshot.default_calendar_id.as_deref(), Some(calendar_id));
+}
+
+#[test]
+fn calendar_deletion_requires_force_and_recovers_from_empty_database() {
+    let f = Fixture::new();
+    let first = f.success(&["calendars", "create", "--name", "Work"]);
+    let first_id = id(&first);
+    assert!(first.contains("Color: #718675\n"));
+    let second = f.success(&["calendars", "create", "--name", "Other"]);
+    let second_id = id(&second);
+    f.success(&["calendars", "set-default", first_id]);
+    let event = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Keep me",
+        "--all-day",
+        "--start",
+        "2026-10-10",
+        "--end",
+        "2026-10-11",
+    ]);
+    let rejected = f.run(&["calendars", "delete", first_id]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--force"));
+    let desktop = CalendarService::open(&f.0).unwrap();
+    assert_eq!(
+        desktop.default_calendar_id().unwrap().as_deref(),
+        Some(first_id)
+    );
+    assert_eq!(desktop.get(id(&event)).unwrap().title, "Keep me");
+    assert_eq!(
+        f.success(&["calendars", "delete", first_id, "--force"]),
+        format!("Deleted {first_id}\n")
+    );
+    assert_eq!(desktop.get(id(&event)).unwrap_err().code, "notFound");
+    assert_eq!(
+        desktop.default_calendar_id().unwrap().as_deref(),
+        Some("local-default")
+    );
+    f.success(&["calendars", "delete", "local-default"]);
+    assert_eq!(
+        desktop.default_calendar_id().unwrap().as_deref(),
+        Some(second_id)
+    );
+    f.success(&["calendars", "delete", second_id]);
+    assert!(f.success(&["calendars", "list"]).is_empty());
+    assert!(desktop.default_calendar_id().unwrap().is_none());
+    let output = f.run(&[
+        "events",
+        "create",
+        "--title",
+        "No calendar",
+        "--all-day",
+        "--start",
+        "2026-10-10",
+        "--end",
+        "2026-10-11",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("calendars create"));
+    let replacement = f.success(&["calendars", "create", "--name", "New first"]);
+    assert!(replacement.contains("Default: true\n"));
+    assert_eq!(
+        desktop.default_calendar_id().unwrap().as_deref(),
+        Some(id(&replacement))
+    );
+}
+
+#[test]
+fn calendar_validation_missing_ids_and_terminal_safe_output() {
+    let f = Fixture::new();
+    for args in [
+        vec!["calendars", "create"],
+        vec!["calendars", "create", "--name", "   "],
+        vec![
+            "calendars",
+            "create",
+            "--name",
+            "Bad color",
+            "--color",
+            "#ffffff",
+        ],
+        vec!["calendars", "update", "local-default"],
+    ] {
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!f.0.exists());
+    }
+    let created = f.success(&[
+        "calendars",
+        "create",
+        "--name",
+        "Safe\n\x1bName",
+        "--description",
+        "Line\nTab\tEnd",
+    ]);
+    assert!(created.contains("Name: Safe  Name\n"));
+    assert!(created.contains("Description: Line Tab End\n"));
+    assert!(!created.contains('\x1b'));
+    let before = f.success(&["calendars", "get", id(&created)]);
+    for args in [
+        vec!["calendars", "update", id(&created), "--name", ""],
+        vec!["calendars", "update", id(&created), "--color", "#ffffff"],
+    ] {
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(f.success(&["calendars", "get", id(&created)]), before);
+    }
+    let long_name = "x".repeat(101);
+    let long_description = "x".repeat(2001);
+    for args in [
+        vec!["calendars", "update", id(&created), "--name", &long_name],
+        vec![
+            "calendars",
+            "update",
+            id(&created),
+            "--description",
+            &long_description,
+        ],
+    ] {
+        assert_eq!(f.run(&args).status.code(), Some(2));
+        assert_eq!(f.success(&["calendars", "get", id(&created)]), before);
+    }
+    for color in [
+        "#718675", "#5B7FA3", "#8A6FA8", "#B56F86", "#B38B43", "#4F918A", "#B77B50", "#768390",
+    ] {
+        assert!(f
+            .success(&["calendars", "update", id(&created), "--color", color])
+            .contains(&format!("Color: {color}\n")));
+    }
+    for operation in ["get", "update", "delete", "set-default", "show", "hide"] {
+        let missing = uuid::Uuid::new_v4().to_string();
+        let mut args = vec!["calendars", operation, &missing];
+        if operation == "update" {
+            args.extend(["--name", "Missing"]);
+        }
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(3), "{operation}");
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(
+        f.run(&["calendars", "get", &id(&created)[..8]])
+            .status
+            .code(),
+        Some(3)
+    );
+    assert!(!f.success(&["calendars", "list"]).contains('\x1b'));
+}
+
+#[test]
+fn calendar_help_and_listing_do_not_require_time_zone() {
+    let f = Fixture::new();
+    assert!(f.success(&["--help"]).contains("calendars"));
+    assert!(f.success(&["calendars", "--help"]).contains("set-default"));
+    assert!(f
+        .success(&["calendars", "delete", "--help"])
+        .contains("--force"));
+    assert!(!f.0.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_aika-cli"))
+        .args(["calendars", "list", "--database"])
+        .arg(&f.0)
+        .env("TZ", "Bogus/Zone")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("local-default"));
+}

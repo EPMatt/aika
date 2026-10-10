@@ -1,6 +1,8 @@
 //! Backend-only provider registration. Adapters receive normalized, scoped operations.
 use crate::contracts::*;
-use crate::service::{error, validate_event, validate_range, LocalProvider};
+use crate::service::{
+    error, validate_event, validate_range, CalendarManagementSnapshot, LocalProvider,
+};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, ServiceError>;
@@ -42,6 +44,12 @@ pub trait Provider: Send {
     }
 
     fn collection_snapshot(&mut self, _range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn delete_calendar_guarded(&mut self, _id: &str, _force: bool) -> Result<()> {
         Err(error("unsupported", "Calendar management is unavailable."))
     }
     fn default_calendar_id(&self) -> Result<Option<String>> {
@@ -111,6 +119,12 @@ impl Provider for LocalProvider {
     }
     fn default_calendar_id(&self) -> Result<Option<String>> {
         LocalProvider::default_calendar_id(self)
+    }
+    fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
+        LocalProvider::calendar_management_snapshot(self)
+    }
+    fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
+        LocalProvider::delete_calendar_guarded(self, id, force)
     }
     fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
         LocalProvider::create_calendar(self, details)
@@ -250,6 +264,12 @@ impl ProviderRegistry {
     }
     pub fn default_calendar_id(&self) -> Result<Option<String>> {
         self.local()?.default_calendar_id()
+    }
+    pub fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
+        self.local()?.calendar_management_snapshot()
+    }
+    pub fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
+        self.local_mut()?.delete_calendar_guarded(id, force)
     }
     pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
         self.local_mut()?.create_calendar(details)

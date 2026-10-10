@@ -27,6 +27,9 @@ The standalone `aika-cli` uses the same Rust core and local calendars as the des
 
 ```sh
 pnpm cli --help
+pnpm cli calendars list
+pnpm cli calendars create --name "Work" --color '#5B7FA3'
+pnpm cli calendars set-default <calendar-id>
 pnpm cli events list --from 2026-10-01 --to 2026-11-01
 pnpm cli events create --title "Lunch" --start 2026-10-10T12:00 --end 2026-10-10T13:00 --time-zone Europe/Zurich
 pnpm cli events get <event-uuid>

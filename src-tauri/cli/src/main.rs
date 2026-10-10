@@ -1,6 +1,9 @@
 use aika_core::{
-    contracts::{CalendarEvent, EventRange, EventTime, ServiceError},
-    service::{error, resolve_local, validate_event, validate_range, CalendarService},
+    contracts::{Calendar, CalendarDetails, CalendarEvent, EventRange, EventTime, ServiceError},
+    service::{
+        error, resolve_local, validate_event, validate_range, CalendarManagementSnapshot,
+        CalendarService, LocalProvider,
+    },
     storage,
 };
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -20,11 +23,55 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List, inspect, create, update, delete, or configure local calendars.
+    Calendars {
+        #[command(subcommand)]
+        command: Calendars,
+    },
     /// List, inspect, create, update, or delete events.
     Events {
         #[command(subcommand)]
         command: Events,
     },
+}
+
+#[derive(Subcommand)]
+enum Calendars {
+    /// List all local calendars, including hidden calendars, in creation order.
+    List,
+    /// Show calendar metadata and settings using its exact ID.
+    Get { id: String },
+    /// Create a visible calendar. Supply --name; color defaults to sage.
+    Create(CalendarArgs),
+    /// Update supplied fields; an empty description clears it.
+    Update {
+        id: String,
+        #[command(flatten)]
+        fields: CalendarArgs,
+    },
+    /// Permanently delete a calendar and its events; populated calendars require --force.
+    Delete {
+        id: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Select the calendar used for new events.
+    SetDefault { id: String },
+    /// Show a calendar's events in the desktop app.
+    Show { id: String },
+    /// Hide a calendar's events in the desktop app.
+    Hide { id: String },
+}
+
+#[derive(Args, Clone)]
+struct CalendarArgs {
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    /// Palette hex: #718675, #5B7FA3, #8A6FA8, #B56F86, #B38B43, #4F918A, #B77B50, #768390.
+    #[arg(long, value_name = "HEX")]
+    color: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -276,13 +323,140 @@ fn describe(event: &CalendarEvent) -> String {
     )
 }
 
+fn calendar_details(fields: CalendarArgs, previous: Option<&Calendar>) -> Result<CalendarDetails> {
+    LocalProvider::validate_details(CalendarDetails {
+        name: required(
+            &fields.name.or_else(|| previous.map(|c| c.name.clone())),
+            "name",
+        )?,
+        description: fields
+            .description
+            .unwrap_or_else(|| previous.map(|c| c.description.clone()).unwrap_or_default()),
+        color: fields.color.unwrap_or_else(|| {
+            previous
+                .map(|c| c.color.clone())
+                .unwrap_or_else(|| "#718675".into())
+        }),
+    })
+}
+
+fn find_calendar<'a>(snapshot: &'a CalendarManagementSnapshot, id: &str) -> Result<&'a Calendar> {
+    snapshot
+        .calendars
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| {
+            error(
+                "notFound",
+                "This calendar no longer exists. Use calendars list to see exact IDs.",
+            )
+        })
+}
+
+fn describe_calendar(calendar: &Calendar, snapshot: &CalendarManagementSnapshot) -> String {
+    format!("ID: {}\nName: {}\nDescription: {}\nColor: {}\nProvider: {}\nWritable: {}\nDefault: {}\nVisible: {}\n",
+        single_line(&calendar.id), single_line(&calendar.name), single_line(&calendar.description),
+        single_line(&calendar.color), single_line(&calendar.provider_id), calendar.writable,
+        snapshot.default_calendar_id.as_deref() == Some(calendar.id.as_str()),
+        !snapshot.hidden_calendar_ids.contains(&calendar.id))
+}
+
+fn open_service(path: &std::path::Path) -> Result<CalendarService> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| error("storage", "Could not create database directory."))?;
+    }
+    CalendarService::open(path)
+}
+
+fn run_calendars(path: &std::path::Path, command: Calendars) -> Result<String> {
+    let created = match &command {
+        Calendars::Create(fields) => Some(calendar_details(fields.clone(), None)?),
+        Calendars::Update { fields, .. }
+            if fields.name.is_none() && fields.description.is_none() && fields.color.is_none() =>
+        {
+            return Err(error(
+                "validation",
+                "Supply --name, --description, or --color to update a calendar.",
+            ));
+        }
+        _ => None,
+    };
+    let mut service = open_service(path)?;
+    match command {
+        Calendars::List => {
+            let snapshot = service.calendar_management_snapshot()?;
+            let mut output = String::new();
+            for calendar in &snapshot.calendars {
+                writeln!(
+                    output,
+                    "{}  {}  {}  default={}  visible={}",
+                    single_line(&calendar.id),
+                    single_line(&calendar.name),
+                    single_line(&calendar.color),
+                    snapshot.default_calendar_id.as_deref() == Some(calendar.id.as_str()),
+                    !snapshot.hidden_calendar_ids.contains(&calendar.id)
+                )
+                .expect("write string");
+            }
+            Ok(output)
+        }
+        Calendars::Get { id } => {
+            let snapshot = service.calendar_management_snapshot()?;
+            Ok(describe_calendar(find_calendar(&snapshot, &id)?, &snapshot))
+        }
+        Calendars::Create(_) => {
+            let calendar = service.create_calendar(created.expect("create input parsed"))?;
+            Ok(describe_calendar(
+                &calendar,
+                &service.calendar_management_snapshot()?,
+            ))
+        }
+        Calendars::Update { id, fields } => {
+            let snapshot = service.calendar_management_snapshot()?;
+            let previous = find_calendar(&snapshot, &id)?.clone();
+            let details = calendar_details(fields, Some(&previous))?;
+            let updated = Calendar {
+                name: details.name.clone(),
+                description: details.description.clone(),
+                color: details.color.clone(),
+                ..previous.clone()
+            };
+            service.update_calendar(&id, details, previous)?;
+            Ok(describe_calendar(
+                &updated,
+                &service.calendar_management_snapshot()?,
+            ))
+        }
+        Calendars::Delete { id, force } => {
+            service.delete_calendar_guarded(&id, force)?;
+            Ok(format!("Deleted {}\n", single_line(&id)))
+        }
+        Calendars::SetDefault { id } => {
+            service.set_default_calendar(&id)?;
+            Ok(format!("Default calendar: {}\n", single_line(&id)))
+        }
+        Calendars::Show { id } => {
+            service.set_calendar_visibility(&id, true)?;
+            Ok(format!("Shown {}\n", single_line(&id)))
+        }
+        Calendars::Hide { id } => {
+            service.set_calendar_visibility(&id, false)?;
+            Ok(format!("Hidden {}\n", single_line(&id)))
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<String> {
     let path = match cli.database {
         Some(path) => path,
         None => storage::database_path()?,
     };
     // Parse inputs before opening (or initializing) a database.
-    let Command::Events { command } = cli.command;
+    let command = match cli.command {
+        Command::Calendars { command } => return run_calendars(&path, command),
+        Command::Events { command } => command,
+    };
     let listing = if let Events::List {
         from,
         to,
@@ -310,11 +484,7 @@ fn run(cli: Cli) -> Result<String> {
             return Err(error("validation", "Use the full event UUID."));
         }
     }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|_| error("storage", "Could not create database directory."))?;
-    }
-    let mut service = CalendarService::open(&path)?;
+    let mut service = open_service(&path)?;
     match command {
         Events::List { .. } => {
             let (range, zone) = listing.expect("list input parsed");
@@ -338,7 +508,7 @@ fn run(cli: Cli) -> Result<String> {
             event.calendar_id = service.default_calendar_id()?.ok_or_else(|| {
                 error(
                     "notFound",
-                    "Create a local calendar in the desktop app first.",
+                    "Create a local calendar with calendars create --name NAME first.",
                 )
             })?;
             Ok(describe(&service.save_checked(event, false, None)?))

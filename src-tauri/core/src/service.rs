@@ -149,6 +149,13 @@ struct HistoryEntry {
     after: Option<CalendarEvent>,
 }
 
+/// Calendar metadata and settings read together, without querying events.
+pub struct CalendarManagementSnapshot {
+    pub calendars: Vec<Calendar>,
+    pub default_calendar_id: Option<String>,
+    pub hidden_calendar_ids: Vec<String>,
+}
+
 pub struct LocalProvider {
     db: Connection,
     history: Vec<HistoryEntry>,
@@ -232,6 +239,27 @@ impl LocalProvider {
     pub fn calendars(&self) -> Result<Vec<Calendar>> {
         Self::read_calendars(&self.db)
     }
+    pub fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
+        let tx = self.db.unchecked_transaction()?;
+        let calendars = Self::read_calendars(&tx)?;
+        let default_calendar_id = tx.query_row(
+            "SELECT default_calendar_id FROM calendar_settings WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let hidden_calendar_ids = {
+            let mut statement =
+                tx.prepare("SELECT id FROM calendars WHERE visible=0 ORDER BY rowid")?;
+            let rows = statement.query_map([], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+        tx.commit()?;
+        Ok(CalendarManagementSnapshot {
+            calendars,
+            default_calendar_id,
+            hidden_calendar_ids,
+        })
+    }
     fn require_calendar(db: &Connection, id: &str) -> Result<()> {
         if !db.query_row(
             "SELECT EXISTS(SELECT 1 FROM calendars WHERE id=?1)",
@@ -242,7 +270,7 @@ impl LocalProvider {
         }
         Ok(())
     }
-    fn validate_details(mut details: CalendarDetails) -> Result<CalendarDetails> {
+    pub fn validate_details(mut details: CalendarDetails) -> Result<CalendarDetails> {
         details.name = details.name.trim().into();
         if details.name.is_empty()
             || details.name.chars().count() > 100
@@ -322,10 +350,21 @@ impl LocalProvider {
         )? as usize)
     }
     pub fn delete_calendar(&mut self, id: &str) -> Result<()> {
+        self.delete_calendar_guarded(id, true)
+    }
+    pub fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_calendar(&tx, id)?;
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM events WHERE calendar_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if count > 0 && !force {
+            return Err(error("validation", &format!("This calendar contains {count} event(s). Supply --force to delete the calendar and its events.")));
+        }
         tx.execute("DELETE FROM events WHERE calendar_id=?1", [id])?;
         tx.execute("DELETE FROM calendars WHERE id=?1", [id])?;
         tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars ORDER BY rowid LIMIT 1) WHERE default_calendar_id IS NULL", [])?;
@@ -589,6 +628,12 @@ impl CalendarService {
     }
     pub fn default_calendar_id(&self) -> Result<Option<String>> {
         self.providers.default_calendar_id()
+    }
+    pub fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
+        self.providers.calendar_management_snapshot()
+    }
+    pub fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
+        self.providers.delete_calendar_guarded(id, force)
     }
     pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
         self.providers.create_calendar(details)
@@ -1014,6 +1059,43 @@ mod tests {
         }
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn guarded_calendar_deletion_checks_events_added_by_another_connection() {
+        let path =
+            std::env::temp_dir().join(format!("aika-guarded-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut cli = CalendarService::open(&path).unwrap();
+        let mut desktop = CalendarService::open(&path).unwrap();
+        assert_eq!(cli.calendar_event_count("local-default").unwrap(), 0);
+        let original = desktop.save_checked(event(), false, None).unwrap();
+        assert_eq!(
+            cli.delete_calendar_guarded("local-default", false)
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+        assert_eq!(desktop.get(&original.id).unwrap(), original);
+        assert_eq!(
+            cli.default_calendar_id().unwrap().as_deref(),
+            Some("local-default")
+        );
+        cli.delete_calendar_guarded("local-default", true).unwrap();
+        assert_eq!(desktop.get(&original.id).unwrap_err().code, "notFound");
+        assert!(cli
+            .calendar_management_snapshot()
+            .unwrap()
+            .calendars
+            .is_empty());
+        assert_eq!(
+            cli.delete_calendar_guarded("local-default", false)
+                .unwrap_err()
+                .code,
+            "notFound"
+        );
+        drop(cli);
+        drop(desktop);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn metadata_visibility_default_and_external_discovery() {
         let path =
