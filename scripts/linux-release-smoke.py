@@ -64,12 +64,12 @@ with tempfile.TemporaryDirectory(prefix="aika-release-") as temporary:
                         "launch": attempt + 1,
                         "schema": db.execute("PRAGMA user_version").fetchone()[0],
                         "events": db.execute("SELECT count(*) FROM events").fetchone()[0],
-                        "calendars": db.execute("SELECT * FROM calendars").fetchall(),
+                        "calendars": db.execute("SELECT id,name FROM calendars").fetchall(),
                         "preferences": db.execute(
                             "SELECT payload FROM preferences"
                         ).fetchone()[0],
                     }
-                assert record["schema"] == 1 and record["events"] == 0
+                assert record["schema"] == 2 and record["events"] == 0
                 assert record["calendars"] == [("local-default", "Personal")]
                 with socket.socket() as connection:
                     connection.settimeout(0.5)

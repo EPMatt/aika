@@ -414,3 +414,80 @@ fn default_database_uses_desktop_identifier_in_xdg_data_directory() {
     drop(desktop);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn cli_uses_default_and_preserves_calendar_after_original_is_deleted() {
+    let f = Fixture::new();
+    let mut desktop = CalendarService::open(&f.0).unwrap();
+    let calendar = desktop
+        .create_calendar(aika_core::contracts::CalendarDetails {
+            name: "Work".into(),
+            description: "Office".into(),
+            color: "#5B7FA3".into(),
+        })
+        .unwrap();
+    desktop.set_default_calendar(&calendar.id).unwrap();
+    desktop.delete_calendar("local-default").unwrap();
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Work event",
+        "--all-day",
+        "--start",
+        "2026-10-10",
+        "--end",
+        "2026-10-11",
+    ]);
+    let id = id(&created);
+    assert!(created.contains(&format!("Calendar: {}", calendar.id)));
+    desktop
+        .set_calendar_visibility(&calendar.id, false)
+        .unwrap();
+    let listed = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-10-10",
+        "--to",
+        "2026-10-11",
+    ]);
+    assert!(listed.contains("Work event"));
+    let updated = f.success(&["events", "update", id, "--title", "Updated work event"]);
+    assert!(updated.contains(&format!("Calendar: {}", calendar.id)));
+    assert_eq!(desktop.get(id).unwrap().calendar_id, calendar.id);
+    f.success(&["events", "delete", id]);
+    desktop.delete_calendar(&calendar.id).unwrap();
+    let empty = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-10-10",
+        "--to",
+        "2026-10-11",
+    ]);
+    assert!(empty.is_empty());
+    let output = f.run(&[
+        "events",
+        "create",
+        "--title",
+        "No calendar",
+        "--all-day",
+        "--start",
+        "2026-10-10",
+        "--end",
+        "2026-10-11",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Create a local calendar"));
+    assert!(desktop
+        .collection_snapshot(aika_core::contracts::EventRange {
+            start: "2026-10-10T00:00:00Z".into(),
+            end: "2026-10-11T00:00:00Z".into(),
+            start_date: "2026-10-10".into(),
+            end_date: "2026-10-11".into(),
+        })
+        .unwrap()
+        .calendars
+        .is_empty());
+}

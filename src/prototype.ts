@@ -1,5 +1,9 @@
 import { DateTime } from 'luxon';
 import { dateKey, makeEvent } from './calendar';
+import { personalCalendar } from './calendars';
+import type { Calendar } from './generated/Calendar';
+import type { CalendarDetails } from './generated/CalendarDetails';
+import type { CalendarCollectionSnapshot } from './generated/CalendarCollectionSnapshot';
 import type { CalendarEvent } from './generated/CalendarEvent';
 
 export type Scenario = 'standard' | 'empty' | 'dense';
@@ -68,27 +72,81 @@ export function sampleEvents(today: DateTime, scenario: Scenario): CalendarEvent
 
 export class PrototypeRepository {
   private events: CalendarEvent[];
-  private history: CalendarEvent[][] = [];
-
+  private calendars: Calendar[] = [structuredClone(personalCalendar)];
+  private defaultCalendarId: string | null = personalCalendar.id;
+  private hiddenCalendarIds: string[] = [];
+  private history: { before: CalendarEvent | null; after: CalendarEvent | null }[] = [];
   constructor(events: CalendarEvent[]) {
     this.events = structuredClone(events);
   }
   list() {
     return structuredClone(this.events);
   }
+  snapshot(): CalendarCollectionSnapshot {
+    return structuredClone({
+      calendars: this.calendars,
+      events: this.events,
+      defaultCalendarId: this.defaultCalendarId,
+      hiddenCalendarIds: this.hiddenCalendarIds,
+      canUndo: this.canUndo(),
+    });
+  }
   canUndo() {
     return this.history.length > 0;
   }
   save(event: CalendarEvent) {
-    this.history.push(structuredClone(this.events));
+    const before = this.events.find((e) => e.id === event.id) ?? null;
+    this.history.push({ before: structuredClone(before), after: structuredClone(event) });
     this.events = [...this.events.filter((item) => item.id !== event.id), structuredClone(event)];
+    if (!before || before.calendarId !== event.calendarId)
+      this.setCalendarVisibility(event.calendarId, true);
   }
   delete(id: string) {
-    this.history.push(structuredClone(this.events));
+    const before = this.events.find((e) => e.id === id) ?? null;
+    this.history.push({ before: structuredClone(before), after: null });
     this.events = this.events.filter((event) => event.id !== id);
   }
   undo() {
-    const previous = this.history.pop();
-    if (previous) this.events = previous;
+    const entry = this.history.pop();
+    if (!entry) return;
+    const id = entry.before?.id ?? entry.after!.id;
+    this.events = this.events.filter((e) => e.id !== id);
+    if (entry.before) this.events.push(entry.before);
+  }
+  createCalendar(details: CalendarDetails) {
+    const calendar = {
+      ...details,
+      name: details.name.trim(),
+      id: crypto.randomUUID(),
+      providerId: 'local',
+      writable: true,
+    };
+    this.calendars.push(calendar);
+    this.defaultCalendarId ??= calendar.id;
+    return structuredClone(calendar);
+  }
+  updateCalendar(id: string, details: CalendarDetails) {
+    this.calendars = this.calendars.map((c) =>
+      c.id === id ? { ...c, ...details, name: details.name.trim() } : c,
+    );
+  }
+  deleteCalendar(id: string) {
+    this.calendars = this.calendars.filter((c) => c.id !== id);
+    this.events = this.events.filter((e) => e.calendarId !== id);
+    this.hiddenCalendarIds = this.hiddenCalendarIds.filter((c) => c !== id);
+    this.history = this.history.filter(
+      (e) => e.before?.calendarId !== id && e.after?.calendarId !== id,
+    );
+    if (this.defaultCalendarId === id) this.defaultCalendarId = this.calendars[0]?.id ?? null;
+  }
+  calendarEventCount(id: string) {
+    return this.events.filter((e) => e.calendarId === id).length;
+  }
+  setDefaultCalendar(id: string) {
+    this.defaultCalendarId = id;
+  }
+  setCalendarVisibility(id: string, visible: boolean) {
+    this.hiddenCalendarIds = this.hiddenCalendarIds.filter((c) => c !== id);
+    if (!visible) this.hiddenCalendarIds.push(id);
   }
 }

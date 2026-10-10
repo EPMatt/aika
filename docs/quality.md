@@ -25,6 +25,14 @@ The suite starts the debug executable with `AIKA_TEST_DATA_DIR` set to an isolat
 
 `native-test` is an explicit, optional Cargo feature, absent from ordinary builds. A compile-time guard rejects enabling it in release mode. There is no production automation permission or frontend mocking bridge. The embedded driver implements some actions by JavaScript dispatch inside the actual webview; this establishes webview/Rust integration but does not prove trusted OS pointer input, native drag-and-drop, or assistive-technology behavior.
 
+## Multiple local calendars
+
+The SQLite v2 migration preserves the existing Personal calendar, events, and appearance/view/sidebar preferences. Calendar metadata, visibility, and default selection persist independently. The browser repository remains an in-memory design harness; real SQLite restart verification uses the Rust and native suites.
+
+Calendar regression checks cover creation/settings, hover and keyboard menus, default selection, per-calendar colors and filtering in all views, checked event moves and undo, permanent calendar/event deletion, and the persistent zero-calendar state. CLI compatibility covers the current default and operation after Personal is deleted. Calendar deletion does not enter event undo history.
+
+Session verification passed: 24 Playwright tests (including both-theme accessibility audits), 28 Rust/CLI tests, 13 frontend unit tests, packaging tests, the frontend and native test builds, formatting checks, and workspace Clippy with warnings denied. The Linux native suite exercised calendar creation/settings/default/visibility, event moves, deletion, and restart with zero calendars through real IPC and a disposable SQLite database. The existing opt-in OS credential-store test remained skipped; Windows/macOS and manual platform checks remain pending.
+
 ## Manual platform checks before alpha acceptance
 
 Record OS/webview version, input method, display scale, exact outcome, and screenshot paths. Execute on Windows 11 x64, macOS 14+ Intel and Apple Silicon, Ubuntu 24.04+, and Arch Linux:

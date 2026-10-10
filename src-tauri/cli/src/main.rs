@@ -9,11 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use std::{fmt::Write, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
-#[command(
-    name = "aika-cli",
-    version,
-    about = "Manage aika's local Personal calendar"
-)]
+#[command(name = "aika-cli", version, about = "Manage aika's local calendars")]
 struct Cli {
     /// Use an explicit SQLite database instead of the desktop application's database.
     #[arg(long, global = true, value_name = "PATH")]
@@ -215,7 +211,9 @@ fn event_from_args(fields: EventArgs, previous: Option<&CalendarEvent>) -> Resul
         id: previous
             .map(|e| e.id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        calendar_id: "local-default".into(),
+        calendar_id: previous
+            .map(|event| event.calendar_id.clone())
+            .unwrap_or_else(|| "local-default".into()),
         title: required(
             &fields.title.or_else(|| previous.map(|e| e.title.clone())),
             "title",
@@ -320,7 +318,7 @@ fn run(cli: Cli) -> Result<String> {
     match command {
         Events::List { .. } => {
             let (range, zone) = listing.expect("list input parsed");
-            let snapshot = service.snapshot(range)?;
+            let snapshot = service.collection_snapshot(range)?;
             let mut output = String::new();
             for event in snapshot.events {
                 writeln!(
@@ -336,7 +334,13 @@ fn run(cli: Cli) -> Result<String> {
         }
         Events::Get { id } => Ok(describe(&service.get(&id)?)),
         Events::Create(_) => {
-            let event = created.expect("create input parsed");
+            let mut event = created.expect("create input parsed");
+            event.calendar_id = service.default_calendar_id()?.ok_or_else(|| {
+                error(
+                    "notFound",
+                    "Create a local calendar in the desktop app first.",
+                )
+            })?;
             Ok(describe(&service.save_checked(event, false, None)?))
         }
         Events::Update { id, fields } => {

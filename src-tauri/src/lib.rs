@@ -34,9 +34,62 @@ async fn with_service<T: Send + 'static>(
 async fn calendar_snapshot(
     state: tauri::State<'_, ServiceState>,
     range: EventRange,
-) -> Result<CalendarSnapshot, ServiceError> {
-    with_service(state.inner().clone(), move |s| s.snapshot(range)).await
+) -> Result<CalendarCollectionSnapshot, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.collection_snapshot(range)).await
 }
+
+#[tauri::command]
+async fn create_calendar(
+    state: tauri::State<'_, ServiceState>,
+    details: CalendarDetails,
+) -> Result<Calendar, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.create_calendar(details)).await
+}
+#[tauri::command]
+async fn update_calendar(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+    details: CalendarDetails,
+    expected: Calendar,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.update_calendar(&id, details, expected)
+    })
+    .await
+}
+#[tauri::command]
+async fn delete_calendar(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| s.delete_calendar(&id)).await
+}
+#[tauri::command]
+async fn calendar_event_count(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+) -> Result<usize, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.calendar_event_count(&id)).await
+}
+#[tauri::command]
+async fn set_default_calendar(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| s.set_default_calendar(&id)).await
+}
+#[tauri::command]
+async fn set_calendar_visibility(
+    state: tauri::State<'_, ServiceState>,
+    id: String,
+    visible: bool,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.set_calendar_visibility(&id, visible)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn save_event(
     state: tauri::State<'_, ServiceState>,
@@ -131,7 +184,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, save_event, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

@@ -8,13 +8,14 @@ pub struct AppInfo {
     pub provider: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Calendar {
     pub id: String,
     pub provider_id: String,
     pub name: String,
     pub color: String,
+    pub description: String,
     pub writable: bool,
 }
 
@@ -85,4 +86,22 @@ pub struct EventRange {
     pub end: String,
     pub start_date: String,
     pub end_date: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarDetails {
+    pub name: String,
+    pub description: String,
+    pub color: String,
+}
+
+#[derive(Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarCollectionSnapshot {
+    pub calendars: Vec<Calendar>,
+    pub events: Vec<CalendarEvent>,
+    pub default_calendar_id: Option<String>,
+    pub hidden_calendar_ids: Vec<String>,
+    pub can_undo: bool,
 }

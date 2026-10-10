@@ -1,6 +1,6 @@
 use cal_desktop_lib::contracts::{
-    AppInfo, Calendar, CalendarEvent, CalendarSnapshot, EventRange, EventTime, Preferences,
-    ServiceError,
+    AppInfo, Calendar, CalendarCollectionSnapshot, CalendarDetails, CalendarEvent,
+    CalendarSnapshot, EventRange, EventTime, Preferences, ServiceError,
 };
 use ts_rs::{Config, TS};
 
@@ -9,6 +9,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default().with_out_dir(directory);
     AppInfo::export_all(&config)?;
     Calendar::export_all(&config)?;
+    CalendarDetails::export_all(&config)?;
+    CalendarCollectionSnapshot::export_all(&config)?;
     EventTime::export_all(&config)?;
     CalendarEvent::export_all(&config)?;
     Preferences::export_all(&config)?;

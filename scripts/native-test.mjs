@@ -29,7 +29,7 @@ const port = Number(process.env.TAURI_WEBDRIVER_PORT ?? 4445);
 await mkdir('test-results/native', { recursive: true });
 let app;
 let browser;
-async function start() {
+async function start(expectCalendar = true) {
   app = spawn(binary, [], {
     env: { ...process.env, AIKA_TEST_DATA_DIR: directory, TAURI_WEBDRIVER_PORT: String(port) },
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -66,7 +66,8 @@ async function start() {
   await browser.waitUntil(async () => await browser.$('[data-runtime="desktop"]').isExisting(), {
     timeout: 15000,
   });
-  await browser.$('[aria-label="New event"]').waitForEnabled();
+  if (expectCalendar) await browser.$('[aria-label="New event"]').waitForEnabled();
+  else await browser.$('.calendar-empty-banner').waitForDisplayed();
   await browser.execute(() => {
     window.__nativeErrors = [];
     window.addEventListener('error', (e) => window.__nativeErrors.push(e.message));
@@ -236,8 +237,109 @@ try {
   await start();
   assert.equal((await browser.$$('.time-event')).length, 0);
   await eventCount(0);
+  // Calendar management through actual renderer -> Rust -> SQLite, including restart.
+  await click('button=Month');
+  await click('.sidebar [aria-label="Create calendar"]');
+  await fill('[aria-label="Calendar name"]', 'Native Work');
+  await fill('[aria-label="Calendar description"]', 'Native persisted description');
+  await click('[aria-label="Blue"]');
+  await click('.calendar-form button[type="submit"]');
+  await browser.$('[aria-label="Native Work"]').waitForDisplayed();
+  async function calendarMenu(name) {
+    const trigger = await browser.$(`[aria-label="Options for ${name}"]`);
+    await trigger.waitForEnabled();
+    await browser.execute((element) => {
+      element.focus();
+      element.click();
+    }, trigger);
+    await browser.$('[role="menu"]').waitForDisplayed();
+  }
+  async function chooseCalendar(label) {
+    const select = await browser.$('[aria-label="Event calendar"]');
+    await browser.execute(
+      (element, name) => {
+        element.value = Array.from(element.options).find((option) => option.text === name).value;
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      },
+      select,
+      label,
+    );
+  }
+  await calendarMenu('Native Work');
+  await click('button=Set as default');
+  await click('[aria-label="New event"]');
+  assert.equal(
+    await browser.$('[aria-label="Event calendar"] option:checked').getText(),
+    'Native Work',
+  );
+  await fill('[aria-label="Event title"]', 'Native Work event');
+  await click('button[type="submit"]');
+  await eventCount(1);
+  await click('[aria-label="Native Work"]');
+  await eventCount(0);
+  await stop();
+  await start();
+  assert.equal(await browser.$('[aria-label="Native Work"]').getAttribute('aria-pressed'), 'false');
+  assert.match(await browser.$('[aria-label="Native Work"]').getText(), /Default/);
+  await calendarMenu('Native Work');
+  await click('[role="menuitem"]=Settings');
+  assert.equal(
+    await browser.$('[aria-label="Calendar description"]').getValue(),
+    'Native persisted description',
+  );
+  assert.equal(await browser.$('[aria-label="Blue"]').getAttribute('aria-pressed'), 'true');
+  await fill('[aria-label="Calendar name"]', 'Native Office');
+  await fill('[aria-label="Calendar description"]', 'Updated native description');
+  await click('[aria-label="Rose"]');
+  await click('.calendar-form button[type="submit"]');
+  await browser.$('[aria-label="Native Office"]').waitForDisplayed();
+  await click('[aria-label="New event"]');
+  await fill('[aria-label="Event title"]', 'Native reveal event');
+  await click('button[type="submit"]');
+  await eventCount(2);
+  assert.equal(
+    await browser.$('[aria-label="Native Office"]').getAttribute('aria-pressed'),
+    'true',
+  );
+  await click('.event-chip[aria-label^="Native Work event,"]');
+  await chooseCalendar('Personal');
+  await click('button[type="submit"]');
+  await browser.waitUntil(async () =>
+    (
+      await browser.$('.event-chip[aria-label^="Native Work event,"]').getAttribute('aria-label')
+    ).includes('Personal'),
+  );
+  await stop();
+  await start();
+  await calendarMenu('Native Office');
+  await click('[role="menuitem"]=Settings');
+  assert.equal(await browser.$('[aria-label="Calendar name"]').getValue(), 'Native Office');
+  assert.equal(
+    await browser.$('[aria-label="Calendar description"]').getValue(),
+    'Updated native description',
+  );
+  assert.equal(await browser.$('[aria-label="Rose"]').getAttribute('aria-pressed'), 'true');
+  await browser.keys('Escape');
+  await calendarMenu('Native Office');
+  await click('button=Delete calendar');
+  assert.match(await browser.$('.calendar-dialog').getText(), /all 1 of its events/);
+  await click('.calendar-dialog .danger-button');
+  await eventCount(1);
+  await calendarMenu('Personal');
+  await click('button=Delete calendar');
+  await click('.calendar-dialog .danger-button');
+  await eventCount(0);
+  await stop();
+  await start(false);
+  assert.equal((await browser.$$('.calendar-row')).length, 0);
+  assert.equal(await browser.$('[aria-label="New event"]').isEnabled(), false);
+  assert.equal(await browser.$('button=Undo').isExisting(), false);
+  assert.equal(
+    await cli('list', '--from', bounds.from, '--to', bounds.to, '--time-zone', bounds.zone),
+    '',
+  );
   console.log(
-    'Native timed/all-day CRUD, CLI interoperability, stale edits/undo, restart, views, keyboard dismissal, and appearance passed.',
+    'Native timed/all-day CRUD, CLI interoperability, stale edits/undo, restart, views, keyboard dismissal, appearance, and multiple calendars passed.',
   );
 } catch (error) {
   if (browser)

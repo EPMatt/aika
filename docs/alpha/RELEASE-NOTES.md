@@ -2,7 +2,7 @@
 
 Acceptance pending. This candidate is for private evaluation, with no public release or automatic updater.
 
-One local calendar with month/week/day views, timed and all-day events, location and plain-text notes. Create, edit, move, resize, delete, and undo within the current session. Events and appearance/view/sidebar preferences persist after restart. Light, dark, and system appearance; dates and times follow device settings. DST gaps are rejected and repeated times require an offset choice.
+Multiple local calendars with month/week/day views, timed and all-day events, location and plain-text notes. Create, edit, move, resize, delete, and undo within the current session. Events, calendar names/descriptions/colors, calendar visibility/default selection, and appearance/view/sidebar preferences persist after restart. Create calendars with the sidebar +; use each calendar’s … menu for settings, default selection, or permanent deletion with its events. The editor supports moving events between local calendars. Light, dark, and system appearance; dates and times follow device settings. DST gaps are rejected and repeated times require an offset choice.
 
 No connected accounts, sync, recurrence, reminders, search, import/export, backup/restore, analytics, or server. Calendar data is stored in local SQLite under the OS account's filesystem protections; it is not application-encrypted. Undo ends when the application exits.
 

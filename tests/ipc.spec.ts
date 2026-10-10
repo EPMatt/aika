@@ -25,13 +25,18 @@ test('desktop IPC errors preserve input and saved preferences hydrate on reload'
               return;
             case 'calendar_snapshot':
               return {
-                calendar: {
-                  id: 'local-default',
-                  providerId: 'local',
-                  name: 'Personal',
-                  color: '#718675',
-                  writable: true,
-                },
+                calendars: [
+                  {
+                    id: 'local-default',
+                    providerId: 'local',
+                    name: 'Personal',
+                    color: '#718675',
+                    writable: true,
+                    description: '',
+                  },
+                ],
+                defaultCalendarId: 'local-default',
+                hiddenCalendarIds: [],
                 events,
                 canUndo: history.length > 0,
               };
@@ -128,13 +133,18 @@ test('normalized calendar metadata and read-only capability control the same vie
           if (command === 'set_preferences') return;
           if (command === 'calendar_snapshot')
             return {
-              calendar: {
-                id: 'second-calendar',
-                providerId: 'fixture',
-                name: 'Shared schedule',
-                color: '#718675',
-                writable: false,
-              },
+              calendars: [
+                {
+                  id: 'second-calendar',
+                  providerId: 'fixture',
+                  name: 'Shared schedule',
+                  color: '#718675',
+                  writable: false,
+                  description: '',
+                },
+              ],
+              defaultCalendarId: 'second-calendar',
+              hiddenCalendarIds: [],
               events: [
                 {
                   id: 'readonly-event',
@@ -201,13 +211,18 @@ test('focus refresh preserves an editor draft and sends its original event on co
             case 'calendar_snapshot':
               (window as any).testSnapshots++;
               return {
-                calendar: {
-                  id: 'local-default',
-                  providerId: 'local',
-                  name: 'Personal',
-                  color: '#718675',
-                  writable: true,
-                },
+                calendars: [
+                  {
+                    id: 'local-default',
+                    providerId: 'local',
+                    name: 'Personal',
+                    color: '#718675',
+                    writable: true,
+                    description: '',
+                  },
+                ],
+                defaultCalendarId: 'local-default',
+                hiddenCalendarIds: [],
                 events: [structuredClone((window as any).testStoredEvent)],
                 canUndo: false,
               };

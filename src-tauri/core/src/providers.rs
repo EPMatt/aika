@@ -40,6 +40,36 @@ pub trait Provider: Send {
             "This provider does not store preferences.",
         ))
     }
+
+    fn collection_snapshot(&mut self, _range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn default_calendar_id(&self) -> Result<Option<String>> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn create_calendar(&mut self, _details: CalendarDetails) -> Result<Calendar> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn update_calendar(
+        &mut self,
+        _id: &str,
+        _details: CalendarDetails,
+        _expected: Calendar,
+    ) -> Result<()> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn delete_calendar(&mut self, _id: &str) -> Result<()> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn calendar_event_count(&self, _id: &str) -> Result<usize> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn set_default_calendar(&mut self, _id: &str) -> Result<()> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
+    fn set_calendar_visibility(&mut self, _id: &str, _visible: bool) -> Result<()> {
+        Err(error("unsupported", "Calendar management is unavailable."))
+    }
     // Auth and synchronization are explicit extension points, not renderer commands.
     fn authenticate(&mut self, _: &crate::credentials::CredentialService) -> Result<()> {
         Err(error(
@@ -66,26 +96,44 @@ impl Provider for LocalProvider {
         }
     }
     fn calendars(&self) -> Result<Vec<Calendar>> {
-        Ok(vec![Calendar {
-            id: "local-default".into(),
-            provider_id: "local".into(),
-            name: "Personal".into(),
-            color: "#718675".into(),
-            writable: true,
-        }])
+        LocalProvider::calendars(self)
     }
     fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
-        if calendar != "local-default" {
-            return Err(error("notFound", "Unknown calendar."));
-        }
-        LocalProvider::snapshot(self, range)
+        self.snapshot_calendar(calendar, range)
     }
     fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
-        if calendar != "local-default" {
-            return Err(error("notFound", "Unknown calendar."));
-        }
         LocalProvider::get(self, id)?
+            .filter(|e| e.calendar_id == calendar)
             .ok_or_else(|| error("notFound", "This event no longer exists."))
+    }
+    fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        LocalProvider::collection_snapshot(self, range)
+    }
+    fn default_calendar_id(&self) -> Result<Option<String>> {
+        LocalProvider::default_calendar_id(self)
+    }
+    fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
+        LocalProvider::create_calendar(self, details)
+    }
+    fn update_calendar(
+        &mut self,
+        id: &str,
+        details: CalendarDetails,
+        expected: Calendar,
+    ) -> Result<()> {
+        LocalProvider::update_calendar(self, id, details, expected)
+    }
+    fn delete_calendar(&mut self, id: &str) -> Result<()> {
+        LocalProvider::delete_calendar(self, id)
+    }
+    fn calendar_event_count(&self, id: &str) -> Result<usize> {
+        LocalProvider::calendar_event_count(self, id)
+    }
+    fn set_default_calendar(&mut self, id: &str) -> Result<()> {
+        LocalProvider::set_default_calendar(self, id)
+    }
+    fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
+        LocalProvider::set_calendar_visibility(self, id, visible)
     }
     fn save_checked(
         &mut self,
@@ -96,8 +144,11 @@ impl Provider for LocalProvider {
         LocalProvider::save_checked(self, event, existing, expected)
     }
     fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()> {
-        if calendar != "local-default" {
-            return Err(error("notFound", "Unknown calendar."));
+        if expected.calendar_id != calendar {
+            return Err(error(
+                "conflict",
+                "Deletion requires the original calendar.",
+            ));
         }
         LocalProvider::delete_checked(self, id, expected)
     }
@@ -115,7 +166,6 @@ impl Provider for LocalProvider {
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Box<dyn Provider>>,
-    calendars: BTreeMap<String, Calendar>,
 }
 impl ProviderRegistry {
     /// Registration is atomic; duplicate global calendar identities are rejected.
@@ -127,12 +177,13 @@ impl ProviderRegistry {
                 "Duplicate or invalid provider identity.",
             ));
         }
+        let known = self.live_calendars()?;
         let calendars = provider.calendars()?;
         let mut discovered = BTreeMap::new();
         for calendar in calendars {
             if calendar.id.is_empty()
                 || calendar.provider_id != descriptor.id
-                || self.calendars.contains_key(&calendar.id)
+                || known.iter().any(|c| c.id == calendar.id)
                 || discovered.contains_key(&calendar.id)
             {
                 return Err(error(
@@ -143,25 +194,88 @@ impl ProviderRegistry {
             discovered.insert(calendar.id.clone(), calendar);
         }
         self.providers.insert(descriptor.id, provider);
-        self.calendars.extend(discovered);
         Ok(())
     }
-    pub fn calendars(&self) -> Vec<Calendar> {
-        self.calendars.values().cloned().collect()
+    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+        self.live_calendars()
     }
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.providers.values().map(|p| p.descriptor()).collect()
     }
+    pub fn live_calendars(&self) -> Result<Vec<Calendar>> {
+        let mut discovered = BTreeMap::new();
+        let mut ordered = Vec::new();
+        for (owner, provider) in &self.providers {
+            for calendar in provider.calendars()? {
+                if calendar.id.is_empty()
+                    || calendar.provider_id != *owner
+                    || discovered.insert(calendar.id.clone(), ()).is_some()
+                {
+                    return Err(error(
+                        "providerIdentity",
+                        "Duplicate or invalid calendar identity.",
+                    ));
+                }
+                ordered.push(calendar);
+            }
+        }
+        Ok(ordered)
+    }
     fn owner(&self, calendar: &str, write: bool) -> Result<String> {
         let calendar = self
-            .calendars
-            .get(calendar)
+            .live_calendars()?
+            .into_iter()
+            .find(|c| c.id == calendar)
             .ok_or_else(|| error("notFound", "Unknown calendar."))?;
         let descriptor = self.providers[&calendar.provider_id].descriptor();
         if write && (!calendar.writable || !descriptor.writable) {
             return Err(error("readOnly", "This calendar is read-only."));
         }
-        Ok(calendar.provider_id.clone())
+        Ok(calendar.provider_id)
+    }
+    fn local(&self) -> Result<&(dyn Provider + '_)> {
+        match self.providers.get("local") {
+            Some(p) => Ok(p.as_ref()),
+            None => Err(error("notFound", "Local provider unavailable.")),
+        }
+    }
+    fn local_mut(&mut self) -> Result<&mut (dyn Provider + '_)> {
+        match self.providers.get_mut("local") {
+            Some(p) => Ok(p.as_mut()),
+            None => Err(error("notFound", "Local provider unavailable.")),
+        }
+    }
+    pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        self.local_mut()?.collection_snapshot(range)
+    }
+    pub fn default_calendar_id(&self) -> Result<Option<String>> {
+        self.local()?.default_calendar_id()
+    }
+    pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
+        self.local_mut()?.create_calendar(details)
+    }
+    pub fn update_calendar(
+        &mut self,
+        id: &str,
+        details: CalendarDetails,
+        expected: Calendar,
+    ) -> Result<()> {
+        self.local_mut()?.update_calendar(id, details, expected)
+    }
+    pub fn delete_calendar(&mut self, id: &str) -> Result<()> {
+        self.local_mut()?.delete_calendar(id)
+    }
+    pub fn calendar_event_count(&self, id: &str) -> Result<usize> {
+        self.local()?.calendar_event_count(id)
+    }
+    pub fn set_default_calendar(&mut self, id: &str) -> Result<()> {
+        self.local_mut()?.set_default_calendar(id)
+    }
+    pub fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
+        self.local_mut()?.set_calendar_visibility(id, visible)
+    }
+    pub fn undo_local(&mut self) -> Result<()> {
+        self.local_mut()?.undo()
     }
     pub fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
         validate_range(&range)?;
@@ -176,7 +290,11 @@ impl ProviderRegistry {
                 "Provider returned data from another calendar.",
             ));
         }
-        result.calendar = self.calendars[calendar].clone();
+        result.calendar = self
+            .live_calendars()?
+            .into_iter()
+            .find(|c| c.id == calendar)
+            .ok_or_else(|| error("notFound", "Unknown calendar."))?;
         Ok(result)
     }
     pub fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
@@ -208,11 +326,16 @@ impl ProviderRegistry {
         expected: Option<CalendarEvent>,
     ) -> Result<CalendarEvent> {
         let owner = self.owner(&event.calendar_id, true)?;
-        if existing != expected.is_some()
-            || expected
-                .as_ref()
-                .is_some_and(|e| e.id != event.id || e.calendar_id != event.calendar_id)
-        {
+        if let Some(original) = &expected {
+            let source = self.owner(&original.calendar_id, true)?;
+            if source != owner || (original.calendar_id != event.calendar_id && owner != "local") {
+                return Err(error(
+                    "conflict",
+                    "Events can only move between local calendars.",
+                ));
+            }
+        }
+        if existing != expected.is_some() || expected.as_ref().is_some_and(|e| e.id != event.id) {
             return Err(error(
                 "conflict",
                 "An update requires the original event identity.",
@@ -284,6 +407,7 @@ mod tests {
                         provider_id: "test".into(),
                         name: "Writable".into(),
                         color: "#718675".into(),
+                        description: "".into(),
                         writable: true,
                     },
                     Calendar {
@@ -291,6 +415,7 @@ mod tests {
                         provider_id: "test".into(),
                         name: "Read only".into(),
                         color: "#718675".into(),
+                        description: "".into(),
                         writable: false,
                     },
                 ],
@@ -437,7 +562,7 @@ mod tests {
             r.delete(calendar, &e.id).unwrap();
             assert!(r.snapshot(calendar, range()).unwrap().events.is_empty());
         }
-        assert_eq!(r.calendars().len(), 3);
+        assert_eq!(r.calendars().unwrap().len(), 3);
         assert_eq!(r.descriptors().len(), 2);
     }
     #[test]
@@ -476,7 +601,7 @@ mod tests {
             ))
             .unwrap();
         assert!(empty.register(Box::new(collision)).is_err());
-        assert_eq!(empty.calendars().len(), 1);
+        assert_eq!(empty.calendars().unwrap().len(), 1);
     }
     #[test]
     fn adapter_cannot_leak_calendar_data_and_local_undo_still_works() {

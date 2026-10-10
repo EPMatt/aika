@@ -2,7 +2,7 @@
 
 A desktop calendar. Tauri 2, React, TypeScript, and Rust.
 
-**Current milestone: phase 5 private alpha preparation; acceptance pending.** The desktop app saves one local calendar in SQLite, restores events and appearance/view/sidebar preferences after restart, and supports session undo. The browser preview remains an in-memory design harness with sample data.
+**Current milestone: phase 5 private alpha preparation; acceptance pending.** The desktop app saves multiple local calendars in SQLite, restores events, calendar settings, visibility, default selection, and appearance/view/sidebar preferences after restart, and supports session event undo. The browser preview remains an in-memory design harness with sample data.
 
 ## Run
 
@@ -17,9 +17,13 @@ Desktop development requires Rust 1.99.0 and the [Tauri prerequisites](https://v
 
 The tooling wrapper also detects a workspace-local Rust installation in `.tools/`. It does not alter global shell configuration. This workspace already has that installation; on another machine use the normal Rust toolchain setup.
 
+## Local calendars
+
+Use **+** beside **Calendars** in the sidebar to create a calendar. Click a calendar row to show or hide its events. Hover or focus the row to open **…**, where you can select the default, edit its name/description/color, or permanently delete the calendar and its events. The event editor lets you choose a calendar and move existing events. Saving a new or moved event to a hidden calendar reveals it. You can delete every calendar; event creation becomes available again after creating one.
+
 ## CLI
 
-The standalone `aika-cli` uses the same Rust core and local Personal calendar as the desktop app. It works with the desktop open or closed, without launching a GUI. See [CLI usage](docs/cli.md) for time formats, exit codes, and concurrency behavior.
+The standalone `aika-cli` uses the same Rust core and local calendars as the desktop app. It works with the desktop open or closed, without launching a GUI. See [CLI usage](docs/cli.md) for time formats, exit codes, and concurrency behavior.
 
 ```sh
 pnpm cli --help

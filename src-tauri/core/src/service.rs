@@ -160,7 +160,7 @@ impl LocalProvider {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -178,6 +178,15 @@ impl LocalProvider {
                 "INSERT INTO preferences VALUES(1,?1)",
                 [serde_json::to_string(&Preferences::default())?],
             )?;
+        }
+        if version < 2 {
+            tx.execute_batch("ALTER TABLE calendars ADD COLUMN color TEXT NOT NULL DEFAULT '#718675';
+                ALTER TABLE calendars ADD COLUMN description TEXT NOT NULL DEFAULT '';
+                ALTER TABLE calendars ADD COLUMN visible INTEGER NOT NULL DEFAULT 1 CHECK(visible IN (0,1));
+                CREATE TABLE calendar_settings(id INTEGER PRIMARY KEY CHECK(id=1), default_calendar_id TEXT REFERENCES calendars(id) ON DELETE SET NULL);
+                INSERT INTO calendar_settings VALUES(1,(SELECT id FROM calendars ORDER BY rowid LIMIT 1));
+                CREATE INDEX events_calendar_range ON events(calendar_id,kind,start,end);
+                PRAGMA user_version=2;")?;
         }
         tx.commit()?;
         Ok(Self {
@@ -205,43 +214,243 @@ impl LocalProvider {
         )?;
         Ok(())
     }
-    pub fn snapshot(&self, range: EventRange) -> Result<CalendarSnapshot> {
-        validate_range(&range)?;
-        let start = instant(&range.start)?;
-        let end = instant(&range.end)?;
-        if end <= start || date(&range.end_date)? <= date(&range.start_date)? {
-            return Err(error("validation", "Invalid event range."));
+    fn read_calendars(db: &Connection) -> Result<Vec<Calendar>> {
+        let mut statement =
+            db.prepare("SELECT id,name,color,description FROM calendars ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok(Calendar {
+                id: row.get(0)?,
+                provider_id: "local".into(),
+                name: row.get(1)?,
+                color: row.get(2)?,
+                description: row.get(3)?,
+                writable: true,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+        Self::read_calendars(&self.db)
+    }
+    fn require_calendar(db: &Connection, id: &str) -> Result<()> {
+        if !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM calendars WHERE id=?1)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(error("notFound", "This calendar no longer exists."));
         }
-        let mut statement = self.db.prepare("SELECT payload FROM events WHERE calendar_id='local-default' AND ((kind='timed' AND start < ?2 AND end > ?1) OR (kind='allDay' AND start < ?4 AND end > ?3)) ORDER BY start,id")?;
+        Ok(())
+    }
+    fn validate_details(mut details: CalendarDetails) -> Result<CalendarDetails> {
+        details.name = details.name.trim().into();
+        if details.name.is_empty()
+            || details.name.chars().count() > 100
+            || details.description.chars().count() > 2000
+        {
+            return Err(error("validation", "Use a calendar name of 1 to 100 characters and a description of up to 2000 characters."));
+        }
+        if ![
+            "#718675", "#5B7FA3", "#8A6FA8", "#B56F86", "#B38B43", "#4F918A", "#B77B50", "#768390",
+        ]
+        .contains(&details.color.as_str())
+        {
+            return Err(error(
+                "validation",
+                "Choose a calendar color from the palette.",
+            ));
+        }
+        Ok(details)
+    }
+    pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
+        let details = Self::validate_details(details)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO calendars(id,name,color,description) VALUES(?1,?2,?3,?4)",
+            params![id, details.name, details.color, details.description],
+        )?;
+        tx.execute(
+            "UPDATE calendar_settings SET default_calendar_id=?1 WHERE default_calendar_id IS NULL",
+            [&id],
+        )?;
+        tx.commit()?;
+        Ok(Calendar {
+            id,
+            provider_id: "local".into(),
+            name: details.name,
+            color: details.color,
+            description: details.description,
+            writable: true,
+        })
+    }
+    pub fn update_calendar(
+        &mut self,
+        id: &str,
+        details: CalendarDetails,
+        expected: Calendar,
+    ) -> Result<()> {
+        let details = Self::validate_details(details)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::read_calendars(&tx)?
+            .into_iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| error("notFound", "This calendar no longer exists."))?;
+        if current != expected {
+            return Err(error(
+                "conflict",
+                "The calendar changed. Reopen its settings before saving.",
+            ));
+        }
+        tx.execute(
+            "UPDATE calendars SET name=?2,color=?3,description=?4 WHERE id=?1",
+            params![id, details.name, details.color, details.description],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn calendar_event_count(&self, id: &str) -> Result<usize> {
+        Self::require_calendar(&self.db, id)?;
+        Ok(self.db.query_row(
+            "SELECT count(*) FROM events WHERE calendar_id=?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+    pub fn delete_calendar(&mut self, id: &str) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_calendar(&tx, id)?;
+        tx.execute("DELETE FROM events WHERE calendar_id=?1", [id])?;
+        tx.execute("DELETE FROM calendars WHERE id=?1", [id])?;
+        tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars ORDER BY rowid LIMIT 1) WHERE default_calendar_id IS NULL", [])?;
+        let calendars = Self::read_calendars(&tx)?;
+        tx.commit()?;
+        self.retain_calendar_history(&calendars);
+        Ok(())
+    }
+    pub fn set_default_calendar(&mut self, id: &str) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_calendar(&tx, id)?;
+        tx.execute("UPDATE calendar_settings SET default_calendar_id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
+        if self.db.execute(
+            "UPDATE calendars SET visible=?2 WHERE id=?1",
+            params![id, visible],
+        )? == 0
+        {
+            return Err(error("notFound", "This calendar no longer exists."));
+        }
+        Ok(())
+    }
+    pub fn default_calendar_id(&self) -> Result<Option<String>> {
+        Ok(self.db.query_row(
+            "SELECT default_calendar_id FROM calendar_settings WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    fn read_events(
+        db: &Connection,
+        range: &EventRange,
+        calendar: Option<&str>,
+    ) -> Result<Vec<CalendarEvent>> {
+        validate_range(range)?;
+        let mut statement = db.prepare("SELECT payload FROM events WHERE (?5 IS NULL OR calendar_id=?5) AND ((kind='timed' AND start < ?2 AND end > ?1) OR (kind='allDay' AND start < ?4 AND end > ?3)) ORDER BY start,id")?;
         let rows = statement.query_map(
-            params![iso(start), iso(end), range.start_date, range.end_date],
+            params![
+                iso(instant(&range.start)?),
+                iso(instant(&range.end)?),
+                range.start_date,
+                range.end_date,
+                calendar
+            ],
             |r| r.get::<_, String>(0),
         )?;
-        let events = rows
-            .map(|row| Ok(serde_json::from_str(&row?)?))
-            .collect::<Result<Vec<_>>>()?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+    fn prune_history(&mut self) -> Result<()> {
+        let calendars = self.calendars()?;
+        self.retain_calendar_history(&calendars);
+        Ok(())
+    }
+    fn retain_calendar_history(&mut self, calendars: &[Calendar]) {
+        let ids: Vec<_> = calendars.iter().map(|c| &c.id).collect();
+        let removed: Vec<_> = self
+            .history
+            .iter()
+            .filter(|entry| {
+                entry
+                    .before
+                    .iter()
+                    .chain(entry.after.iter())
+                    .any(|e| !ids.contains(&&e.calendar_id))
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        self.history.retain(|entry| !removed.contains(&entry.id));
+    }
+    pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        let tx = self.db.transaction()?;
+        let calendars = Self::read_calendars(&tx)?;
+        let events = Self::read_events(&tx, &range, None)?;
+        let default_calendar_id = tx.query_row(
+            "SELECT default_calendar_id FROM calendar_settings WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut statement =
+            tx.prepare("SELECT id FROM calendars WHERE visible=0 ORDER BY rowid")?;
+        let hidden_calendar_ids = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        drop(statement);
+        tx.commit()?;
+        self.retain_calendar_history(&calendars);
+        Ok(CalendarCollectionSnapshot {
+            calendars,
+            events,
+            default_calendar_id,
+            hidden_calendar_ids,
+            can_undo: !self.history.is_empty(),
+        })
+    }
+    pub fn snapshot_calendar(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
+        let tx = self.db.unchecked_transaction()?;
+        let metadata = Self::read_calendars(&tx)?
+            .into_iter()
+            .find(|c| c.id == calendar)
+            .ok_or_else(|| error("notFound", "Unknown calendar."))?;
+        let events = Self::read_events(&tx, &range, Some(calendar))?;
+        tx.commit()?;
         Ok(CalendarSnapshot {
-            calendar: Calendar {
-                id: "local-default".into(),
-                provider_id: "local".into(),
-                name: "Personal".into(),
-                color: "#718675".into(),
-                writable: true,
-            },
+            calendar: metadata,
             events,
             can_undo: !self.history.is_empty(),
         })
+    }
+    pub fn snapshot(&self, range: EventRange) -> Result<CalendarSnapshot> {
+        let id = self
+            .default_calendar_id()?
+            .ok_or_else(|| error("notFound", "Create a calendar first."))?;
+        self.snapshot_calendar(&id, range)
     }
     pub fn get(&self, id: &str) -> Result<Option<CalendarEvent>> {
         Self::read(&self.db, id)
     }
     fn read(db: &Connection, id: &str) -> Result<Option<CalendarEvent>> {
         let json: Option<String> = db
-            .query_row(
-                "SELECT payload FROM events WHERE id=?1 AND calendar_id='local-default'",
-                [id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT payload FROM events WHERE id=?1", [id], |r| r.get(0))
             .optional()?;
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
@@ -254,7 +463,7 @@ impl LocalProvider {
                 end_date,
             } => ("allDay", start_date, end_date),
         };
-        let changed = db.execute("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload WHERE events.calendar_id=excluded.calendar_id", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?])?;
+        let changed = db.execute("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id,kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?])?;
         if changed != 1 {
             return Err(error("conflict", "Event belongs to another calendar."));
         }
@@ -270,11 +479,8 @@ impl LocalProvider {
         existing: bool,
         expected: Option<CalendarEvent>,
     ) -> Result<CalendarEvent> {
-        if event.calendar_id != "local-default" {
-            return Err(error("validation", "Invalid calendar identity."));
-        }
         let event = validate_event(event)?;
-        if existing != expected.is_some() {
+        if existing != expected.is_some() || expected.as_ref().is_some_and(|e| e.id != event.id) {
             return Err(error(
                 "conflict",
                 "An update requires the original event. Reload the calendar.",
@@ -290,7 +496,20 @@ impl LocalProvider {
                 "The event changed. Reload the calendar before saving.",
             ));
         }
+        Self::require_calendar(&tx, &event.calendar_id)?;
+        if let Some(original) = &expected {
+            Self::require_calendar(&tx, &original.calendar_id)?;
+        }
         Self::write(&tx, &event)?;
+        if previous
+            .as_ref()
+            .is_none_or(|e| e.calendar_id != event.calendar_id)
+        {
+            tx.execute(
+                "UPDATE calendars SET visible=1 WHERE id=?1",
+                [&event.calendar_id],
+            )?;
+        }
         tx.commit()?;
         self.history.push(HistoryEntry {
             id: event.id.clone(),
@@ -317,10 +536,7 @@ impl LocalProvider {
                 "The event changed. Reload the calendar before deleting.",
             ));
         }
-        tx.execute(
-            "DELETE FROM events WHERE id=?1 AND calendar_id='local-default'",
-            [id],
-        )?;
+        tx.execute("DELETE FROM events WHERE id=?1", [id])?;
         tx.commit()?;
         self.history.push(HistoryEntry {
             id: id.into(),
@@ -330,6 +546,7 @@ impl LocalProvider {
         Ok(())
     }
     pub fn undo(&mut self) -> Result<()> {
+        self.prune_history()?;
         let Some(entry) = self.history.last() else {
             return Err(error("nothingToUndo", "There is no change to undo."));
         };
@@ -345,10 +562,7 @@ impl LocalProvider {
         match &entry.before {
             Some(event) => Self::write(&tx, event)?,
             None => {
-                tx.execute(
-                    "DELETE FROM events WHERE id=?1 AND calendar_id='local-default'",
-                    [&entry.id],
-                )?;
+                tx.execute("DELETE FROM events WHERE id=?1", [&entry.id])?;
             }
         }
         tx.commit()?;
@@ -370,20 +584,62 @@ impl CalendarService {
     pub fn preferences(&self) -> Result<Preferences> {
         self.providers.preferences()
     }
+    pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
+        self.providers.collection_snapshot(range)
+    }
+    pub fn default_calendar_id(&self) -> Result<Option<String>> {
+        self.providers.default_calendar_id()
+    }
+    pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
+        self.providers.create_calendar(details)
+    }
+    pub fn update_calendar(
+        &mut self,
+        id: &str,
+        details: CalendarDetails,
+        expected: Calendar,
+    ) -> Result<()> {
+        self.providers.update_calendar(id, details, expected)
+    }
+    pub fn delete_calendar(&mut self, id: &str) -> Result<()> {
+        self.providers.delete_calendar(id)
+    }
+    pub fn calendar_event_count(&self, id: &str) -> Result<usize> {
+        self.providers.calendar_event_count(id)
+    }
+    pub fn set_default_calendar(&mut self, id: &str) -> Result<()> {
+        self.providers.set_default_calendar(id)
+    }
+    pub fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
+        self.providers.set_calendar_visibility(id, visible)
+    }
+
     pub fn set_preferences(&mut self, value: Preferences) -> Result<()> {
         self.providers.set_preferences(value)
     }
     pub fn snapshot(&self, range: EventRange) -> Result<CalendarSnapshot> {
-        self.providers.snapshot("local-default", range)
+        let id = self
+            .providers
+            .default_calendar_id()?
+            .ok_or_else(|| error("notFound", "Create a calendar first."))?;
+        self.providers.snapshot(&id, range)
     }
     pub fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
         self.providers.save(event, existing)
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        self.providers.delete("local-default", id)
+        let expected = self.get(id)?;
+        self.delete_checked(id, &expected)
     }
     pub fn get(&self, id: &str) -> Result<CalendarEvent> {
-        self.providers.get("local-default", id)
+        for calendar in self.providers.live_calendars()? {
+            match self.providers.get(&calendar.id, id) {
+                Ok(event) => return Ok(event),
+                Err(e) if e.code == "notFound" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(error("notFound", "This event no longer exists."))
     }
     pub fn save_checked(
         &mut self,
@@ -394,10 +650,11 @@ impl CalendarService {
         self.providers.save_checked(event, existing, expected)
     }
     pub fn delete_checked(&mut self, id: &str, expected: &CalendarEvent) -> Result<()> {
-        self.providers.delete_checked("local-default", id, expected)
+        self.providers
+            .delete_checked(&expected.calendar_id, id, expected)
     }
     pub fn undo(&mut self) -> Result<()> {
-        self.providers.undo("local-default")
+        self.providers.undo_local()
     }
 }
 
@@ -632,11 +889,16 @@ mod tests {
         let mut s = service();
         let mut foreign = event();
         foreign.calendar_id = "foreign".into();
-        s.db.execute("INSERT INTO calendars VALUES('foreign','Other')", [])
-            .unwrap();
+        s.db.execute(
+            "INSERT INTO calendars(id,name) VALUES('foreign','Other')",
+            [],
+        )
+        .unwrap();
         LocalProvider::write(&s.db, &foreign).unwrap();
         assert!(s.snapshot(range()).unwrap().events.is_empty());
-        assert!(s.delete(&foreign.id).is_err());
+        let mut wrong = foreign.clone();
+        wrong.calendar_id = "local-default".into();
+        assert!(s.delete_checked(&foreign.id, &wrong).is_err());
         let mut impostor = foreign.clone();
         impostor.calendar_id = "local-default".into();
         assert!(s.save(impostor, false).is_err());
@@ -655,6 +917,215 @@ mod tests {
             "foreign"
         );
     }
+    fn details(name: &str) -> CalendarDetails {
+        CalendarDetails {
+            name: name.into(),
+            description: "Calendar notes".into(),
+            color: "#5B7FA3".into(),
+        }
+    }
+    #[test]
+    fn multiple_calendars_moves_visibility_and_undo() {
+        let mut s = service();
+        let work = s.create_calendar(details("Work")).unwrap();
+        assert_eq!(
+            s.default_calendar_id().unwrap().as_deref(),
+            Some("local-default")
+        );
+        let original = s.save(event(), false).unwrap();
+        s.set_calendar_visibility(&work.id, false).unwrap();
+        let mut moved = original.clone();
+        moved.calendar_id = work.id.clone();
+        let moved = s.save_checked(moved, true, Some(original.clone())).unwrap();
+        let snapshot = s.collection_snapshot(range()).unwrap();
+        assert_eq!(snapshot.calendars.len(), 2);
+        assert!(snapshot.hidden_calendar_ids.is_empty());
+        assert_eq!(snapshot.events, vec![moved.clone()]);
+        assert!(s
+            .snapshot_calendar("local-default", range())
+            .unwrap()
+            .events
+            .is_empty());
+        assert_eq!(s.calendar_event_count(&work.id).unwrap(), 1);
+        s.undo().unwrap();
+        assert_eq!(s.get(&original.id).unwrap(), Some(original.clone()));
+        // A move must compare the original complete event, not just its ID.
+        let mut stale = moved;
+        stale.title = "Stale move".into();
+        assert_eq!(
+            s.save_checked(
+                stale,
+                true,
+                Some({
+                    let mut wrong = original.clone();
+                    wrong.title = "Stale".into();
+                    wrong
+                })
+            )
+            .unwrap_err()
+            .code,
+            "conflict"
+        );
+        // Hiding the default does not prevent creation; saving reveals it.
+        s.set_calendar_visibility("local-default", false).unwrap();
+        s.save(event(), false).unwrap();
+        assert!(s
+            .collection_snapshot(range())
+            .unwrap()
+            .hidden_calendar_ids
+            .is_empty());
+    }
+    #[test]
+    fn deletion_default_fallback_and_empty_state_survive_restart() {
+        let path =
+            std::env::temp_dir().join(format!("aika-calendars-{}.sqlite3", uuid::Uuid::new_v4()));
+        {
+            let mut s = LocalProvider::open(&path).unwrap();
+            let work = s.create_calendar(details("Work")).unwrap();
+            let other = s.create_calendar(details("Other")).unwrap();
+            s.set_default_calendar(&work.id).unwrap();
+            s.set_calendar_visibility(&other.id, false).unwrap();
+            let original = s.save(event(), false).unwrap();
+            let mut moved = original.clone();
+            moved.calendar_id = work.id.clone();
+            s.save_checked(moved, true, Some(original)).unwrap();
+            s.delete_calendar(&work.id).unwrap();
+            let snapshot = s.collection_snapshot(range()).unwrap();
+            assert!(snapshot.events.is_empty());
+            assert!(!snapshot.can_undo);
+            assert_eq!(
+                snapshot.default_calendar_id.as_deref(),
+                Some("local-default")
+            );
+            assert_eq!(snapshot.hidden_calendar_ids, vec![other.id.clone()]);
+            s.delete_calendar("local-default").unwrap();
+            assert_eq!(s.default_calendar_id().unwrap(), Some(other.id.clone()));
+            s.delete_calendar(&other.id).unwrap();
+        }
+        {
+            let mut s = LocalProvider::open(&path).unwrap();
+            let snapshot = s.collection_snapshot(range()).unwrap();
+            assert!(snapshot.calendars.is_empty());
+            assert!(snapshot.events.is_empty());
+            assert_eq!(snapshot.default_calendar_id, None);
+            assert!(s.save(event(), false).is_err());
+            let created = s.create_calendar(details("New first calendar")).unwrap();
+            assert_eq!(s.default_calendar_id().unwrap(), Some(created.id));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn metadata_visibility_default_and_external_discovery() {
+        let path =
+            std::env::temp_dir().join(format!("aika-discovery-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut desktop = CalendarService::open(&path).unwrap();
+        let mut external = CalendarService::open(&path).unwrap();
+        let work = external.create_calendar(details("Work")).unwrap();
+        external
+            .update_calendar(&work.id, details("Office"), work.clone())
+            .unwrap();
+        assert_eq!(
+            desktop
+                .update_calendar(&work.id, details("Stale"), work.clone())
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        external.set_default_calendar(&work.id).unwrap();
+        let mut e = event();
+        e.calendar_id = work.id.clone();
+        let original = desktop.save_checked(e, false, None).unwrap();
+        external.set_calendar_visibility(&work.id, false).unwrap();
+        let snapshot = desktop.collection_snapshot(range()).unwrap();
+        assert_eq!(snapshot.calendars[1].name, "Office");
+        assert_eq!(snapshot.calendars[1].description, "Calendar notes");
+        assert_eq!(snapshot.hidden_calendar_ids, vec![work.id.clone()]);
+        assert_eq!(snapshot.default_calendar_id, Some(work.id.clone()));
+        assert_eq!(desktop.get(&original.id).unwrap(), original.clone());
+        external.delete_calendar(&work.id).unwrap();
+        assert!(desktop
+            .save_checked(original.clone(), true, Some(original))
+            .is_err());
+        assert!(!desktop.collection_snapshot(range()).unwrap().can_undo);
+        drop(desktop);
+        drop(external);
+        let mut reopened = CalendarService::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .collection_snapshot(range())
+                .unwrap()
+                .calendars
+                .len(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn v1_migration_preserves_events_and_preferences() {
+        let path = std::env::temp_dir().join(format!("aika-v1-{}.sqlite3", uuid::Uuid::new_v4()));
+        let original = validate_event(event()).unwrap();
+        let preferences = Preferences {
+            appearance: "dark".into(),
+            view: "week".into(),
+            sidebar: false,
+        };
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE calendars(id TEXT PRIMARY KEY,name TEXT NOT NULL);
+                INSERT INTO calendars VALUES('local-default','Personal');
+                CREATE TABLE events(id TEXT PRIMARY KEY,calendar_id TEXT NOT NULL REFERENCES calendars(id),kind TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL,payload TEXT NOT NULL);
+                CREATE INDEX events_range ON events(kind,start,end);
+                CREATE TABLE preferences(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
+                PRAGMA user_version=1;").unwrap();
+            db.execute(
+                "INSERT INTO preferences VALUES(1,?1)",
+                [serde_json::to_string(&preferences).unwrap()],
+            )
+            .unwrap();
+            LocalProvider::write(&db, &original).unwrap();
+        }
+        {
+            let mut s = LocalProvider::open(&path).unwrap();
+            let snapshot = s.collection_snapshot(range()).unwrap();
+            assert_eq!(snapshot.events, vec![original]);
+            assert_eq!(snapshot.calendars[0].id, "local-default");
+            assert_eq!(snapshot.calendars[0].color, "#718675");
+            assert_eq!(snapshot.calendars[0].description, "");
+            assert_eq!(
+                snapshot.default_calendar_id.as_deref(),
+                Some("local-default")
+            );
+            assert!(snapshot.hidden_calendar_ids.is_empty());
+            assert_eq!(s.preferences().unwrap(), preferences);
+            assert_eq!(
+                s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                    .unwrap(),
+                2
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn failed_calendar_operations_preserve_state() {
+        let mut s = service();
+        let mut invalid = details(" ");
+        assert!(s.create_calendar(invalid.clone()).is_err());
+        invalid.name = "Name".into();
+        invalid.color = "#ffffff".into();
+        assert!(s.create_calendar(invalid).is_err());
+        let original = s.save(event(), false).unwrap();
+        s.db.execute_batch("PRAGMA query_only=ON").unwrap();
+        assert!(s.delete_calendar("local-default").is_err());
+        assert!(s.set_default_calendar("local-default").is_err());
+        assert!(s.set_calendar_visibility("local-default", false).is_err());
+        assert_eq!(s.get(&original.id).unwrap(), Some(original));
+        assert_eq!(s.calendars().unwrap().len(), 1);
+        s.db.execute_batch("PRAGMA query_only=OFF").unwrap();
+        s.undo().unwrap();
+        assert!(s.collection_snapshot(range()).unwrap().events.is_empty());
+    }
+
     #[test]
     fn shared_wall_time_fixtures() {
         let fixtures: serde_json::Value =

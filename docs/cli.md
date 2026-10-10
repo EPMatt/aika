@@ -1,6 +1,6 @@
 # aika CLI
 
-`aika-cli` operates on the desktop application's local Personal calendar using the shared Rust service. No running desktop app or GUI is required. Connected calendars, JSON output, search, recurrence, import/export, and CLI undo are outside this version.
+`aika-cli` operates on the desktop application's local calendars using the shared Rust service. No running desktop app or GUI is required. Connected calendars, JSON output, search, recurrence, import/export, and CLI undo are outside this version.
 
 ## Build and run
 
@@ -29,7 +29,7 @@ aika-cli events delete <event-uuid>
 
 Listing selects events that overlap `[from, to)`, including events that start before the range. Dates use `YYYY-MM-DD`. `--to` is exclusive, and the range must be positive and at most 366 days. Results are sorted by stored start boundary and then full UUID. Timed boundaries are converted from midnight in the selected IANA zone. An empty result prints nothing. If a boundary midnight falls in a DST gap or repeated time, choose another boundary date or zone.
 
-Creation requires title, start, and end. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, and notes; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
+Creation requires title, start, and end, and uses the default calendar selected in the desktop UI. If no calendars exist, create one in the desktop app first. Listings include all local calendars, including calendars hidden in the desktop UI. Get, update, and delete locate events by their full UUID; updates preserve their calendar. Calendar creation/settings/deletion and event moves between calendars are managed in the desktop UI. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, and notes; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
 
 ## Time and all-day events
 

@@ -1,7 +1,9 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
 import type { CalendarEvent } from './generated/CalendarEvent';
-import type { CalendarSnapshot } from './generated/CalendarSnapshot';
+import type { CalendarCollectionSnapshot } from './generated/CalendarCollectionSnapshot';
+import type { CalendarDetails } from './generated/CalendarDetails';
+import type { Calendar } from './generated/Calendar';
 import type { EventRange } from './generated/EventRange';
 import type { Preferences } from './generated/Preferences';
 import type { ServiceError } from './generated/ServiceError';
@@ -14,7 +16,16 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
-  snapshot: (range: EventRange) => invoke<CalendarSnapshot>('calendar_snapshot', { range }),
+  createCalendar: (details: CalendarDetails) => mutate<Calendar>('create_calendar', { details }),
+  updateCalendar: (id: string, details: CalendarDetails, expected: Calendar) =>
+    mutate<void>('update_calendar', { id, details, expected }),
+  deleteCalendar: (id: string) => mutate<void>('delete_calendar', { id }),
+  calendarEventCount: (id: string) => invoke<number>('calendar_event_count', { id }),
+  setDefaultCalendar: (id: string) => mutate<void>('set_default_calendar', { id }),
+  setCalendarVisibility: (id: string, visible: boolean) =>
+    mutate<void>('set_calendar_visibility', { id, visible }),
+  snapshot: (range: EventRange) =>
+    invoke<CalendarCollectionSnapshot>('calendar_snapshot', { range }),
   save: (event: CalendarEvent, existing: boolean, expected: CalendarEvent | null) =>
     mutate<CalendarEvent>('save_event', { event, existing, expected }),
   delete: (id: string, expected: CalendarEvent) => mutate<void>('delete_event', { id, expected }),
