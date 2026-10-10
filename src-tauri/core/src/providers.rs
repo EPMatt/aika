@@ -16,6 +16,9 @@ pub struct ProviderDescriptor {
 }
 
 pub trait Provider: Send {
+    fn supports_recurrence(&self) -> bool {
+        false
+    }
     fn descriptor(&self) -> ProviderDescriptor;
     fn calendars(&self) -> Result<Vec<Calendar>>;
     fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot>;
@@ -27,6 +30,18 @@ pub trait Provider: Send {
         expected: Option<CalendarEvent>,
     ) -> Result<CalendarEvent>;
     fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()>;
+    fn get_series(&self, _target: &str) -> Result<EventSeries> {
+        Err(error(
+            "unsupported",
+            "This provider does not support recurring events.",
+        ))
+    }
+    fn mutate_event(&mut self, _request: EventMutation) -> Result<Vec<CalendarEvent>> {
+        Err(error(
+            "unsupported",
+            "This provider does not support recurring events.",
+        ))
+    }
     fn undo(&mut self) -> Result<()> {
         Err(error("unsupported", "This provider does not support undo."))
     }
@@ -94,6 +109,15 @@ pub trait Provider: Send {
 }
 
 impl Provider for LocalProvider {
+    fn supports_recurrence(&self) -> bool {
+        true
+    }
+    fn get_series(&self, target: &str) -> Result<EventSeries> {
+        LocalProvider::get_series(self, target)
+    }
+    fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
+        LocalProvider::mutate_event(self, request)
+    }
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
             id: "local".into(),
@@ -297,6 +321,36 @@ impl ProviderRegistry {
     pub fn undo_local(&mut self) -> Result<()> {
         self.local_mut()?.undo()
     }
+    pub fn get_series(&self, target: &str) -> Result<EventSeries> {
+        let id = target.split_once('@').map_or(target, |(id, _)| id);
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(error(
+                "validation",
+                "Use the full event UUID or occurrence selector.",
+            ));
+        }
+        // Recurring features currently belong to the registered local adapter.
+        self.providers
+            .get("local")
+            .ok_or_else(|| error("unsupported", "Local recurrence is unavailable."))?
+            .get_series(target)
+    }
+    pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
+        let series = self.get_series(&request.target)?;
+        let owner = self.owner(&series.event.calendar_id, true)?;
+        if let Some(event) = &request.event {
+            if self.owner(&event.calendar_id, true)? != owner {
+                return Err(error(
+                    "conflict",
+                    "Events can only move between local calendars.",
+                ));
+            }
+        }
+        self.providers
+            .get_mut(&owner)
+            .unwrap()
+            .mutate_event(request)
+    }
     pub fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
         validate_range(&range)?;
         let owner = self.owner(calendar, false)?;
@@ -362,6 +416,12 @@ impl ProviderRegistry {
             ));
         }
         let event = validate_event(event)?;
+        if event.recurrence.is_some() && !self.providers[&owner].supports_recurrence() {
+            return Err(error(
+                "unsupported",
+                "This provider does not support recurring events.",
+            ));
+        }
         self.providers
             .get_mut(&owner)
             .unwrap()
@@ -555,6 +615,8 @@ mod tests {
             },
             location: "".into(),
             notes: "".into(),
+            recurrence: None,
+            occurrence: None,
         }
     }
     #[test]

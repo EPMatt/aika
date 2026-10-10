@@ -9,6 +9,8 @@ import { DateTime } from 'luxon';
 const repository = desktop
   ? null
   : await (async () => {
+      const { initializeRecurrence } = await import('./recurrence');
+      await initializeRecurrence();
       const { PrototypeRepository, sampleEvents } = await import('./prototype');
       const params = new URLSearchParams(location.search);
       const value = DateTime.fromISO(params.get('date') ?? '');

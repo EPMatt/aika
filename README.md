@@ -10,16 +10,26 @@ Use Node 24 LTS and pnpm 12.10.1:
 
 ```sh
 pnpm install --frozen-lockfile
+node scripts/tool.mjs rustup target add wasm32-unknown-unknown
+pnpm rust install wasm-bindgen-cli --version 0.2.129 --locked
 pnpm desktop
 ```
 
 Desktop development requires Rust 1.99.0 and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). For a browser preview, run `pnpm dev` and open http://127.0.0.1:1420.
+
+The browser preview and frontend builds require the WebAssembly target and pinned wasm-bindgen tool shown above. `pnpm domain:build` generates bindings from the shared Rust domain; generated bindings are not checked in.
 
 The tooling wrapper also detects a workspace-local Rust installation in `.tools/`. It does not alter global shell configuration. This workspace already has that installation; on another machine use the normal Rust toolchain setup.
 
 ## Local calendars
 
 Use **+** beside **Calendars** in the sidebar to create a calendar. Click a calendar row to show or hide its events. Hover or focus the row to open **…**, where you can select the default, edit its name/description/color, or permanently delete the calendar and its events. The event editor lets you choose a calendar and move existing events. Saving a new or moved event to a hidden calendar reveals it. You can delete every calendar; event creation becomes available again after creating one.
+
+## Recurring events
+
+The event editor's **Repeat** controls support daily, weekly with selected weekdays, monthly by date or ordinal weekday, and yearly schedules. Set an interval and an optional ending date/count, then use **Preview next dates** to inspect the schedule. Timed repeats keep their saved source zone; unavailable dates and DST gap starts are skipped.
+
+Editing a recurring event offers **This occurrence**, **This and following**, and **Entire series**. Individual deletions skip a date. Series/following edits ask before resetting affected individual changes. Moves and resizes also request a scope, and a split is one undoable action. The CLI supports the same patterns and scopes; see [recurring CLI usage](docs/cli.md#recurring-events).
 
 ## CLI
 

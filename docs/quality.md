@@ -2,7 +2,7 @@
 
 ## Automated checks
 
-`pnpm test` exercises renderer layout and time handling. `pnpm test:ui` covers browser interactions, mocked IPC failures, focus refresh with stale editor drafts, normalized read-only calendars, and axe WCAG A/AA audits in both themes. These checks do not establish native platform input behavior or full screen-reader usability.
+`pnpm test` exercises renderer layout, time handling, and the Rust recurrence domain compiled to WebAssembly. Native Rust and WASM tests consume the same recurrence fixtures. `pnpm test:ui` covers browser interactions, mocked IPC failures, focus refresh with stale editor drafts, normalized read-only calendars, recurrence controls/scopes/preview/undo, and axe WCAG A/AA audits in both themes. These checks do not establish native platform input behavior or full screen-reader usability.
 
 `pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace` covers real SQLite/reopening/undo/migrations, the shared local/test-adapter contract, capability and identity isolation, and unavailable credential-store behavior. CLI process tests cover CRUD persistence, range boundaries, time zones, DST input, and migration rejection; shared service tests cover concurrent mutations and undo conflicts. Test adapters and injected credential stores are compiled only under `cfg(test)`.
 
@@ -19,7 +19,7 @@ pnpm desktop:test:build
 pnpm test:native
 ```
 
-The native runner builds the CLI and checks it against the same disposable database while the desktop is running, including preservation of editor drafts and rejection of stale saves/undo. Focus refresh is triggered by a synthetic webview focus event; physical OS focus behavior remains a manual check.
+The native runner builds the CLI and checks it against the same disposable database while the desktop is running, including preservation of editor drafts and rejection of stale saves/undo. Recurrence checks create and preview a finite series, interleave CLI occurrence/series mutations with desktop drafts, split the future, undo scoped changes, and verify restart persistence. Focus refresh is triggered by a synthetic webview focus event; physical OS focus behavior remains a manual check.
 
 The suite starts the debug executable with `AIKA_TEST_DATA_DIR` set to an isolated temporary directory, connects WebdriverIO directly to the embedded loopback server, and uses real IPC and SQLite without mocks. It restarts the application to distinguish durable data/preferences from session undo. `AIKA_TEST_BINARY` can override the executable path; `TAURI_WEBDRIVER_PORT` can override port 4445. Captures go to ignored `test-results/native/`. Linux CI runs under Xvfb; Windows/macOS jobs remain disabled. The scripts support those platforms but require execution there before claiming verification.
 
@@ -32,6 +32,12 @@ The SQLite v2 migration preserves the existing Personal calendar, events, and ap
 Calendar regression checks cover creation/settings, hover and keyboard menus, default selection, per-calendar colors and filtering in all views, checked event moves and undo, permanent calendar/event deletion, and the persistent zero-calendar state. CLI compatibility covers the current default and operation after Personal is deleted. Calendar deletion does not enter event undo history.
 
 Session verification passed: 24 Playwright tests (including both-theme accessibility audits), 28 Rust/CLI tests, 13 frontend unit tests, packaging tests, the frontend and native test builds, formatting checks, and workspace Clippy with warnings denied. The Linux native suite exercised calendar creation/settings/default/visibility, event moves, deletion, and restart with zero calendars through real IPC and a disposable SQLite database. The existing opt-in OS credential-store test remained skipped; Windows/macOS and manual platform checks remain pending.
+
+## Common recurrence
+
+The schema v3 tests migrate legacy v1/v2 databases without losing events, calendar metadata, or preferences. Storage checks cover atomic split rollback, aggregate concurrency, batch undo, moved exceptions across calendars, destination deletion without resurrection, and reopening. Domain and CLI checks cover daily/weekly/monthly/yearly patterns, intervals, inclusive endings, valid-start counts, unavailable dates, DST gaps/folds, repeated splits, changed monthly seeds, explicit count edits, and bounded expansion. Browser checks exercise the same pure mutation plans through WASM.
+
+Recurrence verification on this Linux host passed 50 Rust/CLI tests (one opt-in credential-store test skipped), 26 frontend/WASM tests, 18 packaging tests, the full 37-test browser suite, and a final rerun of the three recurrence browser tests after date/count corrections. The final Linux native suite passed recurrence preview/scopes/undo, concurrent CLI changes and stale drafts, restart persistence, and existing calendar regressions through real IPC and disposable SQLite. Frontend and native debug builds, generated contracts, formatting, and workspace Clippy with warnings denied passed. Windows/macOS and manual platform verification remain pending as described above.
 
 ## Manual platform checks before alpha acceptance
 

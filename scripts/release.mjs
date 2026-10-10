@@ -45,6 +45,7 @@ export async function validate(tag, cwd = root) {
     'src-tauri/tauri.conf.json',
     'src-tauri/Cargo.toml',
     'src-tauri/core/Cargo.toml',
+    'src-tauri/domain/Cargo.toml',
     'src-tauri/cli/Cargo.toml',
   ]) {
     const contents = await readFile(join(cwd, path), 'utf8');

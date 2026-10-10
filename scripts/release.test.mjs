@@ -33,13 +33,14 @@ async function repository(directory) {
   git(directory, 'init', '-b', 'main');
   git(directory, 'config', 'user.name', 'Release test');
   git(directory, 'config', 'user.email', 'release@example.invalid');
-  for (const path of ['src-tauri/core', 'src-tauri/cli', 'scripts'])
+  for (const path of ['src-tauri/core', 'src-tauri/cli', 'src-tauri/domain', 'scripts'])
     await mkdir(join(directory, path), { recursive: true });
   for (const path of ['package.json', 'src-tauri/tauri.conf.json'])
     await writeFile(join(directory, path), '{"version":"1.2.3"}\n');
   for (const path of [
     'src-tauri/Cargo.toml',
     'src-tauri/core/Cargo.toml',
+    'src-tauri/domain/Cargo.toml',
     'src-tauri/cli/Cargo.toml',
   ])
     await writeFile(join(directory, path), '[package]\nname = "fixture"\nversion = "1.2.3"\n');
@@ -125,6 +126,7 @@ test('requires matching versions across JSON configs and all Rust packages', asy
       'src-tauri/tauri.conf.json',
       'src-tauri/Cargo.toml',
       'src-tauri/core/Cargo.toml',
+      'src-tauri/domain/Cargo.toml',
       'src-tauri/cli/Cargo.toml',
     ]) {
       const original = await readFile(join(directory, path), 'utf8');

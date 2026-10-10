@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="aika-release-") as temporary:
                             "SELECT payload FROM preferences"
                         ).fetchone()[0],
                     }
-                assert record["schema"] == 2 and record["events"] == 0
+                assert record["schema"] == 3 and record["events"] == 0
                 assert record["calendars"] == [("local-default", "Personal")]
                 with socket.socket() as connection:
                     connection.settimeout(0.5)

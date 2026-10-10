@@ -1,4 +1,9 @@
 import { DateTime } from 'luxon';
+import { recurrenceDomain } from './recurrence';
+import type { EventSeries } from './generated/EventSeries';
+import type { EventMutation } from './generated/EventMutation';
+import type { SeriesChange } from './generated/SeriesChange';
+import type { EventRange } from './generated/EventRange';
 import { dateKey, makeEvent } from './calendar';
 import { personalCalendar } from './calendars';
 import type { Calendar } from './generated/Calendar';
@@ -8,7 +13,9 @@ import type { CalendarEvent } from './generated/CalendarEvent';
 
 export type Scenario = 'standard' | 'empty' | 'dense';
 
-// Design fixtures only. Phase 2 replaces this repository with Rust-backed IPC.
+// Browser design fixtures only; native startup never loads these events.
+const fixtureId = (value: number) =>
+  `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
 export function sampleEvents(today: DateTime, scenario: Scenario): CalendarEvent[] {
   if (scenario === 'empty') return [];
   const month = today.startOf('month');
@@ -31,11 +38,11 @@ export function sampleEvents(today: DateTime, scenario: Scenario): CalendarEvent
   ];
   const events = examples.map(([day, hour, title, location]) => {
     const event = makeEvent(month.plus({ days: day - 1 }).set({ hour }));
-    return { ...event, id: `sample-${day}-${hour}`, title, location: location ?? '' };
+    return { ...event, id: fixtureId(day * 24 + hour), title, location: location ?? '' };
   });
   events.push({
     ...makeEvent(month.plus({ days: 14 }), true),
-    id: 'sample-away',
+    id: fixtureId(999),
     title: 'A little time away',
     time: {
       kind: 'allDay',
@@ -56,13 +63,13 @@ export function sampleEvents(today: DateTime, scenario: Scenario): CalendarEvent
         .plus({ hours: duration })
         .toUTC()
         .toISO()!;
-    events.push({ ...event, id: `sample-relative-${offset}-${hour}`, title });
+    events.push({ ...event, id: fixtureId(1000 + (offset + 1) * 24 + hour), title });
   }
   if (scenario === 'dense') {
     for (let i = 0; i < 14; i++) {
       events.push({
         ...makeEvent(today.set({ hour: 8 + Math.floor(i / 2), minute: (i % 2) * 15 })),
-        id: `dense-${i}`,
+        id: fixtureId(2000 + i),
         title: `A busy day · ${i + 1}`,
       });
     }
@@ -71,21 +78,30 @@ export function sampleEvents(today: DateTime, scenario: Scenario): CalendarEvent
 }
 
 export class PrototypeRepository {
-  private events: CalendarEvent[];
+  private series: EventSeries[];
   private calendars: Calendar[] = [structuredClone(personalCalendar)];
   private defaultCalendarId: string | null = personalCalendar.id;
   private hiddenCalendarIds: string[] = [];
-  private history: { before: CalendarEvent | null; after: CalendarEvent | null }[] = [];
+  private history: SeriesChange[][] = [];
   constructor(events: CalendarEvent[]) {
-    this.events = structuredClone(events);
+    this.series = structuredClone(events.map((event) => ({ event, exceptions: [] })));
   }
   list() {
-    return structuredClone(this.events);
+    return structuredClone(this.series.map((s) => s.event));
   }
-  snapshot(): CalendarCollectionSnapshot {
+  getSeries(target: string): EventSeries {
+    const id = target.split('@')[0];
+    const series = this.series.find((s) => s.event.id === id);
+    if (!series) throw new Error('This event no longer exists.');
+    return structuredClone(series);
+  }
+  snapshot(range?: EventRange): CalendarCollectionSnapshot {
+    const events = this.series.flatMap((series) =>
+      series.event.recurrence && range ? recurrenceDomain.expand(series, range) : [series.event],
+    );
     return structuredClone({
       calendars: this.calendars,
-      events: this.events,
+      events,
       defaultCalendarId: this.defaultCalendarId,
       hiddenCalendarIds: this.hiddenCalendarIds,
       canUndo: this.canUndo(),
@@ -94,24 +110,47 @@ export class PrototypeRepository {
   canUndo() {
     return this.history.length > 0;
   }
+  private apply(changes: SeriesChange[], undo = false) {
+    for (const change of changes) {
+      const value = undo ? change.before : change.after;
+      this.series = this.series.filter((s) => s.event.id !== change.id);
+      if (value) {
+        this.series.push(structuredClone(value));
+        if (!undo) {
+          this.setCalendarVisibility(value.event.calendarId, true);
+          for (const exception of value.exceptions)
+            if (exception.event) this.setCalendarVisibility(exception.event.calendarId, true);
+        }
+      }
+    }
+  }
+  mutate(request: EventMutation) {
+    const changes = recurrenceDomain.plan(this.getSeries(request.target), request);
+    this.apply(changes);
+    this.history.push(changes);
+  }
   save(event: CalendarEvent) {
-    const before = this.events.find((e) => e.id === event.id) ?? null;
-    this.history.push({ before: structuredClone(before), after: structuredClone(event) });
-    this.events = [...this.events.filter((item) => item.id !== event.id), structuredClone(event)];
-    if (!before || before.calendarId !== event.calendarId)
-      this.setCalendarVisibility(event.calendarId, true);
+    if (event.recurrence) event = recurrenceDomain.validate(event);
+    const before = this.series.find((s) => s.event.id === event.id) ?? null;
+    const changes = [
+      {
+        id: event.id,
+        before: structuredClone(before),
+        after: { event: structuredClone(event), exceptions: [] },
+      },
+    ];
+    this.apply(changes);
+    this.history.push(changes);
   }
   delete(id: string) {
-    const before = this.events.find((e) => e.id === id) ?? null;
-    this.history.push({ before: structuredClone(before), after: null });
-    this.events = this.events.filter((event) => event.id !== id);
+    const before = this.series.find((s) => s.event.id === id) ?? null;
+    const changes = [{ id, before: structuredClone(before), after: null }];
+    this.apply(changes);
+    this.history.push(changes);
   }
   undo() {
-    const entry = this.history.pop();
-    if (!entry) return;
-    const id = entry.before?.id ?? entry.after!.id;
-    this.events = this.events.filter((e) => e.id !== id);
-    if (entry.before) this.events.push(entry.before);
+    const changes = this.history.pop();
+    if (changes) this.apply(changes, true);
   }
   createCalendar(details: CalendarDetails) {
     const calendar = {
@@ -132,15 +171,38 @@ export class PrototypeRepository {
   }
   deleteCalendar(id: string) {
     this.calendars = this.calendars.filter((c) => c.id !== id);
-    this.events = this.events.filter((e) => e.calendarId !== id);
+    this.series = this.series
+      .filter((s) => s.event.calendarId !== id)
+      .map((s) => ({
+        ...s,
+        exceptions: s.exceptions.map((e) =>
+          e.event?.calendarId === id ? { ...e, event: null } : e,
+        ),
+      }));
     this.hiddenCalendarIds = this.hiddenCalendarIds.filter((c) => c !== id);
-    this.history = this.history.filter(
-      (e) => e.before?.calendarId !== id && e.after?.calendarId !== id,
+    const removedIds = new Set(
+      this.history.flatMap((changes) =>
+        changes
+          .filter((c) =>
+            [c.before, c.after].some(
+              (s) =>
+                s &&
+                (s.event.calendarId === id || s.exceptions.some((e) => e.event?.calendarId === id)),
+            ),
+          )
+          .map((c) => c.id),
+      ),
     );
+    this.history = this.history.filter((changes) => changes.every((c) => !removedIds.has(c.id)));
     if (this.defaultCalendarId === id) this.defaultCalendarId = this.calendars[0]?.id ?? null;
   }
   calendarEventCount(id: string) {
-    return this.events.filter((e) => e.calendarId === id).length;
+    return (
+      this.series.filter((s) => s.event.calendarId === id).length +
+      this.series.flatMap((s) =>
+        s.exceptions.filter((e) => e.event?.calendarId === id && s.event.calendarId !== id),
+      ).length
+    );
   }
   setDefaultCalendar(id: string) {
     this.defaultCalendarId = id;

@@ -370,6 +370,8 @@ fn desktop_created_event_is_readable_by_cli() {
         title: "From desktop".into(),
         location: "Home".into(),
         notes: "Saved through shared core".into(),
+        recurrence: None,
+        occurrence: None,
         time: EventTime::AllDay {
             start_date: "2026-10-10".into(),
             end_date: "2026-10-11".into(),
@@ -757,4 +759,215 @@ fn calendar_help_and_listing_do_not_require_time_zone() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("local-default"));
+}
+
+#[test]
+fn recurring_cli_scopes_endings_and_exception_reset() {
+    let f = Fixture::new();
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Weekly",
+        "--all-day",
+        "--start",
+        "2026-10-05",
+        "--end",
+        "2026-10-06",
+        "--repeat",
+        "weekly",
+        "--weekdays",
+        "mon,wed",
+        "--interval",
+        "2",
+        "--count",
+        "5",
+    ]);
+    let master = id(&created);
+    let list = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-10-01",
+        "--to",
+        "2026-12-01",
+    ]);
+    assert_eq!(list.lines().count(), 5);
+    assert!(list.contains(&format!("{master}@2026-10-19")));
+    assert_eq!(f.run(&["events", "delete", master]).status.code(), Some(2));
+    let occurrence = format!("{master}@2026-10-19");
+    f.success(&[
+        "events",
+        "update",
+        &occurrence,
+        "--scope",
+        "occurrence",
+        "--title",
+        "Exception",
+    ]);
+    assert!(f
+        .success(&["events", "get", &occurrence])
+        .contains("Title: Exception"));
+    let failed = f.run(&[
+        "events", "update", master, "--scope", "series", "--title", "Reset",
+    ]);
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("exceptionsResetRequired"));
+    f.success(&[
+        "events",
+        "update",
+        master,
+        "--scope",
+        "series",
+        "--title",
+        "Reset",
+        "--reset-exceptions",
+    ]);
+    assert!(f
+        .success(&["events", "get", &occurrence])
+        .contains("Title: Reset"));
+    let updated = f.success(&[
+        "events",
+        "update",
+        &occurrence,
+        "--scope",
+        "following",
+        "--title",
+        "Tail",
+    ]);
+    let tail = id(&updated);
+    assert_ne!(tail, master);
+    assert!(uuid::Uuid::parse_str(tail).is_ok());
+    let listed = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-10-01",
+        "--to",
+        "2026-12-01",
+    ]);
+    assert_eq!(listed.lines().count(), 5);
+    assert_eq!(listed.lines().filter(|l| l.contains("Tail")).count(), 3);
+    f.success(&[
+        "events",
+        "delete",
+        &format!("{tail}@2026-10-21"),
+        "--scope",
+        "occurrence",
+    ]);
+    assert_eq!(
+        f.success(&[
+            "events",
+            "list",
+            "--from",
+            "2026-10-01",
+            "--to",
+            "2026-12-01"
+        ])
+        .lines()
+        .count(),
+        4
+    );
+    f.success(&[
+        "events",
+        "update",
+        tail,
+        "--scope",
+        "series",
+        "--no-repeat",
+        "--reset-exceptions",
+    ]);
+    assert_eq!(
+        f.success(&[
+            "events",
+            "list",
+            "--from",
+            "2026-10-01",
+            "--to",
+            "2026-12-01"
+        ])
+        .lines()
+        .count(),
+        3
+    );
+}
+
+#[test]
+fn recurring_cli_validation_monthly_yearly_and_timed_dst() {
+    let f = Fixture::new();
+    for args in [
+        vec!["--repeat", "daily", "--interval", "0"],
+        vec!["--repeat", "daily", "--count", "0"],
+        vec!["--repeat", "weekly", "--weekdays", "wed"],
+        vec!["--interval", "2"],
+        vec!["--repeat", "daily", "--weekdays", "mon"],
+        vec!["--repeat", "weekly", "--weekdays", "mon,mon"],
+    ] {
+        let mut input = vec![
+            "events",
+            "create",
+            "--title",
+            "Bad",
+            "--all-day",
+            "--start",
+            "2026-10-05",
+            "--end",
+            "2026-10-06",
+        ];
+        input.extend(args);
+        assert_eq!(f.run(&input).status.code(), Some(2));
+        assert!(!f.0.exists());
+    }
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Month end",
+        "--all-day",
+        "--start",
+        "2026-01-31",
+        "--end",
+        "2026-02-01",
+        "--repeat",
+        "monthly",
+        "--count",
+        "3",
+    ]);
+    let listed = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-01-01",
+        "--to",
+        "2026-06-01",
+    ]);
+    assert_eq!(listed.lines().count(), 3);
+    assert!(!listed.contains("2026-02-28"));
+    assert!(listed.contains("2026-05-31"));
+    f.success(&["events", "delete", id(&created), "--scope", "series"]);
+    f.success(&[
+        "events",
+        "create",
+        "--title",
+        "DST",
+        "--start",
+        "2026-03-28T02:30",
+        "--end",
+        "2026-03-28T03:30",
+        "--repeat",
+        "daily",
+        "--count",
+        "3",
+    ]);
+    let list = f.success(&[
+        "events",
+        "list",
+        "--from",
+        "2026-03-28",
+        "--to",
+        "2026-04-03",
+    ]);
+    assert_eq!(list.lines().count(), 3);
+    assert!(!list.contains("2026-03-29"));
+    assert!(list.contains("2026-03-30T02:30:00+02:00"));
 }

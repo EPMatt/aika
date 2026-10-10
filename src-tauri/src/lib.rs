@@ -91,6 +91,45 @@ async fn set_calendar_visibility(
 }
 
 #[tauri::command]
+async fn get_event_series(
+    state: tauri::State<'_, ServiceState>,
+    target: String,
+) -> Result<EventSeries, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.get_series(&target)).await
+}
+#[tauri::command]
+async fn mutate_recurring_event(
+    state: tauri::State<'_, ServiceState>,
+    request: EventMutation,
+) -> Result<Vec<CalendarEvent>, ServiceError> {
+    with_service(state.inner().clone(), move |s| s.mutate_event(request)).await
+}
+#[tauri::command]
+async fn preview_recurrence(
+    event: CalendarEvent,
+    series: Option<EventSeries>,
+    request: Option<EventMutation>,
+) -> Result<Vec<CalendarEvent>, ServiceError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let (Some(series), Some(request)) = (series, request) {
+            let changes = aika_core::recurrence::plan_mutation(
+                &series,
+                &request,
+                "a86f6db8-7f44-47c5-a5ca-25d32f9bed3f",
+            )?;
+            return changes
+                .last()
+                .and_then(|c| c.after.as_ref())
+                .map(|s| aika_core::recurrence::preview(s.event.clone()))
+                .unwrap_or(Ok(vec![]));
+        }
+        aika_core::recurrence::preview(event)
+    })
+    .await
+    .map_err(|_| error("service", "Could not preview repetition."))?
+}
+
+#[tauri::command]
 async fn save_event(
     state: tauri::State<'_, ServiceState>,
     event: CalendarEvent,
@@ -184,7 +223,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

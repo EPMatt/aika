@@ -13,6 +13,7 @@ import {
   MapPin,
   PanelLeft,
   Plus,
+  Repeat2,
   Settings2,
   Trash2,
   Undo2,
@@ -43,6 +44,12 @@ import type { Appearance, View } from './calendar';
 import type { PrototypeRepository } from './prototype';
 import { calendarClient, desktop, errorMessage, resolveWallTime } from './client';
 import { CalendarForm, CalendarMenu } from './CalendarControls';
+import { RepeatControls } from './RepeatControls';
+import { previewRecurrence, recurrenceDomain } from './recurrence';
+import type { Recurrence } from './generated/Recurrence';
+import type { MutationScope } from './generated/MutationScope';
+import type { EventSeries } from './generated/EventSeries';
+import type { EventMutation } from './generated/EventMutation';
 import { SidebarPopup } from './SidebarPopup';
 import type { ServiceError } from './generated/ServiceError';
 
@@ -210,8 +217,9 @@ function EventChip({
         e.stopPropagation();
         onClick(event, e.currentTarget);
       }}
-      aria-label={`${event.title}, ${calendar.name}, ${event.time.kind === 'allDay' ? `all day, ${event.time.startDate} through ${DateTime.fromISO(event.time.endDate).minus({ days: 1 }).toISODate()}` : timeLabel(event.time.start)}`}
+      aria-label={`${event.title}${event.recurrence ? ', recurring' : ''}, ${calendar.name}, ${event.time.kind === 'allDay' ? `all day, ${event.time.startDate} through ${DateTime.fromISO(event.time.endDate).minus({ days: 1 }).toISODate()}` : timeLabel(event.time.start)}`}
     >
+      {event.recurrence && <Repeat2 size={11} aria-label="Recurring event" />}
       {event.time.kind === 'timed' && <span className="event-dot" />}
       {day && event.time.kind === 'allDay' && event.time.startDate < dateKey(day) && (
         <span aria-hidden="true">‹</span>
@@ -794,7 +802,7 @@ function TimeView({
                     className="time-event"
                     draggable={eventCalendar.writable}
                     title={event.title}
-                    aria-label={`${event.title}, ${eventCalendar.name}, ${event.time.kind === 'timed' ? timeLabel(event.time.start) : 'all day'}`}
+                    aria-label={`${event.title}${event.recurrence ? ', recurring' : ''}, ${eventCalendar.name}, ${event.time.kind === 'timed' ? timeLabel(event.time.start) : 'all day'}`}
                     style={{
                       ...calendarStyle(eventCalendar),
                       top: (start / 60) * HOUR_HEIGHT + 2,
@@ -815,7 +823,10 @@ function TimeView({
                       onEdit(event, e.currentTarget);
                     }}
                   >
-                    <span className="time-event-title">{event.title}</span>
+                    <span className="time-event-title">
+                      {event.recurrence && <Repeat2 size={11} aria-label="Recurring event" />}{' '}
+                      {event.title}
+                    </span>
                     <span className="time-event-time">
                       {event.time.kind === 'timed'
                         ? `${timeLabel(event.time.start)} – ${timeLabel(event.time.end)}`
@@ -861,10 +872,18 @@ function EventEditor({
   onSave,
   onDelete,
   onClose,
+  scope = 'series',
+  onScope,
+  resetAffected = false,
+  onPreview,
 }: {
+  scope?: MutationScope;
+  onScope?: (scope: MutationScope) => void;
+  resetAffected?: boolean;
+  onPreview: (event: CalendarEvent, countChanged: boolean) => Promise<CalendarEvent[]>;
   event: CalendarEvent;
   existing: boolean;
-  onSave: (event: CalendarEvent) => Promise<void>;
+  onSave: (event: CalendarEvent, resetExceptions: boolean, countChanged: boolean) => Promise<void>;
   onDelete: () => Promise<void>;
   onClose: () => void;
 }) {
@@ -874,14 +893,19 @@ function EventEditor({
   const calendar = calendars.find((c) => c.id === calendarId) ?? emptyCalendar;
   const writable = Boolean(sourceCalendar?.writable && calendar.writable);
   const [title, setTitle] = useState(event.title);
+  const [recurrence, setRecurrence] = useState<Recurrence | undefined>(event.recurrence);
+  const [resetExceptions, setResetExceptions] = useState(false);
+  const [countChanged, setCountChanged] = useState(false);
+  const [preview, setPreview] = useState<CalendarEvent[]>([]);
+  const eventZone = event.time.kind === 'timed' ? event.time.timeZone : DateTime.local().zoneName!;
   const [allDay, setAllDay] = useState(event.time.kind === 'allDay');
   const start =
     event.time.kind === 'timed'
-      ? DateTime.fromISO(event.time.start)
+      ? DateTime.fromISO(event.time.start, { zone: eventZone })
       : DateTime.fromISO(event.time.startDate);
   const end =
     event.time.kind === 'timed'
-      ? DateTime.fromISO(event.time.end)
+      ? DateTime.fromISO(event.time.end, { zone: eventZone })
       : DateTime.fromISO(event.time.endDate).minus({ days: 1 });
   const [startDate, setStartDate] = useState(dateKey(start));
   const [endDate, setEndDate] = useState(dateKey(end));
@@ -896,6 +920,40 @@ function EventEditor({
   const [offsets, setOffsets] = useState<{ start?: number[]; end?: number[] }>({});
   const [chosenOffsets, setChosenOffsets] = useState<{ start?: number; end?: number }>({});
 
+  const buildDraft = async (): Promise<CalendarEvent> => {
+    let time: CalendarEvent['time'];
+    if (allDay) {
+      const until = DateTime.fromISO(endDate).plus({ days: 1 });
+      if (!until.isValid || endDate < startDate)
+        throw new Error('The end date must be on or after the start date.');
+      time = { kind: 'allDay', startDate, endDate: dateKey(until) };
+    } else {
+      const resolve = async (field: 'start' | 'end', local: string) => {
+        try {
+          return await resolveWallTime(local, chosenOffsets[field], eventZone);
+        } catch (err) {
+          const failure = err as ServiceError;
+          if (failure.code === 'ambiguousTime')
+            setOffsets((current) => ({ ...current, [field]: failure.offsets }));
+          throw err;
+        }
+      };
+      const from = await resolve('start', `${startDate}T${startTime}`);
+      const until = await resolve('end', `${endDate}T${endTime}`);
+      if (DateTime.fromISO(until) <= DateTime.fromISO(from))
+        throw new Error('The event must end after it starts.');
+      time = { kind: 'timed', start: from, end: until, timeZone: eventZone };
+    }
+    return {
+      ...event,
+      calendarId,
+      title: title.trim() || 'Preview',
+      location: location.trim(),
+      notes,
+      time,
+      recurrence,
+    };
+  };
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (busy || !writable) return;
@@ -903,41 +961,27 @@ function EventEditor({
       setError('Give your event a title.');
       return;
     }
+    if (resetAffected && !resetExceptions) {
+      setError('Confirm resetting individual changes before saving.');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
-      let time: CalendarEvent['time'];
-      if (allDay) {
-        const until = DateTime.fromISO(endDate).plus({ days: 1 });
-        if (!until.isValid || endDate < startDate)
-          throw new Error('The end date must be on or after the start date.');
-        time = { kind: 'allDay', startDate, endDate: dateKey(until) };
-      } else {
-        const resolve = async (field: 'start' | 'end', local: string) => {
-          try {
-            return await resolveWallTime(local, chosenOffsets[field]);
-          } catch (err) {
-            const failure = err as ServiceError;
-            if (failure.code === 'ambiguousTime')
-              setOffsets((current) => ({ ...current, [field]: failure.offsets }));
-            throw err;
-          }
-        };
-        const from = await resolve('start', `${startDate}T${startTime}`);
-        const until = await resolve('end', `${endDate}T${endTime}`);
-        if (DateTime.fromISO(until) <= DateTime.fromISO(from))
-          throw new Error('The event must end after it starts.');
-        time = { kind: 'timed', start: from, end: until, timeZone: DateTime.local().zoneName! };
-      }
-      await onSave({
-        ...event,
-        calendarId,
-        title: title.trim(),
-        location: location.trim(),
-        notes,
-        time,
-      });
+      await onSave(await buildDraft(), resetExceptions, countChanged);
     } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const showPreview = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      setPreview(await onPreview(await buildDraft(), countChanged));
+    } catch (err) {
+      setPreview([]);
       setError(errorMessage(err));
     } finally {
       setBusy(false);
@@ -968,6 +1012,20 @@ function EventEditor({
             {!writable ? 'Event details' : existing ? 'Edit event' : 'New event'}
           </span>
         </div>
+        {onScope && (
+          <label className="repeat-row">
+            Change
+            <select
+              aria-label="Event change scope"
+              value={scope}
+              onChange={(e) => onScope(e.target.value as MutationScope)}
+            >
+              <option value="occurrence">This occurrence</option>
+              <option value="following">This and following</option>
+              <option value="series">Entire series</option>
+            </select>
+          </label>
+        )}
         <input
           className="event-title-input"
           aria-label="Event title"
@@ -1083,8 +1141,53 @@ function EventEditor({
             </div>
           </div>
         </div>
-        {!allDay && (
-          <p className="timezone-note">{DateTime.local().zoneName?.replaceAll('_', ' ')}</p>
+        {!allDay && <p className="timezone-note">{eventZone.replaceAll('_', ' ')}</p>}
+        <RepeatControls
+          value={recurrence}
+          onChange={(value, explicitCount) => {
+            setCountChanged((current) => current || Boolean(explicitCount));
+            setRecurrence(value);
+            setPreview([]);
+          }}
+          startDate={startDate}
+          disabled={Boolean(onScope && scope === 'occurrence')}
+        />
+        {scope === 'following' && recurrence?.count && !countChanged && (
+          <p className="timezone-note">
+            An unchanged count keeps the remaining repeats. Edit the count to choose a new total.
+          </p>
+        )}
+        {recurrence && scope !== 'occurrence' && (
+          <>
+            <button type="button" className="text-button" onClick={showPreview}>
+              Preview next dates
+            </button>
+            {preview.length > 0 && (
+              <ol className="repeat-preview" aria-label="Repeat preview">
+                {preview.map((e) => (
+                  <li key={e.id}>
+                    {e.time.kind === 'allDay'
+                      ? e.time.startDate
+                      : DateTime.fromISO(e.time.start, { zone: e.time.timeZone }).toFormat(
+                          'ccc, d LLL yyyy HH:mm',
+                        )}
+                  </li>
+                ))}
+              </ol>
+            )}
+          </>
+        )}
+        {resetAffected && (
+          <label className="repeat-reset">
+            <input
+              type="checkbox"
+              aria-label="Reset individual changes"
+              checked={resetExceptions}
+              onChange={(e) => setResetExceptions(e.target.checked)}
+            />
+            This edit discards affected individual edits and skipped occurrences. Reset those
+            changes.
+          </label>
         )}
         {details ? (
           <div className="optional-fields">
@@ -1223,7 +1326,13 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const calendar = calendars.find((c) => c.id === defaultCalendarId) ?? emptyCalendar;
   const [calendarReady, setCalendarReady] = useState(!desktop);
   const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
-  const [editing, setEditing] = useState<{ event: CalendarEvent; existing: boolean } | null>(null);
+  const [editing, setEditing] = useState<{
+    event: CalendarEvent;
+    existing: boolean;
+    selected?: CalendarEvent;
+    series?: EventSeries;
+    scope?: MutationScope;
+  } | null>(null);
   const editorAnchor = useRef<HTMLElement | null>(null);
   const editorPositionRef = useRef<ReturnType<typeof editorPosition> | null>(null);
   const newButton = useRef<HTMLButtonElement>(null);
@@ -1262,18 +1371,20 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       .catch((err) => setPreferenceFailure(errorMessage(err)));
   }, [appearance, view, sidebar, ready]);
   useEffect(() => {
-    if (!desktop) return;
     const token = ++requestVersion.current;
     const days = daysForView(date, view);
     const start = days[0].startOf('day');
     const end = days[days.length - 1].plus({ days: 1 }).startOf('day');
-    calendarClient
-      .snapshot({
-        start: start.toUTC().toISO()!,
-        end: end.toUTC().toISO()!,
-        startDate: dateKey(start),
-        endDate: dateKey(end),
-      })
+    const range = {
+      start: start.toUTC().toISO()!,
+      end: end.toUTC().toISO()!,
+      startDate: dateKey(start),
+      endDate: dateKey(end),
+    };
+    const snapshot = desktop
+      ? calendarClient.snapshot(range)
+      : Promise.resolve().then(() => repository!.snapshot(range));
+    snapshot
       .then((snapshot) => {
         if (token !== requestVersion.current) return;
         setCalendars(snapshot.calendars);
@@ -1327,7 +1438,17 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const refresh = (message: string) => {
     setFailure('');
     if (repository) {
-      applySnapshot(repository.snapshot());
+      const days = daysForView(date, view);
+      const start = days[0].startOf('day');
+      const end = days[days.length - 1].plus({ days: 1 }).startOf('day');
+      applySnapshot(
+        repository.snapshot({
+          start: start.toUTC().toISO()!,
+          end: end.toUTC().toISO()!,
+          startDate: dateKey(start),
+          endDate: dateKey(end),
+        }),
+      );
     } else {
       requestVersion.current++;
       setRevision((value) => value + 1);
@@ -1363,11 +1484,49 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     },
     [calendar, calendarReady],
   );
-  const edit = (event: CalendarEvent, anchor: HTMLElement) => {
+  const edit = async (event: CalendarEvent, anchor: HTMLElement) => {
     editorAnchor.current = anchor;
     editorPositionRef.current = editorPosition(anchor);
-    setEditing({ event, existing: true });
+    if (!event.occurrence) {
+      setEditing({ event, existing: true });
+      return;
+    }
+    try {
+      const series = desktop
+        ? await calendarClient.getSeries(event.id)
+        : repository!.getSeries(event.id);
+      setEditing({ event, selected: event, series, scope: 'occurrence', existing: true });
+    } catch (err) {
+      setFailure(errorMessage(err));
+    }
   };
+  const requestForEdit = (
+    event: CalendarEvent | null,
+    resetExceptions = false,
+    countChanged = false,
+  ): EventMutation => {
+    const selected = editing!.selected!;
+    const scope = editing!.scope ?? 'occurrence';
+    return {
+      target: scope === 'series' ? selected.occurrence!.seriesId : selected.id,
+      scope,
+      event,
+      expected: selected.occurrence!.expected,
+      resetExceptions,
+      countChanged,
+    };
+  };
+  const performRecurring = async (request: EventMutation) => {
+    if (desktop) await calendarClient.mutateEvent(request);
+    else repository!.mutate(request);
+  };
+  const [gestureEdit, setGestureEdit] = useState<{
+    original: CalendarEvent;
+    changed: CalendarEvent;
+  } | null>(null);
+  const [gestureScope, setGestureScope] = useState<MutationScope>('occurrence');
+  const [gestureReset, setGestureReset] = useState(false);
+  const [gestureFailure, setGestureFailure] = useState('');
   const move = async (id: string, target: DateTime, precise = false) => {
     const event = events.find((item) => item.id === id);
     if (!event || !calendars.find((c) => c.id === event.calendarId)?.writable) return;
@@ -1376,15 +1535,24 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       if (event.time.kind === 'timed' && moved.time.kind === 'timed') {
         const oldStart = DateTime.fromISO(event.time.start);
         const start = await resolveWallTime(
-          `${dateKey(target)}T${(precise ? target : oldStart).toFormat('HH:mm')}`,
+          `${dateKey(target)}T${(precise ? target : oldStart.setZone(event.time.timeZone)).toFormat('HH:mm')}`,
+          undefined,
+          event.time.timeZone,
         );
         const duration = DateTime.fromISO(event.time.end).diff(oldStart).milliseconds;
         moved.time = {
           kind: 'timed',
           start,
           end: DateTime.fromISO(start).plus({ milliseconds: duration }).toUTC().toISO()!,
-          timeZone: DateTime.local().zoneName!,
+          timeZone: event.time.timeZone,
         };
+      }
+      if (event.occurrence) {
+        setGestureEdit({ original: event, changed: moved });
+        setGestureScope('occurrence');
+        setGestureReset(false);
+        setGestureFailure('');
+        return;
       }
       if (desktop) await calendarClient.save(moved, true, event);
       else repository!.save(moved);
@@ -1403,10 +1571,21 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     )
       return;
     try {
-      const end = await resolveWallTime(`${dateKey(target)}T${target.toFormat('HH:mm')}`);
+      const end = await resolveWallTime(
+        `${dateKey(target)}T${target.toFormat('HH:mm')}`,
+        undefined,
+        event.time.timeZone,
+      );
       if (DateTime.fromISO(end).toMillis() <= DateTime.fromISO(event.time.start).toMillis())
         throw new Error('End must be after start.');
       const resized = { ...event, time: { ...event.time, end } };
+      if (event.occurrence) {
+        setGestureEdit({ original: event, changed: resized });
+        setGestureScope('occurrence');
+        setGestureReset(false);
+        setGestureFailure('');
+        return;
+      }
       if (desktop) await calendarClient.save(resized, true, event);
       else repository!.save(resized);
       setFailure('');
@@ -1437,6 +1616,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       if (
         target.closest('input, textarea, select, [contenteditable="true"]') ||
         editing ||
+        gestureEdit ||
         activePopup ||
         calendarDialog ||
         deletingCalendar ||
@@ -1460,7 +1640,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [date, editing, activePopup, calendarDialog, deletingCalendar, create]);
+  }, [date, editing, gestureEdit, activePopup, calendarDialog, deletingCalendar, create]);
 
   const heading = view === 'day' ? date.toFormat('cccc') : date.toFormat('LLLL');
   const subheading = view === 'day' ? date.toFormat('d LLLL yyyy') : String(date.year);
@@ -1775,14 +1955,48 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               >
                 {editing && (
                   <EventEditor
-                    key={editing.event.id}
+                    key={`${editing.event.id}:${editing.scope ?? 'single'}`}
                     event={editing.event}
                     existing={editing.existing}
+                    scope={editing.scope ?? 'series'}
+                    onScope={
+                      editing.selected
+                        ? (scope) =>
+                            setEditing({
+                              ...editing,
+                              scope,
+                              event: scope === 'series' ? editing.series!.event : editing.selected!,
+                            })
+                        : undefined
+                    }
+                    resetAffected={Boolean(
+                      editing.series &&
+                        editing.scope !== 'occurrence' &&
+                        editing.series.exceptions.some(
+                          (e) =>
+                            editing.scope === 'series' ||
+                            e.originalStart >= editing.selected!.occurrence!.originalStart,
+                        ),
+                    )}
+                    onPreview={async (event, countChanged) => {
+                      if (editing.selected && editing.series && editing.scope !== 'occurrence') {
+                        const request = requestForEdit(event, true, countChanged);
+                        if (desktop) return calendarClient.preview(event, editing.series, request);
+                        const changes = recurrenceDomain.plan(editing.series, request);
+                        const after = changes[changes.length - 1].after;
+                        return after ? previewRecurrence(after.event) : [];
+                      }
+                      return previewRecurrence(event);
+                    }}
                     onClose={() => setEditing(null)}
-                    onSave={async (event) => {
+                    onSave={async (event, resetExceptions, countChanged) => {
                       setMutating(true);
                       try {
-                        if (desktop)
+                        if (editing.selected)
+                          await performRecurring(
+                            requestForEdit(event, resetExceptions, countChanged),
+                          );
+                        else if (desktop)
                           await calendarClient.save(
                             event,
                             editing.existing,
@@ -1798,7 +2012,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     onDelete={async () => {
                       setMutating(true);
                       try {
-                        if (desktop) await calendarClient.delete(editing.event.id, editing.event);
+                        if (editing.selected) await performRecurring(requestForEdit(null));
+                        else if (desktop)
+                          await calendarClient.delete(editing.event.id, editing.event);
                         else repository!.delete(editing.event.id);
                         setEditing(null);
                         refresh('Event deleted. Undo is available.');
@@ -1811,6 +2027,85 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               </Popover.Content>
             </Popover.Portal>
           </Popover.Root>
+          <Dialog.Root
+            open={Boolean(gestureEdit)}
+            onOpenChange={(open) => {
+              if (!open && !mutating) setGestureEdit(null);
+            }}
+          >
+            <Dialog.Portal>
+              <Dialog.Overlay className="dialog-overlay" />
+              <Dialog.Content
+                className="settings-dialog"
+                aria-describedby="gesture-repeat-description"
+              >
+                <Dialog.Title>Change recurring event</Dialog.Title>
+                <Dialog.Description id="gesture-repeat-description">
+                  Choose which occurrences to move or resize.
+                </Dialog.Description>
+                <label className="repeat-row">
+                  Change
+                  <select
+                    aria-label="Gesture change scope"
+                    value={gestureScope}
+                    onChange={(e) => setGestureScope(e.target.value as MutationScope)}
+                  >
+                    <option value="occurrence">This occurrence</option>
+                    <option value="following">This and following</option>
+                    <option value="series">Entire series</option>
+                  </select>
+                </label>
+                {gestureScope !== 'occurrence' && (
+                  <label className="repeat-reset">
+                    <input
+                      type="checkbox"
+                      aria-label="Reset gesture individual changes"
+                      checked={gestureReset}
+                      onChange={(e) => setGestureReset(e.target.checked)}
+                    />
+                    Reset affected individual edits and skipped occurrences, if any.
+                  </label>
+                )}
+                {gestureFailure && (
+                  <p role="alert" className="editor-error">
+                    {gestureFailure}
+                  </p>
+                )}
+                <div className="dialog-actions">
+                  <button type="button" onClick={() => setGestureEdit(null)} disabled={mutating}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={mutating}
+                    onClick={async () => {
+                      if (!gestureEdit) return;
+                      setMutating(true);
+                      setGestureFailure('');
+                      try {
+                        await performRecurring({
+                          target: gestureEdit.original.id,
+                          scope: gestureScope,
+                          event: gestureEdit.changed,
+                          expected: gestureEdit.original.occurrence!.expected,
+                          resetExceptions: gestureReset,
+                        });
+                        setGestureEdit(null);
+                        refresh('Recurring event changed. Undo is available.');
+                      } catch (err) {
+                        setGestureFailure(errorMessage(err));
+                      } finally {
+                        setMutating(false);
+                      }
+                    }}
+                  >
+                    Save changes
+                  </button>
+                </div>
+              </Dialog.Content>
+            </Dialog.Portal>
+          </Dialog.Root>
           <Dialog.Root
             open={Boolean(calendarDialog)}
             onOpenChange={(open) => {

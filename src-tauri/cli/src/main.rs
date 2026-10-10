@@ -1,5 +1,8 @@
 use aika_core::{
-    contracts::{Calendar, CalendarDetails, CalendarEvent, EventRange, EventTime, ServiceError},
+    contracts::{
+        Calendar, CalendarDetails, CalendarEvent, EventMutation, EventRange, EventTime, MonthlyOn,
+        MutationScope, Recurrence, RepeatFrequency, ServiceError,
+    },
     service::{
         error, resolve_local, validate_event, validate_range, CalendarManagementSnapshot,
         CalendarService, LocalProvider,
@@ -31,7 +34,7 @@ enum Command {
     /// List, inspect, create, update, or delete events.
     Events {
         #[command(subcommand)]
-        command: Events,
+        command: Box<Events>,
     },
 }
 
@@ -97,7 +100,11 @@ enum Events {
         fields: EventArgs,
     },
     /// Delete an event by its full UUID, without a confirmation prompt.
-    Delete { id: String },
+    Delete {
+        id: String,
+        #[arg(long, value_parser = ["occurrence", "following", "series"])]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Args, Clone, Default)]
@@ -121,6 +128,29 @@ struct EventArgs {
     location: Option<String>,
     #[arg(long)]
     notes: Option<String>,
+    #[arg(long, value_parser = ["daily", "weekly", "monthly", "yearly"], conflicts_with = "no_repeat")]
+    repeat: Option<String>,
+    #[arg(long, conflicts_with = "no_repeat")]
+    interval: Option<u32>,
+    /// Comma-separated weekdays: mon,tue,wed,thu,fri,sat,sun.
+    #[arg(long, conflicts_with = "no_repeat")]
+    weekdays: Option<String>,
+    #[arg(long, value_parser = ["date", "weekday"], conflicts_with = "no_repeat")]
+    monthly_on: Option<String>,
+    /// Inclusive ending date in the event's zone.
+    #[arg(long, conflicts_with_all = ["count", "forever", "no_repeat"])]
+    until: Option<String>,
+    #[arg(long, conflicts_with_all = ["until", "forever", "no_repeat"])]
+    count: Option<u32>,
+    #[arg(long, conflicts_with_all = ["until", "count", "no_repeat"])]
+    forever: bool,
+    #[arg(long)]
+    no_repeat: bool,
+    #[arg(long, value_parser = ["occurrence", "following", "series"])]
+    scope: Option<String>,
+    /// Explicitly discard affected individual edits/cancellations on series/following edits.
+    #[arg(long)]
+    reset_exceptions: bool,
 }
 
 type Result<T> = std::result::Result<T, ServiceError>;
@@ -196,7 +226,122 @@ fn required(value: &Option<String>, name: &str) -> Result<String> {
         .ok_or_else(|| error("validation", &format!("Supply --{name}.")))
 }
 
+fn repeat_from_args(
+    fields: &EventArgs,
+    previous: Option<&CalendarEvent>,
+) -> Result<Option<Recurrence>> {
+    if fields.no_repeat {
+        return Ok(None);
+    }
+    let mut rule = previous.and_then(|e| e.recurrence.clone());
+    if let Some(frequency) = &fields.repeat {
+        let frequency = match frequency.as_str() {
+            "daily" => RepeatFrequency::Daily,
+            "weekly" => RepeatFrequency::Weekly,
+            "monthly" => RepeatFrequency::Monthly,
+            _ => RepeatFrequency::Yearly,
+        };
+        if let Some(rule) = &mut rule {
+            if rule.frequency != frequency {
+                rule.weekdays.clear();
+            }
+            rule.frequency = frequency;
+        } else {
+            rule = Some(Recurrence {
+                frequency,
+                interval: 1,
+                weekdays: vec![],
+                monthly_on: MonthlyOn::Date,
+                until: None,
+                count: None,
+                segment: None,
+            });
+        }
+    }
+    let changed = fields.interval.is_some()
+        || fields.weekdays.is_some()
+        || fields.monthly_on.is_some()
+        || fields.until.is_some()
+        || fields.count.is_some()
+        || fields.forever;
+    if changed && rule.is_none() {
+        return Err(error(
+            "validation",
+            "Supply --repeat before repeat options.",
+        ));
+    }
+    if let Some(rule) = &mut rule {
+        if let Some(interval) = fields.interval {
+            rule.interval = interval;
+        }
+        if let Some(value) = &fields.weekdays {
+            if rule.frequency != RepeatFrequency::Weekly {
+                return Err(error(
+                    "validation",
+                    "--weekdays requires weekly repetition.",
+                ));
+            }
+            rule.weekdays = value
+                .split(',')
+                .map(|day| match day.trim().to_ascii_lowercase().as_str() {
+                    "mon" => Ok(1),
+                    "tue" => Ok(2),
+                    "wed" => Ok(3),
+                    "thu" => Ok(4),
+                    "fri" => Ok(5),
+                    "sat" => Ok(6),
+                    "sun" => Ok(7),
+                    _ => Err(error(
+                        "validation",
+                        "Use weekdays mon,tue,wed,thu,fri,sat,sun.",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        if let Some(value) = &fields.monthly_on {
+            if rule.frequency != RepeatFrequency::Monthly {
+                return Err(error(
+                    "validation",
+                    "--monthly-on requires monthly repetition.",
+                ));
+            }
+            rule.monthly_on = if value == "weekday" {
+                MonthlyOn::Weekday
+            } else {
+                MonthlyOn::Date
+            };
+        }
+        if let Some(until) = &fields.until {
+            date(until)?;
+            rule.until = Some(until.clone());
+            rule.count = None;
+        }
+        if let Some(count) = fields.count {
+            rule.count = Some(count);
+            rule.until = None;
+        }
+        if fields.forever {
+            rule.count = None;
+            rule.until = None;
+        }
+    }
+    Ok(rule)
+}
+fn mutation_scope(value: Option<&str>, recurring: bool) -> Result<MutationScope> {
+    match value {
+        Some("occurrence") => Ok(MutationScope::Occurrence),
+        Some("following") => Ok(MutationScope::Following),
+        Some("series") => Ok(MutationScope::Series),
+        None if !recurring => Ok(MutationScope::Series),
+        _ => Err(error(
+            "validation",
+            "Recurring mutations require --scope occurrence|following|series.",
+        )),
+    }
+}
+
 fn event_from_args(fields: EventArgs, previous: Option<&CalendarEvent>) -> Result<CalendarEvent> {
+    let recurrence = repeat_from_args(&fields, previous)?;
     let previous_all_day = previous.is_some_and(|e| matches!(e.time, EventTime::AllDay { .. }));
     let all_day = fields.all_day || (previous_all_day && !fields.timed);
     if previous.is_some()
@@ -255,6 +400,8 @@ fn event_from_args(fields: EventArgs, previous: Option<&CalendarEvent>) -> Resul
         }
     };
     Ok(CalendarEvent {
+        recurrence,
+        occurrence: previous.and_then(|e| e.occurrence.clone()),
         id: previous
             .map(|e| e.id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -312,7 +459,7 @@ fn single_line(value: &str) -> String {
 }
 
 fn describe(event: &CalendarEvent) -> String {
-    format!(
+    let mut output = format!(
         "ID: {}\nCalendar: {}\nTitle: {}\nTime: {}\nLocation: {}\nNotes: {}\n",
         event.id,
         event.calendar_id,
@@ -320,7 +467,38 @@ fn describe(event: &CalendarEvent) -> String {
         display_time(event, None),
         single_line(&event.location),
         single_line(&event.notes)
-    )
+    );
+    if let Some(rule) = &event.recurrence {
+        let frequency = match rule.frequency {
+            RepeatFrequency::Daily => "daily",
+            RepeatFrequency::Weekly => "weekly",
+            RepeatFrequency::Monthly => "monthly",
+            RepeatFrequency::Yearly => "yearly",
+        };
+        writeln!(output, "Repeat: {frequency}, interval {}", rule.interval).expect("write string");
+        if !rule.weekdays.is_empty() {
+            writeln!(output, "Weekdays: {:?}", rule.weekdays).expect("write string");
+        }
+        if rule.frequency == RepeatFrequency::Monthly {
+            writeln!(
+                output,
+                "Monthly on: {}",
+                if rule.monthly_on == MonthlyOn::Weekday {
+                    "weekday"
+                } else {
+                    "date"
+                }
+            )
+            .expect("write string");
+        }
+        if let Some(until) = &rule.until {
+            writeln!(output, "Until: {until}").expect("write string");
+        }
+        if let Some(count) = rule.count {
+            writeln!(output, "Count: {count}").expect("write string");
+        }
+    }
+    output
 }
 
 fn calendar_details(fields: CalendarArgs, previous: Option<&Calendar>) -> Result<CalendarDetails> {
@@ -455,7 +633,7 @@ fn run(cli: Cli) -> Result<String> {
     // Parse inputs before opening (or initializing) a database.
     let command = match cli.command {
         Command::Calendars { command } => return run_calendars(&path, command),
-        Command::Events { command } => command,
+        Command::Events { command } => *command,
     };
     let listing = if let Events::List {
         from,
@@ -479,9 +657,12 @@ fn run(cli: Cli) -> Result<String> {
     } else {
         None
     };
-    if let Events::Get { id } | Events::Update { id, .. } | Events::Delete { id } = &command {
-        if uuid::Uuid::parse_str(id).is_err() {
-            return Err(error("validation", "Use the full event UUID."));
+    if let Events::Get { id } | Events::Update { id, .. } | Events::Delete { id, .. } = &command {
+        if uuid::Uuid::parse_str(id.split_once('@').map_or(id.as_str(), |(id, _)| id)).is_err() {
+            return Err(error(
+                "validation",
+                "Use the full event UUID or occurrence selector.",
+            ));
         }
     }
     let mut service = open_service(&path)?;
@@ -502,7 +683,16 @@ fn run(cli: Cli) -> Result<String> {
             }
             Ok(output)
         }
-        Events::Get { id } => Ok(describe(&service.get(&id)?)),
+        Events::Get { id } => {
+            if let Some((_, key)) = id.split_once('@') {
+                let series = service.get_series(&id)?;
+                Ok(describe(&aika_core::recurrence::get_occurrence(
+                    &series, key,
+                )?))
+            } else {
+                Ok(describe(&service.get(&id)?))
+            }
+        }
         Events::Create(_) => {
             let mut event = created.expect("create input parsed");
             event.calendar_id = service.default_calendar_id()?.ok_or_else(|| {
@@ -514,17 +704,76 @@ fn run(cli: Cli) -> Result<String> {
             Ok(describe(&service.save_checked(event, false, None)?))
         }
         Events::Update { id, fields } => {
-            let previous = service.get(&id)?;
+            let series = service.get_series(&id)?;
+            let scope = mutation_scope(fields.scope.as_deref(), series.event.recurrence.is_some())?;
+            if scope == MutationScope::Occurrence
+                && (fields.repeat.is_some()
+                    || fields.no_repeat
+                    || fields.interval.is_some()
+                    || fields.weekdays.is_some()
+                    || fields.monthly_on.is_some()
+                    || fields.until.is_some()
+                    || fields.count.is_some()
+                    || fields.forever)
+            {
+                return Err(error(
+                    "validation",
+                    "Changing a repeat pattern requires series or following scope.",
+                ));
+            }
+            let reset_exceptions = fields.reset_exceptions;
+            let count_changed = fields.count.is_some();
+            let previous = if scope == MutationScope::Series {
+                series.event.clone()
+            } else {
+                let (_, key) = id.split_once('@').ok_or_else(|| {
+                    error("validation", "This scope requires an occurrence selector.")
+                })?;
+                aika_core::recurrence::get_occurrence(&series, key)?
+            };
             let event = event_from_args(fields, Some(&previous))?;
-            Ok(describe(&service.save_checked(
-                event,
-                true,
-                Some(previous),
-            )?))
+            if series.event.recurrence.is_none() {
+                return Ok(describe(&service.save_checked(
+                    event,
+                    true,
+                    Some(previous),
+                )?));
+            }
+            let output = describe(&event);
+            let target = if scope == MutationScope::Series {
+                series.event.id.clone()
+            } else {
+                id
+            };
+            let saved = service.mutate_event(EventMutation {
+                target,
+                scope: scope.clone(),
+                event: Some(event),
+                expected: aika_core::recurrence::expectation(&series)?,
+                reset_exceptions,
+                count_changed,
+            })?;
+            Ok(if scope == MutationScope::Following {
+                saved.last().map(describe).unwrap_or(output)
+            } else {
+                output
+            })
         }
-        Events::Delete { id } => {
-            let previous = service.get(&id)?;
-            service.delete_checked(&id, &previous)?;
+        Events::Delete { id, scope } => {
+            let series = service.get_series(&id)?;
+            let scope = mutation_scope(scope.as_deref(), series.event.recurrence.is_some())?;
+            if series.event.recurrence.is_none() {
+                service.delete_checked(&id, &series.event)?;
+            } else {
+                service.mutate_event(EventMutation {
+                    target: id.clone(),
+                    scope,
+                    event: None,
+                    expected: aika_core::recurrence::expectation(&series)?,
+                    reset_exceptions: false,
+                    count_changed: false,
+                })?;
+            }
             Ok(format!("Deleted {id}\n"))
         }
     }
@@ -537,9 +786,18 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("{}: {}", err.code, err.message);
+            eprintln!(
+                "{}: {}{}",
+                err.code,
+                err.message,
+                if err.code == "exceptionsResetRequired" {
+                    " Supply --reset-exceptions to confirm."
+                } else {
+                    ""
+                }
+            );
             ExitCode::from(match err.code.as_str() {
-                "validation" | "ambiguousTime" | "nonexistentTime" => 2,
+                "validation" | "ambiguousTime" | "nonexistentTime" | "exceptionsResetRequired" => 2,
                 "notFound" => 3,
                 "conflict" => 4,
                 _ => 1,

@@ -1,5 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
+import type { EventSeries } from './generated/EventSeries';
+import type { EventMutation } from './generated/EventMutation';
 import type { CalendarEvent } from './generated/CalendarEvent';
 import type { CalendarCollectionSnapshot } from './generated/CalendarCollectionSnapshot';
 import type { CalendarDetails } from './generated/CalendarDetails';
@@ -16,6 +18,14 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
+  getSeries: (target: string) => invoke<EventSeries>('get_event_series', { target }),
+  mutateEvent: (request: EventMutation) =>
+    mutate<CalendarEvent[]>('mutate_recurring_event', { request }),
+  preview: (
+    event: CalendarEvent,
+    series: EventSeries | null = null,
+    request: EventMutation | null = null,
+  ) => invoke<CalendarEvent[]>('preview_recurrence', { event, series, request }),
   createCalendar: (details: CalendarDetails) => mutate<Calendar>('create_calendar', { details }),
   updateCalendar: (id: string, details: CalendarDetails, expected: Calendar) =>
     mutate<void>('update_calendar', { id, details, expected }),

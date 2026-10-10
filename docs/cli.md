@@ -1,6 +1,6 @@
 # aika CLI
 
-`aika-cli` operates on the desktop application's local calendars using the shared Rust service. No running desktop app or GUI is required. Connected calendars, JSON output, search, recurrence, import/export, and CLI undo are outside this version.
+`aika-cli` operates on the desktop application's local calendars using the shared Rust service. No running desktop app or GUI is required. Connected calendars, JSON output, search, import/export, and CLI undo are outside this version.
 
 ## Build and run
 
@@ -65,7 +65,35 @@ aika-cli events delete <event-uuid>
 
 Listing selects events that overlap `[from, to)`, including events that start before the range. Dates use `YYYY-MM-DD`. `--to` is exclusive, and the range must be positive and at most 366 days. Results are sorted by stored start boundary and then full UUID. Timed boundaries are converted from midnight in the selected IANA zone. An empty result prints nothing. If a boundary midnight falls in a DST gap or repeated time, choose another boundary date or zone.
 
-Creation requires title, start, and end, and uses the default calendar selected through the CLI or desktop UI. If no calendars exist, use `calendars create --name NAME` first. Listings include all local calendars, including calendars hidden in the desktop UI. Get, update, and delete locate events by their full UUID; updates preserve their calendar. Calendar creation/settings/deletion are available through `calendars`; event assignment and moves between calendars remain managed in the desktop UI. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, and notes; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
+Creation requires title, start, and end, and uses the default calendar selected through the CLI or desktop UI. If no calendars exist, use `calendars create --name NAME` first. Listings include all local calendars, including calendars hidden in the desktop UI. Get, update, and delete locate single events by their full UUID; updates preserve their calendar. Calendar creation/settings/deletion are available through `calendars`; event assignment and moves between calendars remain managed in the desktop UI. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, notes, and applicable repeat settings; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
+
+## Recurring events
+
+```sh
+aika-cli events create --title 'Stand-up' --start 2026-10-05T09:00 --end 2026-10-05T09:15 --time-zone Europe/Zurich --repeat weekly --weekdays mon,wed,fri
+aika-cli events create --title 'Month end' --all-day --start 2026-01-31 --end 2026-02-01 --repeat monthly --count 6
+aika-cli events create --title 'Planning' --start 2026-10-05T09:00 --end 2026-10-05T10:00 --repeat monthly --monthly-on weekday --until 2027-06-30
+aika-cli events update '<series-uuid>@2026-10-09T07:00:00.000Z' --scope occurrence --title 'Longer stand-up'
+aika-cli events delete '<series-uuid>@2026-10-09T07:00:00.000Z' --scope occurrence
+aika-cli events update '<series-uuid>@2026-10-12T07:00:00.000Z' --scope following --title 'Future stand-up'
+aika-cli events update <series-uuid> --scope series --interval 2 --reset-exceptions
+aika-cli events update <series-uuid> --scope series --no-repeat --reset-exceptions
+aika-cli events delete <series-uuid> --scope series
+```
+
+`--repeat daily|weekly|monthly|yearly` starts a pattern; `--interval` defaults to one. Weekly `--weekdays` accepts comma-separated `mon,tue,wed,thu,fri,sat,sun` and must include the seed weekday. Without it, weekly repeats use the seed weekday. Monthly `--monthly-on date|weekday` defaults to the date number; weekday uses the seed's ordinal weekday, including fifth weekdays. Yearly uses the seed month/day. Invalid dates are skipped, never clamped to the end of a month.
+
+Repeats default to no ending. Choose `--until YYYY-MM-DD` (inclusive in the event's source zone) or `--count N`; they are mutually exclusive. `--forever` clears an existing ending. Omitted update fields remain unchanged. `--no-repeat` removes recurrence and leaves one event at the affected segment's first occurrence. Intervals allow 1–10000 and counts 1–100000.
+
+Timed starts follow the saved IANA zone, keeping local clock time and elapsed duration across DST. Nonexistent generated starts are skipped; ambiguous generated starts use the earlier offset. A manually selected offset on the seed is preserved. Invalid generated dates/times do not consume count; cancelled individual occurrences do. All-day repeats use dates and calendar-day durations.
+
+Listing expands occurrences within the requested range and prints exact selectors `<master-uuid>@<original-start>`. The original start is a canonical UTC timestamp with milliseconds for originally timed schedules or `YYYY-MM-DD` for originally all-day schedules. Quote selectors and copy them exactly. Moving an occurrence retains its selector. A bare UUID retrieves the master and its repeat settings; an occurrence selector retrieves its effective values.
+
+Recurring updates/deletes require `--scope occurrence|following|series`. Occurrence/following scope requires a selector. Series updates edit the master, including when supplied a selector. Occurrence changes leave the rest of the schedule intact; recurrence options require series/following scope. Following changes split into a new series and print its new master UUID. Unchanged timing and pattern retain the original interval phase and the remaining count. Changed timing or a replacement pattern begins at the edited selected occurrence. Supplying `--count N` explicitly sets the new segment’s count, including when N equals the original count; omitting it preserves the remaining count. Moving an unchanged weekly weekday selection rotates its weekdays with the date change.
+
+Series/following edits reset affected individual edits and cancellations. If any exist, the command fails without changes unless `--reset-exceptions` is supplied. Deletions already identify their destructive extent through `--scope`. Create an ordinary event for an additional date; explicit extra-date lists are not supported.
+
+Expansion errors never print partial results. Listings allow at most 10000 events, and expansion allows 100000 schedule steps per series. Use a shorter range or a closer/bounded schedule if a limit is reached.
 
 ## Time and all-day events
 

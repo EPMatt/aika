@@ -4,6 +4,7 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 
 [dependencies]
+aika-domain = { path = "../domain", features = ["sqlite"] }
 serde = { version = "1", features = ["derive"] }
 ts-rs = { version = "12", features = ["serde-compat"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

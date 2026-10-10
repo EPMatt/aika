@@ -1,152 +1,14 @@
 //! Local application service. All callers serialize access, including undo and preferences.
 use crate::contracts::*;
-use chrono::{
-    DateTime, LocalResult, NaiveDate, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc,
-};
-use chrono_tz::Tz;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, ServiceError>;
-pub fn error(code: &str, message: &str) -> ServiceError {
-    ServiceError {
-        code: code.into(),
-        message: message.into(),
-        offsets: vec![],
-    }
-}
-impl From<rusqlite::Error> for ServiceError {
-    fn from(_: rusqlite::Error) -> Self {
-        error(
-            "storage",
-            "Could not access the calendar database. Your data has not been reset.",
-        )
-    }
-}
-impl From<serde_json::Error> for ServiceError {
-    fn from(_: serde_json::Error) -> Self {
-        error("storage", "Could not read stored calendar data.")
-    }
-}
-fn date(value: &str) -> Result<NaiveDate> {
-    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| error("validation", "Use a valid calendar date."))?;
-    if parsed.to_string() != value {
-        return Err(error("validation", "Use an ISO calendar date."));
-    }
-    Ok(parsed)
-}
-fn instant(value: &str) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|v| v.with_timezone(&Utc))
-        .map_err(|_| error("validation", "Use a valid timestamp with an offset."))
-}
-fn zone(value: &str) -> Result<Tz> {
-    value
-        .parse()
-        .map_err(|_| error("validation", "Use a valid IANA time zone."))
-}
-fn iso(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-/// Resolve wall-clock input before conversion: never silently shift a DST gap.
-pub fn resolve_local(local: &str, time_zone: &str, offset: Option<i32>) -> Result<String> {
-    let local = NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M")
-        .map_err(|_| error("validation", "Use a valid local date and time."))?;
-    let candidates =
-        match zone(time_zone)?.from_local_datetime(&local) {
-            LocalResult::None => return Err(error(
-                "nonexistentTime",
-                "This time does not exist because the clocks move forward. Choose another time.",
-            )),
-            LocalResult::Single(value) => vec![value],
-            LocalResult::Ambiguous(a, b) => vec![a, b],
-        };
-    let offsets: Vec<i32> = candidates
-        .iter()
-        .map(|v| v.offset().fix().local_minus_utc() / 60)
-        .collect();
-    if candidates.len() > 1 && offset.is_none() {
-        return Err(ServiceError {
-            code: "ambiguousTime".into(),
-            message: "This time occurs twice. Choose its UTC offset.".into(),
-            offsets,
-        });
-    }
-    let chosen = candidates
-        .into_iter()
-        .find(|v| offset.is_none_or(|o| v.offset().fix().local_minus_utc() / 60 == o))
-        .ok_or_else(|| {
-            error(
-                "validation",
-                "The selected offset does not match this time.",
-            )
-        })?;
-    Ok(iso(chosen.with_timezone(&Utc)))
-}
-
-/// Shared normalized validation used before provider dispatch.
-pub fn validate_event(mut event: CalendarEvent) -> Result<CalendarEvent> {
-    if uuid::Uuid::parse_str(&event.id).is_err() {
-        return Err(error("validation", "Invalid event identity."));
-    }
-    event.title = event.title.trim().into();
-    if event.title.is_empty() || event.title.chars().count() > 300 {
-        return Err(error("validation", "Enter a title of 1 to 300 characters."));
-    }
-    match &mut event.time {
-        EventTime::Timed {
-            start,
-            end,
-            time_zone,
-        } => {
-            zone(time_zone)?;
-            let from = instant(start)?;
-            let until = instant(end)?;
-            if until <= from {
-                return Err(error("validation", "The event must end after it starts."));
-            }
-            *start = iso(from);
-            *end = iso(until);
-        }
-        EventTime::AllDay {
-            start_date,
-            end_date,
-        } => {
-            if date(end_date)? <= date(start_date)? {
-                return Err(error(
-                    "validation",
-                    "The exclusive end date must follow the start date.",
-                ));
-            }
-        }
-    }
-    Ok(event)
-}
-pub fn validate_range(range: &EventRange) -> Result<()> {
-    let start = instant(&range.start)?;
-    let end = instant(&range.end)?;
-    let dates = date(&range.end_date)?
-        .signed_duration_since(date(&range.start_date)?)
-        .num_days();
-    if end <= start
-        || dates <= 0
-        || dates > 366
-        || end.signed_duration_since(start).num_hours() > 24 * 367
-    {
-        return Err(error(
-            "validation",
-            "Choose an event range of at most 366 days.",
-        ));
-    }
-    Ok(())
-}
+pub use aika_domain::{error, resolve_local, validate_event, validate_range};
+use aika_domain::{instant, iso};
 
 struct HistoryEntry {
-    id: String,
-    before: Option<CalendarEvent>,
-    after: Option<CalendarEvent>,
+    changes: Vec<SeriesChange>,
 }
 
 /// Calendar metadata and settings read together, without querying events.
@@ -167,7 +29,7 @@ impl LocalProvider {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -194,6 +56,15 @@ impl LocalProvider {
                 INSERT INTO calendar_settings VALUES(1,(SELECT id FROM calendars ORDER BY rowid LIMIT 1));
                 CREATE INDEX events_calendar_range ON events(calendar_id,kind,start,end);
                 PRAGMA user_version=2;")?;
+        }
+        if version < 3 {
+            tx.execute_batch("ALTER TABLE events ADD COLUMN recurring INTEGER NOT NULL DEFAULT 0;
+                CREATE INDEX events_recurring ON events(recurring,calendar_id);
+                CREATE TABLE event_exceptions(series_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    original_start TEXT NOT NULL, calendar_id TEXT REFERENCES calendars(id), payload TEXT,
+                    PRIMARY KEY(series_id,original_start));
+                CREATE INDEX event_exceptions_calendar ON event_exceptions(calendar_id);
+                PRAGMA user_version=3;")?;
         }
         tx.commit()?;
         Ok(Self {
@@ -344,7 +215,7 @@ impl LocalProvider {
     pub fn calendar_event_count(&self, id: &str) -> Result<usize> {
         Self::require_calendar(&self.db, id)?;
         Ok(self.db.query_row(
-            "SELECT count(*) FROM events WHERE calendar_id=?1",
+            "SELECT (SELECT count(*) FROM events WHERE calendar_id=?1)+(SELECT count(*) FROM event_exceptions x JOIN events e ON e.id=x.series_id WHERE x.calendar_id=?1 AND e.calendar_id<>?1)",
             [id],
             |r| r.get::<_, i64>(0),
         )? as usize)
@@ -358,13 +229,17 @@ impl LocalProvider {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_calendar(&tx, id)?;
         let count: i64 = tx.query_row(
-            "SELECT count(*) FROM events WHERE calendar_id=?1",
+            "SELECT (SELECT count(*) FROM events WHERE calendar_id=?1)+(SELECT count(*) FROM event_exceptions x JOIN events e ON e.id=x.series_id WHERE x.calendar_id=?1 AND e.calendar_id<>?1)",
             [id],
             |r| r.get(0),
         )?;
         if count > 0 && !force {
             return Err(error("validation", &format!("This calendar contains {count} event(s). Supply --force to delete the calendar and its events.")));
         }
+        tx.execute(
+            "UPDATE event_exceptions SET payload=NULL,calendar_id=NULL WHERE calendar_id=?1",
+            [id],
+        )?;
         tx.execute("DELETE FROM events WHERE calendar_id=?1", [id])?;
         tx.execute("DELETE FROM calendars WHERE id=?1", [id])?;
         tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars ORDER BY rowid LIMIT 1) WHERE default_calendar_id IS NULL", [])?;
@@ -405,18 +280,163 @@ impl LocalProvider {
         calendar: Option<&str>,
     ) -> Result<Vec<CalendarEvent>> {
         validate_range(range)?;
-        let mut statement = db.prepare("SELECT payload FROM events WHERE (?5 IS NULL OR calendar_id=?5) AND ((kind='timed' AND start < ?2 AND end > ?1) OR (kind='allDay' AND start < ?4 AND end > ?3)) ORDER BY start,id")?;
-        let rows = statement.query_map(
-            params![
-                iso(instant(&range.start)?),
-                iso(instant(&range.end)?),
-                range.start_date,
-                range.end_date,
-                calendar
-            ],
-            |r| r.get::<_, String>(0),
+        // Include every recurring master: its original start may be years outside the view.
+        let mut statement = db.prepare("SELECT DISTINCT e.id FROM events e WHERE
+            (e.recurring=1 AND (?5 IS NULL OR e.calendar_id=?5 OR EXISTS(SELECT 1 FROM event_exceptions x WHERE x.series_id=e.id AND x.calendar_id=?5))) OR
+            (e.recurring=0 AND (?5 IS NULL OR e.calendar_id=?5) AND ((e.kind='timed' AND e.start < ?2 AND e.end > ?1) OR (e.kind='allDay' AND e.start < ?4 AND e.end > ?3)))")?;
+        let ids = statement
+            .query_map(
+                params![
+                    iso(instant(&range.start)?),
+                    iso(instant(&range.end)?),
+                    range.start_date,
+                    range.end_date,
+                    calendar
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut events = vec![];
+        for id in ids {
+            let series = Self::read_series(db, &id)?
+                .ok_or_else(|| error("storage", "Event disappeared inside a snapshot."))?;
+            events.extend(
+                aika_domain::recurrence::expand(&series, range)?
+                    .into_iter()
+                    .filter(|e| calendar.is_none_or(|id| e.calendar_id == id)),
+            );
+            if events.len() > 10000 {
+                return Err(error(
+                    "recurrenceLimit",
+                    "Calendar range exceeds 10000 events. Choose a shorter range.",
+                ));
+            }
+        }
+        events.sort_by(|a, b| {
+            let start = |e: &CalendarEvent| match &e.time {
+                EventTime::Timed { start, .. } => start.clone(),
+                EventTime::AllDay { start_date, .. } => start_date.clone(),
+            };
+            start(a).cmp(&start(b)).then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(events)
+    }
+    fn read_series(db: &Connection, id: &str) -> Result<Option<EventSeries>> {
+        let Some(event) = Self::read(db, id)? else {
+            return Ok(None);
+        };
+        let mut statement=db.prepare("SELECT original_start,payload FROM event_exceptions WHERE series_id=?1 ORDER BY original_start")?;
+        let values = statement
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let exceptions = values
+            .into_iter()
+            .map(|(original_start, json)| {
+                Ok(EventException {
+                    original_start,
+                    event: json.map(|s| serde_json::from_str(&s)).transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(EventSeries { event, exceptions }))
+    }
+    pub fn get_series(&self, target: &str) -> Result<EventSeries> {
+        let id = target.split_once('@').map_or(target, |(id, _)| id);
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(error(
+                "validation",
+                "Use the full event UUID or occurrence selector.",
+            ));
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let series = Self::read_series(&tx, id)?
+            .ok_or_else(|| error("notFound", "This event no longer exists."))?;
+        if let Some((_, key)) = target.split_once('@') {
+            aika_domain::recurrence::get_occurrence(&series, key)?;
+        }
+        tx.commit()?;
+        Ok(series)
+    }
+    pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = request
+            .target
+            .split_once('@')
+            .map_or(request.target.as_str(), |(id, _)| id);
+        let series = Self::read_series(&tx, id)?
+            .ok_or_else(|| error("notFound", "This event no longer exists."))?;
+        let changes = aika_domain::recurrence::plan_mutation(
+            &series,
+            &request,
+            &uuid::Uuid::new_v4().to_string(),
         )?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+        Self::apply_changes(&tx, &changes, false)?;
+        tx.commit()?;
+        let saved = changes
+            .iter()
+            .filter_map(|c| c.after.as_ref())
+            .map(|s| s.event.clone())
+            .collect();
+        self.history.push(HistoryEntry { changes });
+        Ok(saved)
+    }
+    fn write_series(db: &Connection, series: &EventSeries) -> Result<()> {
+        Self::require_calendar(db, &series.event.calendar_id)?;
+        Self::write(db, &series.event)?;
+        db.execute(
+            "DELETE FROM event_exceptions WHERE series_id=?1",
+            [&series.event.id],
+        )?;
+        for exception in &series.exceptions {
+            if let Some(event) = &exception.event {
+                Self::require_calendar(db, &event.calendar_id)?;
+            }
+            db.execute("INSERT INTO event_exceptions(series_id,original_start,calendar_id,payload) VALUES(?1,?2,?3,?4)",params![series.event.id,exception.original_start,exception.event.as_ref().map(|e|&e.calendar_id),exception.event.as_ref().map(serde_json::to_string).transpose()?])?;
+        }
+        Ok(())
+    }
+    fn apply_changes(db: &Connection, changes: &[SeriesChange], undo: bool) -> Result<()> {
+        for change in changes {
+            let expected = if undo { &change.after } else { &change.before };
+            if &Self::read_series(db, &change.id)? != expected {
+                return Err(error(
+                    "conflict",
+                    if undo {
+                        "The event changed outside this action. Undo cannot overwrite it."
+                    } else {
+                        "The event changed. Reload before editing."
+                    },
+                ));
+            }
+        }
+        for change in changes {
+            let value = if undo { &change.before } else { &change.after };
+            match value {
+                Some(series) => {
+                    Self::write_series(db, series)?;
+                    if !undo {
+                        db.execute(
+                            "UPDATE calendars SET visible=1 WHERE id=?1",
+                            [&series.event.calendar_id],
+                        )?;
+                        for event in series.exceptions.iter().filter_map(|x| x.event.as_ref()) {
+                            db.execute(
+                                "UPDATE calendars SET visible=1 WHERE id=?1",
+                                [&event.calendar_id],
+                            )?;
+                        }
+                    }
+                }
+                None => {
+                    db.execute("DELETE FROM events WHERE id=?1", [&change.id])?;
+                }
+            }
+        }
+        Ok(())
     }
     fn prune_history(&mut self) -> Result<()> {
         let calendars = self.calendars()?;
@@ -428,16 +448,25 @@ impl LocalProvider {
         let removed: Vec<_> = self
             .history
             .iter()
-            .filter(|entry| {
-                entry
+            .flat_map(|entry| &entry.changes)
+            .filter(|change| {
+                change
                     .before
                     .iter()
-                    .chain(entry.after.iter())
-                    .any(|e| !ids.contains(&&e.calendar_id))
+                    .chain(change.after.iter())
+                    .any(|series| {
+                        !ids.contains(&&series.event.calendar_id)
+                            || series
+                                .exceptions
+                                .iter()
+                                .filter_map(|e| e.event.as_ref())
+                                .any(|e| !ids.contains(&&e.calendar_id))
+                    })
             })
-            .map(|entry| entry.id.clone())
+            .map(|c| c.id.clone())
             .collect();
-        self.history.retain(|entry| !removed.contains(&entry.id));
+        self.history
+            .retain(|entry| !entry.changes.iter().any(|c| removed.contains(&c.id)));
     }
     pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
         let tx = self.db.transaction()?;
@@ -502,7 +531,7 @@ impl LocalProvider {
                 end_date,
             } => ("allDay", start_date, end_date),
         };
-        let changed = db.execute("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id,kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?])?;
+        let changed = db.execute("INSERT INTO events(id,calendar_id,kind,start,end,payload,recurring) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id,kind=excluded.kind,start=excluded.start,end=excluded.end,payload=excluded.payload,recurring=excluded.recurring", params![event.id,event.calendar_id,kind,start,end,serde_json::to_string(event)?,event.recurrence.is_some()])?;
         if changed != 1 {
             return Err(error("conflict", "Event belongs to another calendar."));
         }
@@ -539,22 +568,26 @@ impl LocalProvider {
         if let Some(original) = &expected {
             Self::require_calendar(&tx, &original.calendar_id)?;
         }
-        Self::write(&tx, &event)?;
-        if previous
-            .as_ref()
-            .is_none_or(|e| e.calendar_id != event.calendar_id)
-        {
-            tx.execute(
-                "UPDATE calendars SET visible=1 WHERE id=?1",
-                [&event.calendar_id],
-            )?;
+        if previous.as_ref().is_some_and(|e| e.recurrence.is_some()) {
+            return Err(error(
+                "validation",
+                "Recurring edits require an explicit scope.",
+            ));
         }
-        tx.commit()?;
-        self.history.push(HistoryEntry {
+        let changes = vec![SeriesChange {
             id: event.id.clone(),
-            before: previous,
-            after: Some(event.clone()),
-        });
+            before: previous.map(|event| EventSeries {
+                event,
+                exceptions: vec![],
+            }),
+            after: Some(EventSeries {
+                event: event.clone(),
+                exceptions: vec![],
+            }),
+        }];
+        Self::apply_changes(&tx, &changes, false)?;
+        tx.commit()?;
+        self.history.push(HistoryEntry { changes });
         Ok(event)
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
@@ -575,13 +608,23 @@ impl LocalProvider {
                 "The event changed. Reload the calendar before deleting.",
             ));
         }
-        tx.execute("DELETE FROM events WHERE id=?1", [id])?;
-        tx.commit()?;
-        self.history.push(HistoryEntry {
+        if previous.recurrence.is_some() {
+            return Err(error(
+                "validation",
+                "Recurring deletions require an explicit scope.",
+            ));
+        }
+        let changes = vec![SeriesChange {
             id: id.into(),
-            before: Some(previous),
+            before: Some(EventSeries {
+                event: previous,
+                exceptions: vec![],
+            }),
             after: None,
-        });
+        }];
+        Self::apply_changes(&tx, &changes, false)?;
+        tx.commit()?;
+        self.history.push(HistoryEntry { changes });
         Ok(())
     }
     pub fn undo(&mut self) -> Result<()> {
@@ -592,18 +635,7 @@ impl LocalProvider {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if Self::read(&tx, &entry.id)? != entry.after {
-            return Err(error(
-                "conflict",
-                "The event changed outside this action. Undo cannot overwrite it.",
-            ));
-        }
-        match &entry.before {
-            Some(event) => Self::write(&tx, event)?,
-            None => {
-                tx.execute("DELETE FROM events WHERE id=?1", [&entry.id])?;
-            }
-        }
+        Self::apply_changes(&tx, &entry.changes, true)?;
         tx.commit()?;
         self.history.pop();
         Ok(())
@@ -619,6 +651,12 @@ impl CalendarService {
         let mut providers = crate::providers::ProviderRegistry::default();
         providers.register(Box::new(LocalProvider::open(path)?))?;
         Ok(Self { providers })
+    }
+    pub fn get_series(&self, target: &str) -> Result<EventSeries> {
+        self.providers.get_series(target)
+    }
+    pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
+        self.providers.mutate_event(request)
     }
     pub fn preferences(&self) -> Result<Preferences> {
         self.providers.preferences()
@@ -713,6 +751,8 @@ mod tests {
             title: "Leap day".into(),
             location: "Home".into(),
             notes: "Notes".into(),
+            recurrence: None,
+            occurrence: None,
             time: EventTime::Timed {
                 start: "2024-02-29T23:00:00Z".into(),
                 end: "2024-03-01T02:00:00Z".into(),
@@ -1165,7 +1205,20 @@ mod tests {
                 [serde_json::to_string(&preferences).unwrap()],
             )
             .unwrap();
-            LocalProvider::write(&db, &original).unwrap();
+            let EventTime::Timed { start, end, .. } = &original.time else {
+                panic!("expected timed fixture")
+            };
+            db.execute(
+                "INSERT INTO events VALUES(?1,?2,'timed',?3,?4,?5)",
+                params![
+                    original.id,
+                    original.calendar_id,
+                    start,
+                    end,
+                    serde_json::to_string(&original).unwrap()
+                ],
+            )
+            .unwrap();
         }
         {
             let mut s = LocalProvider::open(&path).unwrap();
@@ -1183,7 +1236,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                2
+                3
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -1275,5 +1328,252 @@ mod tests {
         if let EventTime::Timed { start, .. } = saved.time {
             assert_eq!(start, "2025-12-31T23:00:00.000Z");
         }
+    }
+}
+
+#[cfg(test)]
+mod recurrence_tests {
+    use super::*;
+    fn master() -> CalendarEvent {
+        CalendarEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            calendar_id: "local-default".into(),
+            title: "Daily".into(),
+            location: "".into(),
+            notes: "".into(),
+            time: EventTime::AllDay {
+                start_date: "2026-10-01".into(),
+                end_date: "2026-10-02".into(),
+            },
+            recurrence: Some(Recurrence {
+                frequency: RepeatFrequency::Daily,
+                interval: 1,
+                weekdays: vec![],
+                monthly_on: MonthlyOn::Date,
+                until: None,
+                count: Some(12),
+                segment: None,
+            }),
+            occurrence: None,
+        }
+    }
+    fn range(from: &str, to: &str) -> EventRange {
+        EventRange {
+            start: format!("{from}T00:00:00Z"),
+            end: format!("{to}T00:00:00Z"),
+            start_date: from.into(),
+            end_date: to.into(),
+        }
+    }
+    fn request(
+        series: &EventSeries,
+        key: &str,
+        scope: MutationScope,
+        event: Option<CalendarEvent>,
+    ) -> EventMutation {
+        EventMutation {
+            target: format!("{}@{key}", series.event.id),
+            scope,
+            event,
+            expected: aika_domain::recurrence::expectation(series).unwrap(),
+            reset_exceptions: false,
+            count_changed: false,
+        }
+    }
+    #[test]
+    fn moved_occurrences_persist_query_destination_and_do_not_resurrect() {
+        let path = std::env::temp_dir().join(format!("aika-rec-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut service = CalendarService::open(&path).unwrap();
+        let event = master();
+        service.save_checked(event.clone(), false, None).unwrap();
+        let destination = service
+            .create_calendar(CalendarDetails {
+                name: "Other".into(),
+                description: "".into(),
+                color: "#718675".into(),
+            })
+            .unwrap();
+        service
+            .set_calendar_visibility(&destination.id, false)
+            .unwrap();
+        let series = service.get_series(&event.id).unwrap();
+        let mut occurrence =
+            aika_domain::recurrence::get_occurrence(&series, "2026-10-09").unwrap();
+        occurrence.calendar_id = destination.id.clone();
+        occurrence.time = EventTime::AllDay {
+            start_date: "2026-11-01".into(),
+            end_date: "2026-11-03".into(),
+        };
+        service
+            .mutate_event(request(
+                &series,
+                "2026-10-09",
+                MutationScope::Occurrence,
+                Some(occurrence),
+            ))
+            .unwrap();
+        assert_eq!(
+            service
+                .collection_snapshot(range("2026-10-01", "2026-11-01"))
+                .unwrap()
+                .events
+                .len(),
+            11
+        );
+        assert!(service
+            .calendar_management_snapshot()
+            .unwrap()
+            .hidden_calendar_ids
+            .is_empty());
+        drop(service);
+        let mut service = CalendarService::open(&path).unwrap();
+        let moved = service
+            .providers
+            .snapshot(&destination.id, range("2026-11-02", "2026-11-03"))
+            .unwrap();
+        assert_eq!(moved.events.len(), 1);
+        assert_eq!(moved.events[0].id, format!("{}@2026-10-09", event.id));
+        assert_eq!(
+            service
+                .delete_calendar_guarded(&destination.id, false)
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+        service.delete_calendar(&destination.id).unwrap();
+        let values = service
+            .collection_snapshot(range("2026-10-01", "2026-11-04"))
+            .unwrap();
+        assert_eq!(values.events.len(), 11);
+        assert!(!values.events.iter().any(|e| e.id.ends_with("@2026-10-09")));
+        drop(service);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn split_undo_is_atomic_and_external_exceptions_reject_stale_changes() {
+        let path = std::env::temp_dir().join(format!("aika-rec-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut a = CalendarService::open(&path).unwrap();
+        let event = master();
+        a.save_checked(event.clone(), false, None).unwrap();
+        let series = a.get_series(&event.id).unwrap();
+        let selected = aika_domain::recurrence::get_occurrence(&series, "2026-10-05").unwrap();
+        let saved = a
+            .mutate_event(request(
+                &series,
+                "2026-10-05",
+                MutationScope::Following,
+                Some(CalendarEvent {
+                    title: "Tail".into(),
+                    ..selected
+                }),
+            ))
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(
+            a.collection_snapshot(range("2026-10-01", "2026-10-20"))
+                .unwrap()
+                .events
+                .len(),
+            12
+        );
+        a.undo().unwrap();
+        assert_eq!(a.get_series(&event.id).unwrap(), series);
+        let selected = aika_domain::recurrence::get_occurrence(&series, "2026-10-05").unwrap();
+        let saved = a
+            .mutate_event(request(
+                &series,
+                "2026-10-05",
+                MutationScope::Following,
+                Some(selected),
+            ))
+            .unwrap();
+        let mut b = CalendarService::open(&path).unwrap();
+        let tail = b.get_series(&saved[1].id).unwrap();
+        b.mutate_event(request(
+            &tail,
+            "2026-10-06",
+            MutationScope::Occurrence,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(a.undo().unwrap_err().code, "conflict");
+        assert_eq!(a.get_series(&event.id).unwrap().event, saved[0]);
+        assert_eq!(
+            a.collection_snapshot(range("2026-10-01", "2026-10-20"))
+                .unwrap()
+                .events
+                .len(),
+            11
+        );
+        assert_eq!(
+            a.mutate_event(request(
+                &tail,
+                "2026-10-07",
+                MutationScope::Occurrence,
+                None
+            ))
+            .unwrap_err()
+            .code,
+            "conflict"
+        );
+        drop(a);
+        drop(b);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn failed_following_move_rolls_back_both_series_and_history() {
+        let mut provider = LocalProvider::open(Path::new(":memory:")).unwrap();
+        let event = master();
+        provider.save_checked(event.clone(), false, None).unwrap();
+        let series = provider.get_series(&event.id).unwrap();
+        let mut selected = aika_domain::recurrence::get_occurrence(&series, "2026-10-05").unwrap();
+        selected.calendar_id = "missing".into();
+        assert!(provider
+            .mutate_event(request(
+                &series,
+                "2026-10-05",
+                MutationScope::Following,
+                Some(selected)
+            ))
+            .is_err());
+        assert_eq!(provider.get_series(&event.id).unwrap(), series);
+        provider.undo().unwrap();
+        assert!(provider.get(&event.id).unwrap().is_none());
+    }
+    #[test]
+    fn v2_migration_preserves_metadata_preferences_and_legacy_json() {
+        let path =
+            std::env::temp_dir().join(format!("aika-rec-v2-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut provider = LocalProvider::open(&path).unwrap();
+        let mut event = master();
+        event.recurrence = None;
+        provider.save_checked(event.clone(), false, None).unwrap();
+        provider
+            .set_calendar_visibility("local-default", false)
+            .unwrap();
+        let prefs = Preferences {
+            appearance: "dark".into(),
+            view: "week".into(),
+            sidebar: false,
+        };
+        provider.set_preferences(prefs.clone()).unwrap();
+        provider.db.execute_batch("DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring; PRAGMA user_version=2;").unwrap();
+        drop(provider);
+        let mut provider = LocalProvider::open(&path).unwrap();
+        let snapshot = provider
+            .collection_snapshot(range("2026-10-01", "2026-10-20"))
+            .unwrap();
+        assert_eq!(snapshot.events, vec![event]);
+        assert_eq!(snapshot.hidden_calendar_ids, vec!["local-default"]);
+        assert_eq!(provider.preferences().unwrap(), prefs);
+        assert_eq!(
+            provider
+                .db
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            3
+        );
+        drop(provider);
+        std::fs::remove_file(path).unwrap();
     }
 }

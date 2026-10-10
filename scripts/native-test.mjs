@@ -87,8 +87,8 @@ async function stop() {
     await exited;
   }
 }
-async function click(selector) {
-  const e = await browser.$(selector);
+async function click(selector, index) {
+  const e = index === undefined ? await browser.$(selector) : (await browser.$$(selector))[index];
   await e.waitForDisplayed();
   // The embedded driver's element click focuses *after* dispatch, which dismisses
   // Radix virtual-anchor popovers. Match normal focus-before-click ordering.
@@ -101,6 +101,18 @@ async function fill(selector, value) {
   const e = await browser.$(selector);
   await e.waitForDisplayed();
   await e.setValue(value);
+}
+async function selectOption(selector, value) {
+  const element = await browser.$(selector);
+  await element.waitForDisplayed();
+  await browser.execute(
+    (element, next) => {
+      element.value = next;
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    },
+    element,
+    value,
+  );
 }
 async function appearance(value) {
   await click('[aria-label="Open settings"]');
@@ -237,6 +249,109 @@ try {
   await start();
   assert.equal((await browser.$$('.time-event')).length, 0);
   await eventCount(0);
+  // Recurrence uses actual IPC/SQLite, including aggregate conflicts with CLI exceptions.
+  await click('button=Month');
+  const firstDay = `${bounds.from.slice(0, 7)}-01`;
+  const nextMonth = await browser.execute((date) => {
+    const value = new Date(`${date}T12:00:00`);
+    value.setMonth(value.getMonth() + 1);
+    return value.toLocaleDateString('en-CA');
+  }, firstDay);
+  await click('[aria-label="New event"]');
+  await fill('[aria-label="Event title"]', 'Native recurring');
+  await click('[aria-label="All-day event"]');
+  await fill('#event-start-date', firstDay);
+  await fill('#event-end-date', firstDay);
+  await selectOption('[aria-label="Repeat pattern"]', 'daily');
+  await selectOption('[aria-label="Repeat ending"]', 'count');
+  await fill('[aria-label="Repeat count"]', '3');
+  await click('button=Preview next dates');
+  await browser.waitUntil(async () => (await browser.$$('.repeat-preview li')).length === 3);
+  await click('button[type="submit"]');
+  await eventCount(3);
+  const recList = await cli(
+    'list',
+    '--from',
+    firstDay,
+    '--to',
+    nextMonth,
+    '--time-zone',
+    bounds.zone,
+  );
+  const selectors = recList
+    .trim()
+    .split('\n')
+    .filter((line) => line.includes('Native recurring'))
+    .map((line) => line.split(' ')[0]);
+  assert.equal(selectors.length, 3);
+  const seriesId = selectors[0].split('@')[0];
+  await click('.event-chip', 0);
+  await fill('[aria-label="Event title"]', 'Native stale recurring draft');
+  await cli('delete', selectors[2], '--scope', 'occurrence');
+  await browser.execute(() => window.dispatchEvent(new Event('focus')));
+  await eventCount(2);
+  await click('button[type="submit"]');
+  await browser.waitUntil(async () =>
+    (await browser.$('[role="alert"]').getText()).includes('event changed'),
+  );
+  assert.equal(
+    await browser.$('[aria-label="Event title"]').getValue(),
+    'Native stale recurring draft',
+  );
+  await browser.keys('Escape');
+  await cli(
+    'update',
+    seriesId,
+    '--scope',
+    'series',
+    '--title',
+    'CLI recurring',
+    '--reset-exceptions',
+  );
+  await browser.execute(() => window.dispatchEvent(new Event('focus')));
+  await eventCount(3);
+  await browser.execute(
+    (element) => {
+      element.focus();
+      element.click();
+    },
+    (await browser.$$('.event-chip'))[1],
+  );
+  await selectOption('[aria-label="Event change scope"]', 'following');
+  await fill('[aria-label="Event title"]', 'Native future recurring');
+  await click('button[type="submit"]');
+  await browser.$('[aria-label="Event title"]').waitForExist({ reverse: true });
+  await eventCount(3);
+  assert.match(
+    await cli('list', '--from', firstDay, '--to', nextMonth, '--time-zone', bounds.zone),
+    /Native future recurring/,
+  );
+  await click('button=Undo');
+  await browser.waitUntil(async () =>
+    browser.execute(() => {
+      const events = [...document.querySelectorAll('.event-chip')];
+      return (
+        events.length === 3 && events.every((event) => event.textContent.includes('CLI recurring'))
+      );
+    }),
+  );
+  assert.ok(
+    !(
+      await cli('list', '--from', firstDay, '--to', nextMonth, '--time-zone', bounds.zone)
+    ).includes('Native future recurring'),
+  );
+  await click('.event-chip', 0);
+  await click('[aria-label="Delete event"]');
+  await eventCount(2);
+  await click('button=Undo');
+  await eventCount(3);
+  await stop();
+  await start();
+  await eventCount(3);
+  await click('.event-chip', 0);
+  await selectOption('[aria-label="Event change scope"]', 'series');
+  await click('[aria-label="Delete event"]');
+  await eventCount(0);
   // Calendar management through actual renderer -> Rust -> SQLite, including restart.
   await click('button=Month');
   await click('.sidebar [aria-label="Create calendar"]');
@@ -301,13 +416,13 @@ try {
   await fill('[aria-label="Calendar description"]', 'Updated native description');
   await click('[aria-label="Rose"]');
   await click('.calendar-form button[type="submit"]');
-  await browser.$('[aria-label="Native Office"]').waitForDisplayed();
+  await browser.$('.calendar-name[title="Native Office"]').waitForDisplayed();
   await click('[aria-label="New event"]');
   await fill('[aria-label="Event title"]', 'Native reveal event');
   await click('button[type="submit"]');
   await eventCount(2);
   assert.equal(
-    await browser.$('[aria-label="Native Office"]').getAttribute('aria-pressed'),
+    await browser.$('[aria-label="Hide Native Office calendar"]').getAttribute('aria-pressed'),
     'true',
   );
   await click('.event-chip[aria-label^="Native Work event,"]');
@@ -348,7 +463,7 @@ try {
     '',
   );
   console.log(
-    'Native timed/all-day CRUD, CLI interoperability, stale edits/undo, restart, views, keyboard dismissal, appearance, and multiple calendars passed.',
+    'Native timed/all-day CRUD, recurrence/scopes/preview/undo/restart, CLI aggregate conflicts, views, keyboard dismissal, appearance, and multiple calendars passed.',
   );
 } catch (error) {
   if (browser)

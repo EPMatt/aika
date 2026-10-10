@@ -26,5 +26,5 @@ path = "src/bin/export-types.rs"
 native-test = ["dep:tauri-plugin-wdio-webdriver"]
 
 [workspace]
-members = ["core", "cli"]
+members = ["core", "cli", "domain"]
 resolver = "2"

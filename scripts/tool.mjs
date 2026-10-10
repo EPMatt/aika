@@ -14,10 +14,11 @@ if (existsSync(localCargo) && existsSync(localRustup)) {
 }
 
 const [tool, ...args] = process.argv.slice(2);
-if (tool !== 'cargo' && tool !== 'tauri') throw new Error('Expected cargo or tauri');
+if (!['cargo', 'tauri', 'wasm-bindgen', 'rustup'].includes(tool))
+  throw new Error('Expected cargo, tauri, wasm-bindgen or rustup');
 const result =
-  tool === 'cargo'
-    ? spawnSync('cargo', args, { cwd: root, env, stdio: 'inherit' })
+  tool !== 'tauri'
+    ? spawnSync(tool, args, { cwd: root, env, stdio: 'inherit' })
     : spawnSync(
         process.execPath,
         [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), ...args],

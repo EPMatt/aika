@@ -45,6 +45,7 @@ dependencies = [
 name = "aika-core"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aika-domain",
  "chrono",
  "chrono-tz",
  "dirs",
@@ -54,6 +55,20 @@ dependencies = [
  "serde_json",
  "ts-rs",
  "uuid",
+]
+
+[[package]]
+name = "aika-domain"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ts-rs",
+ "uuid",
+ "wasm-bindgen",
 ]
 
 [[package]]
