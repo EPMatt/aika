@@ -13,7 +13,7 @@ pnpm cli:build
 pnpm rust install --path src-tauri/cli --locked
 ```
 
-`pnpm cli` runs the development binary. `pnpm cli:build` produces `src-tauri/target/release/aika-cli` (`aika-cli.exe` on Windows). Cargo installation places it in Cargo's bin directory, which must be on your PATH. Existing desktop installers do not include this binary.
+`pnpm cli` runs the development binary. `pnpm cli:build` produces `src-tauri/target/release/aika-cli` (`aika-cli.exe` on Windows). Cargo installation places it in Cargo's bin directory, which must be on your PATH. Tagged release installers include this binary; see [installed CLI paths](releases.md#use-the-bundled-cli). Private-alpha candidates do not include it.
 
 The commands below use the installed binary. Replace IDs with the full UUID printed on creation or listing.
 

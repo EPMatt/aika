@@ -26,9 +26,9 @@ async function files(directory) {
   return nested.flat();
 }
 
-export async function collect({ bundle, output, target, version, revision, notes }) {
+export async function installerArtifacts({ bundle, target, version }) {
   const spec = targets[target];
-  if (!spec) throw new Error('Unsupported alpha target');
+  if (!spec) throw new Error('Unsupported packaging target');
   const installers = (await files(bundle))
     .filter((path) => spec.extensions.some((ext) => path.endsWith(ext)))
     .sort();
@@ -47,6 +47,12 @@ export async function collect({ bundle, output, target, version, revision, notes
       bytes,
     });
   }
+  return artifacts;
+}
+
+export async function collect({ bundle, output, target, version, revision, notes }) {
+  const spec = targets[target];
+  const artifacts = await installerArtifacts({ bundle, target, version });
   const releaseNotes = await readFile(notes);
   await mkdir(output, { recursive: false });
   const manifest = {

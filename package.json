@@ -22,7 +22,8 @@
     "desktop:test:build": "node scripts/tool.mjs tauri build --debug --no-bundle --features native-test",
     "test:native": "node scripts/tool.mjs cargo build --manifest-path src-tauri/Cargo.toml -p aika-cli && node scripts/native-test.mjs",
     "alpha:build": "node scripts/alpha.mjs",
-    "test:packaging": "node --test scripts/alpha.test.mjs"
+    "test:packaging": "node --test scripts/alpha.test.mjs scripts/release.test.mjs",
+    "release:build": "node scripts/release.mjs build"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

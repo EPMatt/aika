@@ -1,0 +1,149 @@
+name: Tagged release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event.created == true && github.event.deleted == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      revision: ${{ steps.release.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - name: Validate tag, versions, and main ancestry
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/release.mjs validate "$RELEASE_TAG"
+
+  frontend:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm build
+      - run: pnpm test
+      - run: pnpm test:packaging
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:ui
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-browser-evidence
+          path: test-results/
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release-${{ matrix.target }}
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev patchelf libfuse2t64 file rpm libarchive-tools
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rust fmt --manifest-path src-tauri/Cargo.toml --all --check
+      - run: pnpm rust clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - run: pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace --locked --target ${{ matrix.target }}
+      - name: Build desktop packages with the CLI
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/release.mjs build "$RELEASE_TAG" '${{ matrix.target }}'
+      - name: Inspect packaged desktop and CLI
+        run: python scripts/release-package-check.py 'artifacts/release-${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: artifacts/release-${{ matrix.target }}/
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, frontend, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-*-*
+          merge-multiple: true
+          path: artifacts/release
+      - name: Verify assets and publish with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/release.mjs publish "$RELEASE_TAG" artifacts/release

@@ -40,7 +40,7 @@ Build a standalone release binary with `pnpm cli:build` (`src-tauri/target/relea
 pnpm rust install --path src-tauri/cli --locked
 ```
 
-Desktop installers remain unchanged; the CLI is installed separately.
+Tagged release installers include the CLI; see [release packages and installed CLI paths](docs/releases.md). Private-alpha candidates still install the desktop separately.
 
 ## Verify
 
@@ -75,4 +75,4 @@ Read [the implementation plan](docs/plan.md), [architecture decisions](docs/arch
 
 ## Private alpha candidates
 
-Run `pnpm alpha:build <native-target-triple>` to build release installers and collect checksums, provenance, and release notes under `artifacts/`. Linux x86_64 builds produce `.deb`, `.rpm`, and AppImage packages; `pnpm desktop:build` also includes these formats by default. Fedora users can install the RPM with `sudo dnf install ./<filename>.rpm`. Supported targets and installation/update evidence are documented in [alpha verification](docs/alpha/verification.md). `pnpm test:packaging` verifies artifact collection. Only Linux CI is active, using Ubuntu 24.04 and inspecting RPM contents and candidate checksums before upload. Fedora installation/launch, Windows/macOS, and the manual acceptance matrix remain pending. No candidate is published automatically.
+Run `pnpm alpha:build <native-target-triple>` to build release installers and collect checksums, provenance, and release notes under `artifacts/`. Linux x86_64 builds produce `.deb`, `.rpm`, and AppImage packages; `pnpm desktop:build` also includes these formats by default. Fedora users can install the RPM with `sudo dnf install ./<filename>.rpm`. Supported targets and installation/update evidence are documented in [alpha verification](docs/alpha/verification.md). `pnpm test:packaging` verifies artifact collection. Private-alpha CI builds Linux x64, Windows x64, and both macOS architectures. Linux uses Ubuntu 24.04 and inspects RPM contents and candidate checksums before upload. Fedora installation/launch, Windows/macOS, and the manual acceptance matrix remain pending. Private-alpha candidates are not published automatically. Numeric tags on main publish desktop packages with the bundled CLI through the separate [tagged release workflow](docs/releases.md).

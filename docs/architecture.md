@@ -34,7 +34,7 @@ The credential service stays behind the backend boundary. Use persistent OS stor
 
 Vitest covers layout and prototype repository behavior; Playwright covers renderer flows and captures review images. Browser checks are not evidence of native integration. Phase 4 adds WebdriverIO embedded Tauri automation on Windows/macOS/Linux, with plugins enabled only in test builds, plus real-platform checks.
 
-The active CI desktop target is Linux on Ubuntu 24.04; Windows/macOS entries remain commented out per the latest user decision. The repository is now rooted at `project-cal`, so workflow paths match the app layout. Origin is `EPMatt/aika`, with `main` as the publication branch. Hosted CI and cross-platform execution still require observing actual workflow results. See `docs/repository-history.md` for the relocation and rewritten revision mapping. Windows/macOS launch checks remain external verification tasks.
+The active CI desktop matrix includes Linux x64 on Ubuntu 24.04, Windows x64 on Windows 2025, and Apple Silicon/Intel on separate native macOS 15 runners. Windows and both macOS builds were enabled at the user’s request when adding tagged releases. The repository is now rooted at `project-cal`, so workflow paths match the app layout. Origin is `EPMatt/aika`, with `main` as the publication branch. Hosted CI and cross-platform execution still require observing actual workflow results. See `docs/repository-history.md` for the relocation and rewritten revision mapping. Windows/macOS launch checks remain external verification tasks.
 
 Private distribution uses Windows installers, per-architecture macOS DMGs with ad-hoc signing, and Linux AppImage/deb/RPM. There is no public signing, notarization, updater, analytics, or server in v0.
 
