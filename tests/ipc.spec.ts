@@ -180,6 +180,92 @@ test('normalized calendar metadata and read-only capability control the same vie
   await expect(page.getByLabel('Event editor')).not.toBeVisible();
 });
 
+test('event and calendar capabilities restrict writable calendar controls', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'isTauri', { value: true });
+    const today = new Date().toLocaleDateString('en-CA');
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      value: {
+        invoke: async (command: string) => {
+          if (command === 'get_app_info')
+            return { name: 'aika', version: 'test', provider: 'fixture' };
+          if (command === 'get_preferences')
+            return { appearance: 'light', view: 'month', sidebar: true };
+          if (command === 'set_preferences') return;
+          if (command === 'calendar_snapshot')
+            return {
+              calendars: [
+                {
+                  id: 'second-calendar',
+                  providerId: 'fixture',
+                  name: 'Shared schedule',
+                  color: '#718675',
+                  writable: true,
+                  description: '',
+                },
+              ],
+              defaultCalendarId: 'second-calendar',
+              hiddenCalendarIds: [],
+              events: [
+                {
+                  id: 'readonly-event',
+                  calendarId: 'second-calendar',
+                  title: 'Read-only event',
+                  location: '',
+                  notes: '',
+                  time: {
+                    kind: 'allDay',
+                    startDate: today,
+                    endDate: tomorrow.toLocaleDateString('en-CA'),
+                  },
+                },
+              ],
+              accounts: [],
+              calendarCapabilities: {
+                'second-calendar': {
+                  read: true,
+                  create: false,
+                  edit: true,
+                  delete: true,
+                  recurrence: false,
+                  customizeMetadata: true,
+                  moveEvent: false,
+                },
+              },
+              eventCapabilities: {
+                'readonly-event': {
+                  read: true,
+                  create: false,
+                  edit: false,
+                  delete: false,
+                  recurrence: false,
+                  customizeMetadata: true,
+                  moveEvent: false,
+                },
+              },
+              canUndo: false,
+            };
+          throw new Error(`Read-only view attempted ${command}`);
+        },
+      },
+    });
+  });
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'New event' })).toBeDisabled();
+  await expect(page.locator('.calendar-label')).toContainText('Shared schedule');
+  await page.locator('.event-chip').click();
+  await expect(page.getByRole('textbox', { name: 'Event title' })).toBeDisabled();
+  await expect(page.locator('.editor-calendar')).toContainText('Shared schedule');
+  await expect(page.locator('.editor-calendar')).toContainText('Read-only calendar');
+  await expect(page.locator('.event-chip')).toHaveAttribute('draggable', 'false');
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByLabel('Event editor')).not.toBeVisible();
+  await page.keyboard.press('n');
+  await expect(page.getByLabel('Event editor')).not.toBeVisible();
+});
+
 test('focus refresh preserves an editor draft and sends its original event on conflicts', async ({
   page,
 }) => {

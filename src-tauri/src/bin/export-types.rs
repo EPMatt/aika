@@ -8,9 +8,17 @@ use cal_desktop_lib::contracts::{
 };
 use ts_rs::{Config, TS};
 
+use cal_desktop_lib::contracts::{
+    AccountSummary, Capabilities, ConnectionState, ProviderDescriptor,
+};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/generated");
     let config = Config::default().with_out_dir(directory);
+    AccountSummary::export_all(&config)?;
+    Capabilities::export_all(&config)?;
+    ConnectionState::export_all(&config)?;
+    ProviderDescriptor::export_all(&config)?;
     Recurrence::export_all(&config)?;
     RepeatFrequency::export_all(&config)?;
     MonthlyOn::export_all(&config)?;

@@ -1,6 +1,14 @@
 # aika implementation plan
 
-## Agreed product
+## Current work and next increment
+
+The desktop currently supports multiple local calendars, common recurrence, and a standalone CLI. The provider registry and OS credential service exist; production still registers only the local provider. The original v0 phases below are historical milestones, not a description of today's complete feature set.
+
+The next increment is [extensible connected calendars and Google integration](integrations/google-calendar.md). Its phases use a separate Google phase numbering scheme. **Google phases 0–1 are delivered: specification plus shared repository/account/capability foundations. Phases 2–6 remain planned.** Start with the [Google phase 1 handoff](handoffs/google-phase-1.md) and the [connected-calendar architecture decisions](architecture.md#connected-calendar-decisions-google-integration).
+
+This specification supersedes the earlier instruction to defer all Google work until alpha acceptance. It does not complete or waive outstanding platform, installer, accessibility, or user-acceptance checks; their evidence remains tracked in [alpha verification](alpha/verification.md).
+
+## Original v0 product (historical)
 
 Personal desktop alpha for Windows 11 x64, macOS 14+ Intel/Apple Silicon, and Linux x64 (Ubuntu 24.04+, Arch, and Fedora/Fedora-based distributions with compatible runtimes). Tauri 2 + React/TypeScript, Rust backend. Custom calendar views and a distinct warm-neutral/sage visual identity. Spacious, minimal, premium UI. Light, dark, and system appearance from v0, controlled only from Settings. The sidebar footer contains only Settings. Use functional copy throughout.
 
@@ -25,7 +33,7 @@ Credential service uses macOS Keychain, Windows Credential Store, and Linux Secr
 
 ## Handoff procedure
 
-Record each phase in `docs/handoffs/phase-N.md`: source revision or uncommitted state, delivered behavior, exact commands/results, screenshots/artifact paths, unresolved defects, and next-phase starting instructions. The receiving engineer reads the plan and architecture, checks the working tree, and reproduces relevant checks before continuing. Engineering phases proceed when their gates pass. Pause at design and final-alpha gates for user review.
+Record each original v0 phase in `docs/handoffs/phase-N.md`: source revision or uncommitted state, delivered behavior, exact commands/results, screenshots/artifact paths, unresolved defects, and next-phase starting instructions. Connected-calendar phases use `docs/handoffs/google-phase-N.md` and the [integration handoff procedure](integrations/google-calendar.md#handoff-procedure). The receiving engineer reads the plan and architecture, checks the working tree, and reproduces relevant checks before continuing. Engineering phases proceed when their gates pass. The original design and final-alpha gates still require user review for those milestones.
 
 ## Required validation
 
@@ -33,7 +41,7 @@ CRUD/undo/restart; timed/all-day/overnight/multi-day ranges; leap days and year 
 
 ## Defaults
 
-System appearance; month on first launch; remember last view/sidebar/appearance in phase 2. New timed events last one hour; timed gestures snap to 15 minutes. Month gestures move by local date; time-grid gestures operate on time. Event type changes in the editor. All-day ranges use an exclusive end date internally. Google work begins only after the v0 alpha and a separate integration specification.
+System appearance; month on first launch; remember last view/sidebar/appearance in phase 2. New timed events last one hour; timed gestures snap to 15 minutes. Month gestures move by local date; time-grid gestures operate on time. Event type changes in the editor. All-day ranges use an exclusive end date internally. Connected calendars follow the separate [Google integration specification](integrations/google-calendar.md); its shared backend foundation is delivered; production Google connectivity remains planned.
 
 ## Implementation status after phase 3
 

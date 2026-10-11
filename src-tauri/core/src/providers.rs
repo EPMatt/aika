@@ -1,212 +1,41 @@
-//! Backend-only provider registration. Adapters receive normalized, scoped operations.
+//! Backend-only protocol adapters. The registry owns one shared repository.
 use crate::contracts::*;
-use crate::service::{
-    error, validate_event, validate_range, CalendarManagementSnapshot, LocalProvider,
-};
+use crate::repository::{CalendarManagementSnapshot, Repository};
+use crate::service::{error, validate_event, validate_range};
 use std::collections::BTreeMap;
-
 type Result<T> = std::result::Result<T, ServiceError>;
-#[derive(Clone)]
-pub struct ProviderDescriptor {
-    pub id: String,
-    pub name: String,
-    pub writable: bool,
-    pub authentication: bool,
-    pub synchronization: bool,
-}
 
 pub trait Provider: Send {
-    fn supports_recurrence(&self) -> bool {
-        false
-    }
     fn descriptor(&self) -> ProviderDescriptor;
-    fn calendars(&self) -> Result<Vec<Calendar>>;
-    fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot>;
-    fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent>;
-    fn save_checked(
-        &mut self,
-        event: CalendarEvent,
-        existing: bool,
-        expected: Option<CalendarEvent>,
-    ) -> Result<CalendarEvent>;
-    fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()>;
-    fn get_series(&self, _target: &str) -> Result<EventSeries> {
-        Err(error(
-            "unsupported",
-            "This provider does not support recurring events.",
-        ))
-    }
-    fn mutate_event(&mut self, _request: EventMutation) -> Result<Vec<CalendarEvent>> {
-        Err(error(
-            "unsupported",
-            "This provider does not support recurring events.",
-        ))
-    }
-    fn undo(&mut self) -> Result<()> {
-        Err(error("unsupported", "This provider does not support undo."))
-    }
-    fn preferences(&self) -> Result<Preferences> {
-        Err(error(
-            "unsupported",
-            "This provider does not store preferences.",
-        ))
-    }
-    fn set_preferences(&mut self, _: Preferences) -> Result<()> {
-        Err(error(
-            "unsupported",
-            "This provider does not store preferences.",
-        ))
-    }
-
-    fn collection_snapshot(&mut self, _range: EventRange) -> Result<CalendarCollectionSnapshot> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn delete_calendar_guarded(&mut self, _id: &str, _force: bool) -> Result<()> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn default_calendar_id(&self) -> Result<Option<String>> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn create_calendar(&mut self, _details: CalendarDetails) -> Result<Calendar> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn update_calendar(
-        &mut self,
-        _id: &str,
-        _details: CalendarDetails,
-        _expected: Calendar,
-    ) -> Result<()> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn delete_calendar(&mut self, _id: &str) -> Result<()> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn calendar_event_count(&self, _id: &str) -> Result<usize> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn set_default_calendar(&mut self, _id: &str) -> Result<()> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    fn set_calendar_visibility(&mut self, _id: &str, _visible: bool) -> Result<()> {
-        Err(error("unsupported", "Calendar management is unavailable."))
-    }
-    // Auth and synchronization are explicit extension points, not renderer commands.
-    fn authenticate(&mut self, _: &crate::credentials::CredentialService) -> Result<()> {
-        Err(error(
-            "unsupported",
-            "Authentication is unavailable for this provider.",
-        ))
-    }
-    fn synchronize(&mut self) -> Result<()> {
-        Err(error(
-            "unsupported",
-            "Synchronization is unavailable for this provider.",
-        ))
-    }
+    fn capabilities(&self) -> Capabilities;
+    // Future authentication/discovery/HTTP methods belong here, never in repository locks.
 }
-
+pub struct LocalProvider;
 impl Provider for LocalProvider {
-    fn supports_recurrence(&self) -> bool {
-        true
-    }
-    fn get_series(&self, target: &str) -> Result<EventSeries> {
-        LocalProvider::get_series(self, target)
-    }
-    fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
-        LocalProvider::mutate_event(self, request)
-    }
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
             id: "local".into(),
             name: "On this device".into(),
-            writable: true,
-            authentication: false,
-            synchronization: false,
+            connection_available: true,
+            unavailable_reason: None,
+            capabilities: self.capabilities(),
         }
     }
-    fn calendars(&self) -> Result<Vec<Calendar>> {
-        LocalProvider::calendars(self)
-    }
-    fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
-        self.snapshot_calendar(calendar, range)
-    }
-    fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
-        LocalProvider::get(self, id)?
-            .filter(|e| e.calendar_id == calendar)
-            .ok_or_else(|| error("notFound", "This event no longer exists."))
-    }
-    fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
-        LocalProvider::collection_snapshot(self, range)
-    }
-    fn default_calendar_id(&self) -> Result<Option<String>> {
-        LocalProvider::default_calendar_id(self)
-    }
-    fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
-        LocalProvider::calendar_management_snapshot(self)
-    }
-    fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
-        LocalProvider::delete_calendar_guarded(self, id, force)
-    }
-    fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
-        LocalProvider::create_calendar(self, details)
-    }
-    fn update_calendar(
-        &mut self,
-        id: &str,
-        details: CalendarDetails,
-        expected: Calendar,
-    ) -> Result<()> {
-        LocalProvider::update_calendar(self, id, details, expected)
-    }
-    fn delete_calendar(&mut self, id: &str) -> Result<()> {
-        LocalProvider::delete_calendar(self, id)
-    }
-    fn calendar_event_count(&self, id: &str) -> Result<usize> {
-        LocalProvider::calendar_event_count(self, id)
-    }
-    fn set_default_calendar(&mut self, id: &str) -> Result<()> {
-        LocalProvider::set_default_calendar(self, id)
-    }
-    fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
-        LocalProvider::set_calendar_visibility(self, id, visible)
-    }
-    fn save_checked(
-        &mut self,
-        event: CalendarEvent,
-        existing: bool,
-        expected: Option<CalendarEvent>,
-    ) -> Result<CalendarEvent> {
-        LocalProvider::save_checked(self, event, existing, expected)
-    }
-    fn delete_checked(&mut self, calendar: &str, id: &str, expected: &CalendarEvent) -> Result<()> {
-        if expected.calendar_id != calendar {
-            return Err(error(
-                "conflict",
-                "Deletion requires the original calendar.",
-            ));
-        }
-        LocalProvider::delete_checked(self, id, expected)
-    }
-    fn undo(&mut self) -> Result<()> {
-        LocalProvider::undo(self)
-    }
-    fn preferences(&self) -> Result<Preferences> {
-        LocalProvider::preferences(self)
-    }
-    fn set_preferences(&mut self, value: Preferences) -> Result<()> {
-        LocalProvider::set_preferences(self, value)
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::local()
     }
 }
-
-#[derive(Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Box<dyn Provider>>,
+    pub(crate) repository: Repository,
 }
 impl ProviderRegistry {
-    /// Registration is atomic; duplicate global calendar identities are rejected.
+    pub fn new(repository: Repository) -> Self {
+        Self {
+            providers: BTreeMap::new(),
+            repository,
+        }
+    }
     pub fn register(&mut self, provider: Box<dyn Provider>) -> Result<()> {
         let descriptor = provider.descriptor();
         if descriptor.id.is_empty() || self.providers.contains_key(&descriptor.id) {
@@ -215,88 +44,113 @@ impl ProviderRegistry {
                 "Duplicate or invalid provider identity.",
             ));
         }
-        let known = self.live_calendars()?;
-        let calendars = provider.calendars()?;
-        let mut discovered = BTreeMap::new();
-        for calendar in calendars {
-            if calendar.id.is_empty()
-                || calendar.provider_id != descriptor.id
-                || known.iter().any(|c| c.id == calendar.id)
-                || discovered.contains_key(&calendar.id)
-            {
-                return Err(error(
-                    "providerIdentity",
-                    "Duplicate or invalid calendar identity.",
-                ));
-            }
-            discovered.insert(calendar.id.clone(), calendar);
-        }
         self.providers.insert(descriptor.id, provider);
         Ok(())
-    }
-    pub fn calendars(&self) -> Result<Vec<Calendar>> {
-        self.live_calendars()
     }
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.providers.values().map(|p| p.descriptor()).collect()
     }
-    pub fn live_calendars(&self) -> Result<Vec<Calendar>> {
-        let mut discovered = BTreeMap::new();
-        let mut ordered = Vec::new();
-        for (owner, provider) in &self.providers {
-            for calendar in provider.calendars()? {
-                if calendar.id.is_empty()
-                    || calendar.provider_id != *owner
-                    || discovered.insert(calendar.id.clone(), ()).is_some()
-                {
-                    return Err(error(
-                        "providerIdentity",
-                        "Duplicate or invalid calendar identity.",
-                    ));
-                }
-                ordered.push(calendar);
-            }
-        }
-        Ok(ordered)
+    pub fn accounts(&self) -> Result<Vec<AccountSummary>> {
+        self.repository.accounts()
     }
-    fn owner(&self, calendar: &str, write: bool) -> Result<String> {
-        let calendar = self
-            .live_calendars()?
+    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+        self.repository.calendars()
+    }
+    pub fn live_calendars(&self) -> Result<Vec<Calendar>> {
+        self.calendars()
+    }
+    pub fn capabilities(
+        &self,
+        calendar: &str,
+        event: Option<&CalendarEvent>,
+    ) -> Result<Capabilities> {
+        let metadata = self
+            .calendars()?
             .into_iter()
             .find(|c| c.id == calendar)
             .ok_or_else(|| error("notFound", "Unknown calendar."))?;
-        let descriptor = self.providers[&calendar.provider_id].descriptor();
-        if write && (!calendar.writable || !descriptor.writable) {
-            return Err(error("readOnly", "This calendar is read-only."));
+        let adapter = self.providers.get(&metadata.provider_id).ok_or_else(|| {
+            error(
+                "unsupported",
+                "Provider unavailable; cached data remains readable.",
+            )
+        })?;
+        let mut caps = adapter
+            .capabilities()
+            .intersect(&self.repository.calendar_capabilities(calendar)?);
+        if let Some(event) = event {
+            if event.calendar_id != calendar {
+                return Err(error(
+                    "providerIdentity",
+                    "Event belongs to another calendar.",
+                ));
+            }
+            caps = caps.intersect(&self.repository.event_capabilities(&event.id)?);
         }
-        Ok(calendar.provider_id)
+        Ok(caps)
     }
-    fn local(&self) -> Result<&(dyn Provider + '_)> {
-        match self.providers.get("local") {
-            Some(p) => Ok(p.as_ref()),
-            None => Err(error("notFound", "Local provider unavailable.")),
+    fn require(
+        &self,
+        calendar: &str,
+        event: Option<&CalendarEvent>,
+        operation: &str,
+    ) -> Result<()> {
+        let caps = self.capabilities(calendar, event)?;
+        let allowed = match operation {
+            "create" => caps.create,
+            "edit" => caps.edit,
+            "delete" => caps.delete,
+            "recurrence" => caps.recurrence,
+            "move" => caps.move_event,
+            "customize" => caps.customize_metadata,
+            _ => false,
+        };
+        if !allowed {
+            return Err(error(
+                "readOnly",
+                "This operation is unavailable for this calendar or event.",
+            ));
         }
-    }
-    fn local_mut(&mut self) -> Result<&mut (dyn Provider + '_)> {
-        match self.providers.get_mut("local") {
-            Some(p) => Ok(p.as_mut()),
-            None => Err(error("notFound", "Local provider unavailable.")),
-        }
+        Ok(())
     }
     pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
-        self.local_mut()?.collection_snapshot(range)
+        let mut snapshot = self.repository.collection_snapshot(range)?;
+        snapshot.accounts = self.accounts()?;
+        snapshot.calendar_capabilities = snapshot
+            .calendars
+            .iter()
+            .map(|c| {
+                let caps = self
+                    .capabilities(&c.id, None)
+                    .unwrap_or_else(|_| Capabilities::read_only());
+                (c.id.clone(), caps)
+            })
+            .collect();
+        for event in &snapshot.events {
+            let caps = self
+                .capabilities(&event.calendar_id, Some(event))
+                .unwrap_or_else(|_| Capabilities::read_only());
+            snapshot
+                .event_capabilities
+                .insert(event.id.clone(), caps.clone());
+            if let Some((master, _)) = event.id.split_once('@') {
+                snapshot
+                    .event_capabilities
+                    .entry(master.into())
+                    .and_modify(|existing| *existing = existing.intersect(&caps))
+                    .or_insert(caps);
+            }
+        }
+        Ok(snapshot)
     }
     pub fn default_calendar_id(&self) -> Result<Option<String>> {
-        self.local()?.default_calendar_id()
+        self.repository.default_calendar_id()
     }
     pub fn calendar_management_snapshot(&self) -> Result<CalendarManagementSnapshot> {
-        self.local()?.calendar_management_snapshot()
-    }
-    pub fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
-        self.local_mut()?.delete_calendar_guarded(id, force)
+        self.repository.calendar_management_snapshot()
     }
     pub fn create_calendar(&mut self, details: CalendarDetails) -> Result<Calendar> {
-        self.local_mut()?.create_calendar(details)
+        self.repository.create_calendar(details)
     }
     pub fn update_calendar(
         &mut self,
@@ -304,90 +158,84 @@ impl ProviderRegistry {
         details: CalendarDetails,
         expected: Calendar,
     ) -> Result<()> {
-        self.local_mut()?.update_calendar(id, details, expected)
+        self.require(id, None, "customize")?;
+        self.repository.update_calendar(id, details, expected)
+    }
+    pub fn delete_calendar_guarded(&mut self, id: &str, force: bool) -> Result<()> {
+        self.repository.delete_calendar_guarded(id, force)
     }
     pub fn delete_calendar(&mut self, id: &str) -> Result<()> {
-        self.local_mut()?.delete_calendar(id)
+        self.delete_calendar_guarded(id, true)
     }
     pub fn calendar_event_count(&self, id: &str) -> Result<usize> {
-        self.local()?.calendar_event_count(id)
+        self.repository.calendar_event_count(id)
     }
     pub fn set_default_calendar(&mut self, id: &str) -> Result<()> {
-        self.local_mut()?.set_default_calendar(id)
+        self.require(id, None, "create")?;
+        self.repository.set_default_calendar(id)
     }
     pub fn set_calendar_visibility(&mut self, id: &str, visible: bool) -> Result<()> {
-        self.local_mut()?.set_calendar_visibility(id, visible)
-    }
-    pub fn undo_local(&mut self) -> Result<()> {
-        self.local_mut()?.undo()
+        self.repository.set_calendar_visibility(id, visible)
     }
     pub fn get_series(&self, target: &str) -> Result<EventSeries> {
-        let id = target.split_once('@').map_or(target, |(id, _)| id);
-        if uuid::Uuid::parse_str(id).is_err() {
-            return Err(error(
-                "validation",
-                "Use the full event UUID or occurrence selector.",
-            ));
-        }
-        // Recurring features currently belong to the registered local adapter.
-        self.providers
-            .get("local")
-            .ok_or_else(|| error("unsupported", "Local recurrence is unavailable."))?
-            .get_series(target)
+        self.repository.get_series(target)
     }
     pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
         let series = self.get_series(&request.target)?;
-        let owner = self.owner(&series.event.calendar_id, true)?;
+        self.require(
+            &series.event.calendar_id,
+            Some(&series.event),
+            if request.event.is_some() {
+                "edit"
+            } else {
+                "delete"
+            },
+        )?;
+        if series.event.recurrence.is_some() {
+            self.require(&series.event.calendar_id, Some(&series.event), "recurrence")?;
+        }
         if let Some(event) = &request.event {
-            if self.owner(&event.calendar_id, true)? != owner {
+            self.check_move(&series.event, event)?;
+        }
+        self.repository.mutate_event(request)
+    }
+    fn check_move(&self, original: &CalendarEvent, event: &CalendarEvent) -> Result<()> {
+        if original.calendar_id != event.calendar_id {
+            self.require(&original.calendar_id, Some(original), "move")?;
+            self.require(&event.calendar_id, None, "move")?;
+            if self
+                .repository
+                .calendar_account(&original.calendar_id)?
+                .is_some()
+                || self
+                    .repository
+                    .calendar_account(&event.calendar_id)?
+                    .is_some()
+            {
                 return Err(error(
-                    "conflict",
-                    "Events can only move between local calendars.",
+                    "unsupported",
+                    "Remote-calendar moves are unavailable.",
                 ));
             }
         }
-        self.providers
-            .get_mut(&owner)
-            .unwrap()
-            .mutate_event(request)
+        Ok(())
     }
     pub fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
         validate_range(&range)?;
-        let owner = self.owner(calendar, false)?;
-        let mut result = self.providers[&owner].snapshot(calendar, range)?;
-        if result.calendar.id != calendar
-            || result.calendar.provider_id != owner
-            || result.events.iter().any(|e| e.calendar_id != calendar)
-        {
-            return Err(error(
-                "providerIdentity",
-                "Provider returned data from another calendar.",
-            ));
-        }
-        result.calendar = self
-            .live_calendars()?
-            .into_iter()
-            .find(|c| c.id == calendar)
-            .ok_or_else(|| error("notFound", "Unknown calendar."))?;
-        Ok(result)
+        self.repository.snapshot_calendar(calendar, range)
     }
     pub fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
         if uuid::Uuid::parse_str(id).is_err() {
             return Err(error("validation", "Use the full event UUID."));
         }
-        let owner = self.owner(calendar, false)?;
-        let event = self.providers[&owner].get(calendar, id)?;
-        if event.calendar_id != calendar || event.id != id {
-            return Err(error(
-                "providerIdentity",
-                "Provider returned an event from another identity.",
-            ));
-        }
-        Ok(event)
+        self.repository
+            .get(id)?
+            .filter(|e| e.calendar_id == calendar)
+            .ok_or_else(|| error("notFound", "This event no longer exists."))
     }
     pub fn save(&mut self, event: CalendarEvent, existing: bool) -> Result<CalendarEvent> {
         let expected = if existing {
-            Some(self.get(&event.calendar_id, &event.id)?)
+            self.repository.get(&event.id)?
         } else {
             None
         };
@@ -399,38 +247,22 @@ impl ProviderRegistry {
         existing: bool,
         expected: Option<CalendarEvent>,
     ) -> Result<CalendarEvent> {
-        let owner = self.owner(&event.calendar_id, true)?;
+        self.require(
+            &event.calendar_id,
+            expected
+                .as_ref()
+                .filter(|e| e.calendar_id == event.calendar_id),
+            if existing { "edit" } else { "create" },
+        )?;
         if let Some(original) = &expected {
-            let source = self.owner(&original.calendar_id, true)?;
-            if source != owner || (original.calendar_id != event.calendar_id && owner != "local") {
-                return Err(error(
-                    "conflict",
-                    "Events can only move between local calendars.",
-                ));
-            }
-        }
-        if existing != expected.is_some() || expected.as_ref().is_some_and(|e| e.id != event.id) {
-            return Err(error(
-                "conflict",
-                "An update requires the original event identity.",
-            ));
+            self.require(&original.calendar_id, Some(original), "edit")?;
+            self.check_move(original, &event)?;
         }
         let event = validate_event(event)?;
-        if event.recurrence.is_some() && !self.providers[&owner].supports_recurrence() {
-            return Err(error(
-                "unsupported",
-                "This provider does not support recurring events.",
-            ));
+        if event.recurrence.is_some() {
+            self.require(&event.calendar_id, None, "recurrence")?;
         }
-        self.providers
-            .get_mut(&owner)
-            .unwrap()
-            .save_checked(event, existing, expected)
-    }
-    pub fn delete(&mut self, calendar: &str, id: &str) -> Result<()> {
-        self.owner(calendar, true)?;
-        let expected = self.get(calendar, id)?;
-        self.delete_checked(calendar, id, &expected)
+        self.repository.save_checked(event, existing, expected)
     }
     pub fn delete_checked(
         &mut self,
@@ -438,168 +270,56 @@ impl ProviderRegistry {
         id: &str,
         expected: &CalendarEvent,
     ) -> Result<()> {
-        let owner = self.owner(calendar, true)?;
         if expected.id != id || expected.calendar_id != calendar {
             return Err(error(
                 "conflict",
                 "Deletion requires the original event identity.",
             ));
         }
-        self.providers
-            .get_mut(&owner)
-            .unwrap()
-            .delete_checked(calendar, id, expected)
+        self.require(calendar, Some(expected), "delete")?;
+        self.repository.delete_checked(id, expected)
     }
-    pub fn undo(&mut self, calendar: &str) -> Result<()> {
-        let owner = self.owner(calendar, true)?;
-        self.providers.get_mut(&owner).unwrap().undo()
+    pub fn undo_session(&mut self) -> Result<()> {
+        for (calendar, event, operation) in self.repository.undo_requirements()? {
+            self.require(&calendar, event.as_ref(), &operation)?;
+        }
+        self.repository.undo()
     }
     pub fn preferences(&self) -> Result<Preferences> {
-        self.providers
-            .get("local")
-            .ok_or_else(|| error("notFound", "Local provider unavailable."))?
-            .preferences()
+        self.repository.preferences()
     }
     pub fn set_preferences(&mut self, value: Preferences) -> Result<()> {
-        self.providers
-            .get_mut("local")
-            .ok_or_else(|| error("notFound", "Local provider unavailable."))?
-            .set_preferences(value)
+        self.repository.set_preferences(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Deliberately independent of SQLite and compiled only into the Rust test harness.
-    struct TestProvider {
-        leak: bool,
-        calendars: Vec<Calendar>,
-        events: BTreeMap<String, CalendarEvent>,
-    }
-    impl TestProvider {
-        fn new() -> Self {
-            Self {
-                leak: false,
-                calendars: vec![
-                    Calendar {
-                        id: "test-write".into(),
-                        provider_id: "test".into(),
-                        name: "Writable".into(),
-                        color: "#718675".into(),
-                        description: "".into(),
-                        writable: true,
-                    },
-                    Calendar {
-                        id: "test-read".into(),
-                        provider_id: "test".into(),
-                        name: "Read only".into(),
-                        color: "#718675".into(),
-                        description: "".into(),
-                        writable: false,
-                    },
-                ],
-                events: BTreeMap::new(),
-            }
-        }
-    }
+    use rusqlite::params;
+    use std::path::Path;
+    struct TestProvider;
     impl Provider for TestProvider {
         fn descriptor(&self) -> ProviderDescriptor {
             ProviderDescriptor {
                 id: "test".into(),
-                name: "Test adapter".into(),
-                writable: true,
-                authentication: false,
-                synchronization: false,
+                name: "Test only".into(),
+                connection_available: false,
+                unavailable_reason: Some("Test fixture".into()),
+                capabilities: self.capabilities(),
             }
         }
-        fn calendars(&self) -> Result<Vec<Calendar>> {
-            Ok(self.calendars.clone())
+        fn capabilities(&self) -> Capabilities {
+            let mut caps = Capabilities::local();
+            caps.recurrence = false;
+            caps.move_event = false;
+            caps
         }
-        fn snapshot(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
-            Ok(CalendarSnapshot {
-                calendar: self
-                    .calendars
-                    .iter()
-                    .find(|c| c.id == calendar)
-                    .unwrap()
-                    .clone(),
-                events: self
-                    .events
-                    .values()
-                    .filter(|e| {
-                        (self.leak || e.calendar_id == calendar)
-                            && match &e.time {
-                                EventTime::Timed { start, end, .. } => {
-                                    start < &range.end && end > &range.start
-                                }
-                                EventTime::AllDay {
-                                    start_date,
-                                    end_date,
-                                } => start_date < &range.end_date && end_date > &range.start_date,
-                            }
-                    })
-                    .cloned()
-                    .collect(),
-                can_undo: false,
-            })
-        }
-        fn get(&self, calendar: &str, id: &str) -> Result<CalendarEvent> {
-            self.events
-                .get(id)
-                .filter(|e| self.leak || e.calendar_id == calendar)
-                .cloned()
-                .ok_or_else(|| error("notFound", "Event not in calendar."))
-        }
-        fn save_checked(
-            &mut self,
-            event: CalendarEvent,
-            existing: bool,
-            expected: Option<CalendarEvent>,
-        ) -> Result<CalendarEvent> {
-            let previous = self.events.get(&event.id);
-            if previous != expected.as_ref()
-                || existing != previous.is_some()
-                || previous.is_some_and(|p| p.calendar_id != event.calendar_id)
-            {
-                return Err(error("conflict", "Event identity mismatch."));
-            }
-            self.events.insert(event.id.clone(), event.clone());
-            Ok(event)
-        }
-        fn delete_checked(
-            &mut self,
-            calendar: &str,
-            id: &str,
-            expected: &CalendarEvent,
-        ) -> Result<()> {
-            if !self
-                .events
-                .get(id)
-                .is_some_and(|e| e.calendar_id == calendar)
-            {
-                return Err(error("notFound", "Event not in calendar."));
-            }
-            if self.events.get(id) != Some(expected) {
-                return Err(error("conflict", "Event changed."));
-            }
-            self.events.remove(id);
-            Ok(())
-        }
-    }
-    fn registry() -> ProviderRegistry {
-        let mut r = ProviderRegistry::default();
-        r.register(Box::new(
-            LocalProvider::open(std::path::Path::new(":memory:")).unwrap(),
-        ))
-        .unwrap();
-        r.register(Box::new(TestProvider::new())).unwrap();
-        r
     }
     fn range() -> EventRange {
         EventRange {
-            start: "2026-10-01T00:00:00.000Z".into(),
-            end: "2026-11-01T00:00:00.000Z".into(),
+            start: "2026-10-01T00:00:00Z".into(),
+            end: "2026-11-01T00:00:00Z".into(),
             start_date: "2026-10-01".into(),
             end_date: "2026-11-01".into(),
         }
@@ -609,119 +329,428 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             calendar_id: calendar.into(),
             title: "  Normalized  ".into(),
-            time: EventTime::AllDay {
-                start_date: "2026-10-09".into(),
-                end_date: "2026-10-11".into(),
-            },
             location: "".into(),
             notes: "".into(),
             recurrence: None,
             occurrence: None,
+            time: EventTime::AllDay {
+                start_date: "2026-10-09".into(),
+                end_date: "2026-10-11".into(),
+            },
         }
     }
+    fn details(name: &str) -> CalendarDetails {
+        CalendarDetails {
+            name: name.into(),
+            color: "#718675".into(),
+            description: "".into(),
+        }
+    }
+    fn registry(path: &Path) -> (ProviderRegistry, String, String, String) {
+        let mut r = ProviderRegistry::new(Repository::open(path).unwrap());
+        r.register(Box::new(LocalProvider)).unwrap();
+        r.register(Box::new(TestProvider)).unwrap();
+        let a = r
+            .repository
+            .upsert_account("test", "subject-a", "Account A", ConnectionState::Connected)
+            .unwrap();
+        let b = r
+            .repository
+            .upsert_account(
+                "test",
+                "subject-b",
+                "Account B",
+                ConnectionState::AuthenticationRequired,
+            )
+            .unwrap();
+        let one = r
+            .repository
+            .import_calendar(
+                &a,
+                "shared-remote-id",
+                details("One"),
+                Capabilities::local(),
+            )
+            .unwrap();
+        let two = r
+            .repository
+            .import_calendar(
+                &b,
+                "shared-remote-id",
+                details("Two"),
+                Capabilities::local(),
+            )
+            .unwrap();
+        let readonly = r
+            .repository
+            .import_calendar(&a, "read", details("Read only"), Capabilities::read_only())
+            .unwrap();
+        (r, one, two, readonly)
+    }
+    fn count(r: &ProviderRegistry) -> i64 {
+        r.repository
+            .db
+            .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
+            .unwrap()
+    }
     #[test]
-    fn shared_crud_contract_and_isolation() {
-        let mut r = registry();
-        for calendar in ["local-default", "test-write"] {
-            let mut e = r.save(event(calendar), false).unwrap();
-            assert_eq!(e.title, "Normalized");
-            assert!(r.save(e.clone(), false).is_err());
-            assert_eq!(r.snapshot(calendar, range()).unwrap().events.len(), 1);
-            e.title = "Updated".into();
-            r.save(e.clone(), true).unwrap();
-            assert_eq!(
-                r.snapshot(calendar, range()).unwrap().events[0].title,
-                "Updated"
-            );
-            let other = if calendar == "local-default" {
-                "test-write"
-            } else {
-                "local-default"
+    fn common_crud_collection_account_identity_and_undo_contract() {
+        let (mut r, one, two, readonly) = registry(Path::new(":memory:"));
+        assert_ne!(one, two);
+        assert!(r.register(Box::new(TestProvider)).is_err());
+        for calendar in ["local-default", &one, &two] {
+            let saved = r.save(event(calendar), false).unwrap();
+            assert_eq!(saved.title, "Normalized");
+            assert!(r.save(saved.clone(), false).is_err());
+            assert!(r.get(&readonly, &saved.id).is_err());
+            assert_eq!(r.collection_snapshot(range()).unwrap().events.len(), 1);
+            let changed = CalendarEvent {
+                title: "Updated".into(),
+                ..saved.clone()
             };
-            assert!(r.snapshot(other, range()).unwrap().events.is_empty());
-            assert!(r.delete(other, &e.id).is_err());
-            assert_eq!(r.snapshot(calendar, range()).unwrap().events.len(), 1);
-            r.delete(calendar, &e.id).unwrap();
-            assert!(r.snapshot(calendar, range()).unwrap().events.is_empty());
+            r.save_checked(changed.clone(), true, Some(saved.clone()))
+                .unwrap();
+            assert_eq!(
+                r.save_checked(saved.clone(), true, Some(saved.clone()))
+                    .unwrap_err()
+                    .code,
+                "conflict"
+            );
+            r.undo_session().unwrap();
+            assert_eq!(r.get(calendar, &saved.id).unwrap(), saved);
+            r.delete_checked(calendar, &saved.id, &saved).unwrap();
+            r.undo_session().unwrap();
+            r.undo_session().unwrap();
+            assert!(r.collection_snapshot(range()).unwrap().events.is_empty());
+            assert_eq!(count(&r), 0);
         }
-        assert_eq!(r.calendars().unwrap().len(), 3);
-        assert_eq!(r.descriptors().len(), 2);
+        let snapshot = r.collection_snapshot(range()).unwrap();
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert_eq!(snapshot.calendars.len(), 4);
+        assert!(!snapshot.calendar_capabilities[&readonly].edit);
+        assert!(!snapshot.calendar_capabilities[&one].recurrence);
     }
     #[test]
-    fn readonly_identity_bounds_and_unsupported_operations() {
-        let mut r = registry();
+    fn remote_mapping_collisions_and_wrong_account_ingestion() {
+        let (mut r, one, two, _) = registry(Path::new(":memory:"));
+        let a = r.repository.calendar_account(&one).unwrap().unwrap();
+        let b = r.repository.calendar_account(&two).unwrap().unwrap();
+        let first = r
+            .repository
+            .cache_event(
+                &a,
+                "same-event",
+                event(&one),
+                "rev-a",
+                r#"{"untouched":"A"}"#,
+                Capabilities::local(),
+            )
+            .unwrap();
+        let second = r
+            .repository
+            .cache_event(
+                &b,
+                "same-event",
+                event(&two),
+                "rev-b",
+                r#"{"untouched":"B"}"#,
+                Capabilities::local(),
+            )
+            .unwrap();
+        assert_ne!(first, second);
         assert_eq!(
-            r.save(event("test-read"), false).err().unwrap().code,
-            "readOnly"
+            r.repository
+                .cache_event(
+                    &a,
+                    "same-event",
+                    event(&one),
+                    "rev-c",
+                    "{}",
+                    Capabilities::local()
+                )
+                .unwrap(),
+            first
         );
         assert_eq!(
-            r.delete("test-read", "anything").unwrap_err().code,
-            "readOnly"
-        );
-        assert_eq!(r.undo("test-read").unwrap_err().code, "readOnly");
-        assert!(r.save(event("missing"), false).is_err());
-        assert!(r.snapshot("missing", range()).is_err());
-        let mut huge = range();
-        huge.end_date = "2028-01-01".into();
-        assert!(r.snapshot("test-write", huge).is_err());
-        assert_eq!(r.undo("test-write").unwrap_err().code, "unsupported");
-        let mut p = TestProvider::new();
-        assert_eq!(
-            p.authenticate(&crate::credentials::CredentialService::default())
+            r.repository
+                .cache_event(&a, "wrong", event(&two), "rev", "{}", Capabilities::local())
                 .unwrap_err()
                 .code,
-            "unsupported"
+            "providerIdentity"
         );
-        assert_eq!(p.synchronize().unwrap_err().code, "unsupported");
-        assert!(r.register(Box::new(TestProvider::new())).is_err());
-        let mut collision = TestProvider::new();
-        collision.calendars[0].id = "local-default".into();
-        let mut empty = ProviderRegistry::default();
-        empty
-            .register(Box::new(
-                LocalProvider::open(std::path::Path::new(":memory:")).unwrap(),
-            ))
-            .unwrap();
-        assert!(empty.register(Box::new(collision)).is_err());
-        assert_eq!(empty.calendars().unwrap().len(), 1);
+        assert!(r.get(&one, &second).is_err());
+        assert_eq!(r.collection_snapshot(range()).unwrap().events.len(), 2);
+        // Reconnecting cannot duplicate accounts or overwrite local presentation/exclusions.
+        r.set_calendar_visibility(&one, false).unwrap();
+        r.delete_calendar(&one).unwrap();
+        assert_eq!(
+            r.repository
+                .upsert_account("test", "subject-a", "Updated", ConnectionState::Connected)
+                .unwrap(),
+            a
+        );
+        assert_eq!(
+            r.repository
+                .import_calendar(
+                    &a,
+                    "shared-remote-id",
+                    details("Remote name"),
+                    Capabilities::local()
+                )
+                .unwrap(),
+            one
+        );
+        assert!(!r.calendars().unwrap().iter().any(|c| c.id == one));
+        assert_eq!(r.accounts().unwrap().len(), 2);
     }
     #[test]
-    fn adapter_cannot_leak_calendar_data_and_local_undo_still_works() {
-        let mut r = registry();
-        let e = r.save(event("local-default"), false).unwrap();
-        r.undo("local-default").unwrap();
-        assert!(r
-            .snapshot("local-default", range())
+    fn permissions_event_restrictions_moves_and_unavailable_adapter() {
+        let (mut r, one, two, readonly) = registry(Path::new(":memory:"));
+        assert_eq!(
+            r.save(event(&readonly), false).unwrap_err().code,
+            "readOnly"
+        );
+        assert_eq!(
+            r.set_default_calendar(&readonly).unwrap_err().code,
+            "readOnly"
+        );
+        r.set_default_calendar(&one).unwrap();
+        r.set_calendar_visibility(&readonly, false).unwrap();
+        let a = r.repository.calendar_account(&one).unwrap().unwrap();
+        let id = r
+            .repository
+            .cache_event(
+                &a,
+                "meeting",
+                event(&one),
+                "rev",
+                "{\"attendees\":[1]}",
+                Capabilities::read_only(),
+            )
+            .unwrap();
+        let meeting = r.get(&one, &id).unwrap();
+        assert_eq!(
+            r.save_checked(meeting.clone(), true, Some(meeting.clone()))
+                .unwrap_err()
+                .code,
+            "readOnly"
+        );
+        assert_eq!(
+            r.delete_checked(&one, &id, &meeting).unwrap_err().code,
+            "readOnly"
+        );
+        assert!(!r.collection_snapshot(range()).unwrap().event_capabilities[&id].edit);
+        let saved = r.save(event(&one), false).unwrap();
+        let moved = CalendarEvent {
+            calendar_id: two.clone(),
+            ..saved.clone()
+        };
+        assert!(r.save_checked(moved, true, Some(saved.clone())).is_err());
+        r.repository
+            .import_calendar(
+                &a,
+                "shared-remote-id",
+                details("One"),
+                Capabilities::read_only(),
+            )
+            .unwrap();
+        assert_eq!(
+            r.default_calendar_id().unwrap().as_deref(),
+            Some("local-default")
+        );
+        assert_eq!(r.undo_session().unwrap_err().code, "readOnly");
+        assert_eq!(r.repository.get(&saved.id).unwrap(), Some(saved));
+        r.providers.remove("test");
+        assert_eq!(r.collection_snapshot(range()).unwrap().events.len(), 2);
+        assert!(r.save(event(&two), false).is_err());
+        r.save(event("local-default"), false).unwrap();
+    }
+    #[test]
+    fn durable_intent_restart_shadow_preservation_and_transaction_failure() {
+        let path =
+            std::env::temp_dir().join(format!("aika-provider-{}.sqlite3", uuid::Uuid::new_v4()));
+        let (mut r, one, _, _) = registry(&path);
+        let a = r.repository.calendar_account(&one).unwrap().unwrap();
+        let id = r
+            .repository
+            .cache_event(
+                &a,
+                "server-event",
+                event(&one),
+                "r1",
+                "{\"providerOnly\":true}",
+                Capabilities::local(),
+            )
+            .unwrap();
+        let original = r.get(&one, &id).unwrap();
+        let changed = CalendarEvent {
+            title: "Offline change".into(),
+            ..original.clone()
+        };
+        r.save_checked(changed.clone(), true, Some(original.clone()))
+            .unwrap();
+        assert_eq!(count(&r), 1);
+        r.repository
+            .cache_event(
+                &a,
+                "server-event",
+                original.clone(),
+                "r2",
+                "{\"providerOnly\":true,\"new\":1}",
+                Capabilities::local(),
+            )
+            .unwrap();
+        assert_eq!(r.get(&one, &id).unwrap(), changed);
+        assert_eq!(r.delete_calendar(&one).unwrap_err().code, "pendingWork");
+        // Inject failure in the outbox, proving effective mutation and history roll back.
+        r.repository.db.execute_batch("CREATE TRIGGER reject_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let failed = CalendarEvent {
+            title: "Failed".into(),
+            ..changed.clone()
+        };
+        assert!(r.save_checked(failed, true, Some(changed.clone())).is_err());
+        assert_eq!(r.get(&one, &id).unwrap(), changed);
+        assert_eq!(count(&r), 1);
+        r.repository
+            .db
+            .execute_batch("DROP TRIGGER reject_outbox")
+            .unwrap();
+        r.undo_session().unwrap();
+        assert_eq!(count(&r), 0);
+        r.save_checked(changed.clone(), true, Some(original))
+            .unwrap();
+        drop(r);
+        let mut reopened = ProviderRegistry::new(Repository::open(&path).unwrap());
+        reopened.register(Box::new(LocalProvider)).unwrap();
+        reopened.register(Box::new(TestProvider)).unwrap();
+        assert_eq!(count(&reopened), 1);
+        assert_eq!(reopened.get(&one, &id).unwrap(), changed);
+        assert!(!reopened.collection_snapshot(range()).unwrap().can_undo);
+        let (revision, shadow): (String, String) = reopened
+            .repository
+            .db
+            .query_row(
+                "SELECT revision,shadow_payload FROM remote_events WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, "r2");
+        assert!(shadow.contains("providerOnly"));
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn checked_permissions_survive_between_service_check_and_repository_transaction() {
+        let (mut r, one, _, _) = registry(Path::new(":memory:"));
+        let saved = r.save(event(&one), false).unwrap();
+        r.repository
+            .db
+            .execute("UPDATE calendars SET writable=0 WHERE id=?1", [&one])
+            .unwrap();
+        assert_eq!(
+            r.repository
+                .save_checked(saved.clone(), true, Some(saved.clone()))
+                .unwrap_err()
+                .code,
+            "readOnly"
+        );
+        assert_eq!(r.repository.undo().unwrap_err().code, "readOnly");
+        assert_eq!(count(&r), 1);
+        assert_eq!(r.repository.get(&saved.id).unwrap(), Some(saved));
+    }
+    #[test]
+    fn service_uses_shared_series_reads_and_remote_outbox_without_network() {
+        let (r, one, _, _) = registry(Path::new(":memory:"));
+        let mut service = crate::service::CalendarService { providers: r };
+        let account = service
+            .providers
+            .repository
+            .calendar_account(&one)
             .unwrap()
-            .events
-            .is_empty());
-        r.save(e.clone(), false).unwrap();
-        let mut wrong = e;
-        wrong.calendar_id = "test-write".into();
-        assert!(r.save(wrong, true).is_err());
+            .unwrap();
+        let mut master = event(&one);
+        master.recurrence = Some(Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 1,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(3),
+            segment: None,
+        });
+        let id = service
+            .providers
+            .repository
+            .cache_event(
+                &account,
+                "recurring",
+                master,
+                "r",
+                "{}",
+                Capabilities::read_only(),
+            )
+            .unwrap();
+        assert!(service.get_series(&id).unwrap().event.recurrence.is_some());
         assert_eq!(
-            r.snapshot("local-default", range()).unwrap().events.len(),
-            1
+            service.collection_snapshot(range()).unwrap().events.len(),
+            3
         );
-        // A broken adapter is rejected even if it returns foreign events under its own metadata.
-        let mut p = TestProvider::new();
-        let foreign = event("local-default");
-        let foreign_id = foreign.id.clone();
-        p.events.insert(foreign.id.clone(), foreign);
-        p.leak = true;
-        let mut leaking = ProviderRegistry::default();
-        leaking.register(Box::new(p)).unwrap();
+        let saved = service.save_checked(event(&one), false, None).unwrap();
+        assert_eq!(count(&service.providers), 1);
+        assert_eq!(service.get(&saved.id).unwrap(), saved);
+        service.undo().unwrap();
+        assert_eq!(count(&service.providers), 0);
+        assert!(service.get(&saved.id).is_err());
+    }
+    #[test]
+    fn operation_capabilities_do_not_collapse_to_a_writable_flag() {
+        let (mut r, one, _, _) = registry(Path::new(":memory:"));
+        let account = r.repository.calendar_account(&one).unwrap().unwrap();
+        let mut caps = Capabilities::local();
+        caps.create = false;
+        r.repository
+            .import_calendar(
+                &account,
+                "shared-remote-id",
+                details("Edit only"),
+                caps.clone(),
+            )
+            .unwrap();
+        assert_eq!(r.save(event(&one), false).unwrap_err().code, "readOnly");
+        assert_eq!(r.set_default_calendar(&one).unwrap_err().code, "readOnly");
         assert_eq!(
-            leaking.get("test-write", &foreign_id).unwrap_err().code,
-            "providerIdentity"
+            r.repository.set_default_calendar(&one).unwrap_err().code,
+            "readOnly"
         );
-        assert_eq!(
-            leaking.snapshot("test-write", range()).err().unwrap().code,
-            "providerIdentity"
-        );
-        let mut p = TestProvider::new();
-        // Discovery rejects metadata claiming another provider.
-        p.calendars[0].provider_id = "local".into();
-        assert!(ProviderRegistry::default().register(Box::new(p)).is_err());
+        let id = r
+            .repository
+            .cache_event(&account, "existing", event(&one), "r", "{}", caps)
+            .unwrap();
+        let original = r.get(&one, &id).unwrap();
+        r.save_checked(
+            CalendarEvent {
+                title: "Allowed edit".into(),
+                ..original.clone()
+            },
+            true,
+            Some(original),
+        )
+        .unwrap();
+        assert_eq!(count(&r), 1);
+    }
+    #[test]
+    fn database_rejects_cross_account_remote_mappings() {
+        let (r, one, two, _) = registry(Path::new(":memory:"));
+        let a = r.repository.calendar_account(&one).unwrap().unwrap();
+        assert!(r
+            .repository
+            .db
+            .execute(
+                "INSERT INTO remote_events VALUES(?1,?2,?3,'remote','r','{}','{}')",
+                params![uuid::Uuid::new_v4().to_string(), a, two]
+            )
+            .is_err());
+        assert!(r.repository.db.execute("INSERT INTO calendars(id,name,provider_id,account_id,remote_id) VALUES('bad','Bad','wrong',?1,'remote')",[a]).is_err());
     }
 }

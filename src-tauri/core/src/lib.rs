@@ -5,3 +5,4 @@ pub mod service;
 pub mod storage;
 
 pub use aika_domain::recurrence;
+pub mod repository;

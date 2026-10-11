@@ -971,3 +971,83 @@ fn recurring_cli_validation_monthly_yearly_and_timed_dst() {
     assert!(!list.contains("2026-03-29"));
     assert!(list.contains("2026-03-30T02:30:00+02:00"));
 }
+
+#[test]
+fn cached_connected_calendars_are_readable_without_an_adapter_or_worker() {
+    use aika_core::{
+        contracts::{CalendarDetails, CalendarEvent, Capabilities, ConnectionState},
+        repository::Repository,
+    };
+    let f = Fixture::new();
+    let mut repository = Repository::open(&f.0).unwrap();
+    let account = repository
+        .upsert_account(
+            "test",
+            "disposable-subject",
+            "Fixture account",
+            ConnectionState::AuthenticationRequired,
+        )
+        .unwrap();
+    let calendar = repository
+        .import_calendar(
+            &account,
+            "remote-calendar",
+            CalendarDetails {
+                name: "Cached fixture".into(),
+                color: "#718675".into(),
+                description: "".into(),
+            },
+            Capabilities::local(),
+        )
+        .unwrap();
+    let id = repository
+        .cache_event(
+            &account,
+            "remote-event",
+            CalendarEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                calendar_id: calendar.clone(),
+                title: "Cached remote event".into(),
+                location: "".into(),
+                notes: "".into(),
+                recurrence: None,
+                occurrence: None,
+                time: EventTime::AllDay {
+                    start_date: "2026-10-10".into(),
+                    end_date: "2026-10-11".into(),
+                },
+            },
+            "revision",
+            "{\"fixture\":true}",
+            Capabilities::local(),
+        )
+        .unwrap();
+    drop(repository);
+    assert!(f.success(&["calendars", "list"]).contains("Cached fixture"));
+    assert!(f
+        .success(&["events", "get", &id])
+        .contains("Cached remote event"));
+    assert!(f
+        .success(&[
+            "events",
+            "list",
+            "--from",
+            "2026-10-01",
+            "--to",
+            "2026-11-01",
+        ])
+        .contains("Cached remote event"));
+    let result = f.run(&[
+        "events",
+        "update",
+        &id,
+        "--title",
+        "Cannot write without adapter",
+    ]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Provider unavailable"));
+    assert_eq!(
+        CalendarService::open(&f.0).unwrap().get(&id).unwrap().title,
+        "Cached remote event"
+    );
+}

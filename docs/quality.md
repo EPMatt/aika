@@ -51,3 +51,9 @@ Record OS/webview version, input method, display scale, exact outcome, and scree
 - Build an ordinary release and verify it has no test-driver listener or test fixtures. Install/update/packaging checks belong to phase 5.
 
 Do not mark an unexecuted platform or screen-reader check as passed. See the phase-4 handoff for evidence from this host and remaining checks.
+
+## Google phase 1 foundation
+
+The schema v4 repository suites preserve v1–v3 events, series exceptions, calendar metadata, visibility, defaults, and preferences; reject future schemas; and roll back an injected v4 migration failure. The second provider is compiled only under `cfg(test)` and supplies capabilities while sharing the same repository and service as Local. Tests cover two accounts with colliding calendar/event remote IDs, reconnect/exclusion identity retention, cached reads during authentication/adapter unavailability, event restrictions, checked permission loss, atomic outbox failure, durable restart, and unsent session undo. CLI process tests read a disposable connected-calendar cache without a worker and reject writes when its test adapter is unavailable.
+
+The renderer consumes generated capability maps for creation, editing, deletion, moves, recurrence, and gestures. A mocked IPC browser scenario proves that event restrictions override a writable calendar. Browser evidence does not establish Google authentication or HTTP. See the [Google phase 1 handoff](handoffs/google-phase-1.md) for exact commands, results, and the remaining phase/platform gates.

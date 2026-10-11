@@ -10,7 +10,7 @@ Canonicalize OS/webview locales before formatting: Linux can expose POSIX tags s
 
 ## Boundaries
 
-Current local data flow: React calendar → typed IPC client → Rust `CalendarService` → SQLite. Phase 4 adds registered provider dispatch between the service and persistence or remote adapters. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
+Current local data flow: React calendar → typed IPC client → Rust `CalendarService` → `ProviderRegistry` → SQLite-backed `LocalProvider`. Registered provider dispatch shipped in the original phase 4. Frontend views own rendering/selection/interaction state, never provider-specific event mapping, SQL, tokens, or authentication.
 
 The browser design harness uses `PrototypeRepository` explicitly. It is in-memory and independently undoable; this is a design harness, not the permanent provider implementation. Native startup binds the typed IPC client and never loads the browser fixture repository. No sample events should seed a user's database.
 
@@ -26,7 +26,7 @@ The backend validates titles, date ordering, valid time zones, and DST ambiguity
 
 The provider registry exposes descriptor, capabilities, normalized calendar discovery, bounded event listing, and normalized create/update/delete operations. Authentication and sync are backend extension points. Unsupported capabilities produce typed errors. Contract tests exercise local and test-only adapters, independent calendar identities, and read-only behavior without changing views.
 
-The first remote provider introduces a common cached adapter/sync coordinator, rather than copying caching into Google-specific code. Durable offline mutations use an outbox with retries and explicit conflicts. Subsequent Google/Microsoft/CalDAV implementations map their auth, IDs, cursors, revisions, event formats, and errors to that common layer. New recurrence/invitation features need a separate domain/UI increment.
+The first remote provider introduces a common cached adapter/sync coordinator. Durable offline mutations use an outbox with retries and explicit conflicts. Subsequent providers map their auth, IDs, cursors, revisions, event formats, and errors to that common layer. Local common recurrence has since shipped; remote recurrence is planned in Google integration phase 5, while invitation editing remains deferred. The [connected-calendar decisions](#connected-calendar-decisions-google-integration) below and [integration specification](integrations/google-calendar.md) define the accepted design; no remote adapter or sync runtime is implemented yet.
 
 The credential service stays behind the backend boundary. Use persistent OS stores (Keychain, Windows Credential Store, Linux Secret Service), namespace entries by application/account, and never return credentials to the renderer. Locked/unavailable stores block connected accounts. Data at rest is not application-encrypted in v0. No session-only or plaintext fallback.
 
@@ -140,3 +140,73 @@ The renderer looks up metadata by each event's calendar ID, filters visibility b
 - **Compare complete aggregates and undo batches.** Recurring reads carry a deterministic serialized expectation covering the master and sorted exceptions. It is an opaque concurrency token, not a credential or revision number, with the same content-comparison/ABA limitations as existing single-event edits. SQLite compares expectations inside an immediate transaction before applying every planned row change. A split and its exceptions form one session-undo entry; compensation first checks every affected aggregate, then restores all changes atomically. Failed writes and undo preserve history. CLI mutations stay outside desktop session history. Providers that implement only ordinary CRUD reject recurrence.
 - **Keep calendar ownership coherent.** Occurrence overrides may move between local calendars. Saving reveals the destination. Deleting a master calendar cascades its series/exception rows; deleting a destination calendar converts moved-in overrides to cancellations so their original occurrences cannot reappear. Guarded CLI calendar deletion counts moved-in overrides. Undo histories involving deleted calendars are pruned.
 - **Reproducible bindings.** Browser builds compile the domain with Rust 1.99.0 for `wasm32-unknown-unknown` and the `wasm` feature, then generate web bindings with wasm-bindgen 0.2.129, matching the pinned Rust dependency. `pnpm domain:build` is included in dev/build/unit-test entrypoints. Bindings under `src/wasm` are generated and ignored; contracts under `src/generated` remain checked in. Both CI workflows provision the WASM target and pinned bindgen tool. Native production code uses Rust directly and never loads the browser fixture database.
+
+## Connected-calendar decisions (Google integration)
+
+Status: **accepted design; phases 0–1 delivered, connection and sync implementation planned in phases 2–6.** These decisions build on the shipped local behavior described above. The [integration specification](integrations/google-calendar.md) owns product behavior, interfaces, phase gates, and verification. Future handoffs must distinguish delivered code from planned guarantees.
+
+### ADR G01: Provider types and account identities
+
+**Decision:** register one implementation per provider type and model its connected accounts separately. Keep internal calendar/event identities stable and map remote identities within the account and calendar scope. Reconnection uses the same account identity and preserves exclusions. Google account identity uses its stable subject, with email as display metadata.
+
+**Rationale:** the current provider registry is keyed by provider ID; registering another provider instance for every account would conflate implementation identity with connection identity. Account-scoped mappings support multiple accounts and identical remote IDs without changing views.
+
+**Consequences:** shared calendars connected through two accounts have separate local identities and account labels. Adding a provider requires adapter implementation, registration/configuration, and contract tests; runtime plugin loading is outside this increment.
+
+### ADR G02: Shared repository and capability-based presentation
+
+**Decision:** extract SQLite persistence from `LocalProvider` into a shared repository used for local data, remote caches, and application settings. Extend collection and series dispatch beyond the local adapter. Generate public DTOs from Rust and enforce provider, calendar, and event capabilities in both the service and renderer.
+
+**Rationale:** local-owned collection snapshots, default/visibility settings, and recurrence/undo routing currently prevent a second production provider from appearing completely. Separate caches or Google branches in views would duplicate persistence and interaction behavior.
+
+**Consequences:** phase 1 needs transactional migrations and regression evidence before authentication is added. Preserve existing IDs, recurrence aggregates, preferences, and local moves. Imported meetings, unsupported event types, and unsupported recurrence remain inspectable with restricted mutation capabilities. The pure domain/WASM layer must remain independent of network, SQLite, and credentials.
+
+### ADR G03: Cache-first operations and durable synchronization
+
+**Decision:** all UI and CLI reads use the repository. Supported remote edits commit their effective local state and durable outbox work together. A common coordinator performs network work outside database locks; adapters map discovery, changes, opaque revisions/cursors, and mutations. Persist the remote shadow separately from local pending intent and retain provider fields outside the editable domain.
+
+**Rationale:** direct remote CRUD cannot provide reliable offline editing or restart recovery. Separate shadow and intent make it possible to refresh server state without discarding queued edits.
+
+**Consequences:** paginated sync generations and their final cursors commit together. A cursor reset replaces only remote shadow state after a successful rebuild. Revision checks protect newer local edits from late acknowledgements; database leases serialize account workers across desktop processes. Adapter-specific idempotency and acknowledgement recovery are required because a lost response is not proof that a write failed.
+
+### ADR G04: Explicit conflicts and compensating undo
+
+**Decision:** retain both versions and pause the affected event when local and remote changes conflict. Offer Keep local or Keep Google, including deletion conflicts; no automatic merge or silent winner. Session undo cancels unsent work or queues a checked compensating mutation after acknowledgement. In-flight work has explicit dependencies.
+
+**Rationale:** the user selected explicit resolution. Google supports conditional writes through resource revisions, which prevent an outdated write from silently replacing a newer event. See [conditional modifications](https://developers.google.com/workspace/calendar/api/guides/version-resources).
+
+**Consequences:** conflicts and pending work survive restart, while undo history remains session-scoped. Keeping local still respects current permissions and remote identity; permission failures retain recoverable intent. Account removal or exclusion requires pending work to sync or be explicitly discarded before its cache is removed.
+
+### ADR G05: Backend authentication and credential boundary
+
+**Decision:** Google uses a system-browser authorization-code flow with PKCE, validated state, and a random-port loopback callback. Rust owns connection sessions, refresh, cancellation, and timeout. Access/refresh credentials use the existing OS store, without plaintext or session-only fallback. IPC exposes progress and account metadata, never tokens. Other providers may supply different authentication flows behind the same account lifecycle.
+
+**Rationale:** Google's [installed-app flow](https://developers.google.com/identity/protocols/oauth2/native-app) supports desktop loopback callbacks. Backend ownership preserves the existing credential boundary and avoids exposing Google endpoints or arbitrary URL opening to the renderer.
+
+**Consequences:** store failures pause remote access without blocking local or cached data. Public desktop client configuration is distinct from user credentials; no bundled client value is treated as a confidential server secret. Missing configuration disables connection with a clear explanation. Live verification requires a configured Desktop OAuth client and disposable test account.
+
+### ADR G06: Import selection and synchronization lifetime
+
+**Decision:** show a provider popup from backend descriptors. Google discovery presents all eligible calendars checked before confirmation. Persist selections separately from visibility, and retain explicit exclusions when reconciling discovery. Automatically import newly discovered eligible calendars. Sync at startup, focus/resume, manual request, every 60 seconds while the desktop runs, and after debounced local writes.
+
+**Rationale:** this reconciles automatic addition with selection at import and implements the user's chosen application-open sync lifetime. Hiding a calendar changes presentation without unexpectedly stopping synchronization.
+
+**Consequences:** no application server, webhook service, or OS background daemon is introduced. Queued CLI edits wait for the desktop worker. Imported calendar removal means exclusion from aika, not deletion in Google. Local appearance overrides do not require remote calendar-management scopes.
+
+### ADR G07: Recurrence compatibility and bounded fallback coverage
+
+**Decision:** import masters and exceptions without date filtering, and map only provably equivalent patterns to the common domain. Preserve unsupported recurrence and display provider-expanded occurrences cached for 12 months past and 24 months ahead, plus other ranges opened online. Missing offline coverage is explicit. Compatible recurrence receives scoped two-way edits in phase 5.
+
+**Rationale:** the existing editor/domain represents common patterns, not every Google recurrence expression. The selected fallback avoids inventing an inaccurate schedule. Google's [recurring-event API](https://developers.google.com/workspace/calendar/api/guides/recurringevents) provides instance identities and requires multiple requests for following-series changes.
+
+**Consequences:** unsupported rules stay read-only and their occurrence caches invalidate after relevant changes. Following-series edits become persisted workflows with recoverable partial progress; local transaction atomicity cannot imply remote multi-request atomicity. DST, count/end-date semantics, exceptions, and undo require equivalence and crash-recovery evidence before enabling edits.
+
+### Google phase 1 implementation boundary
+
+The backend `ProviderRegistry` owns a shared `Repository` (connection and session history), with one stateless adapter per provider type. The production adapter is Local; a second adapter exists only under `cfg(test)`. Collection reads, calendar metadata/settings, series lookup, checked writes, and undo use the repository for every account. Cached reads remain available when an adapter or account authentication is unavailable; writes require a registered adapter. Native account/capability DTOs enrich the collection contract without adding account storage to `aika-domain` or its WASM build.
+
+Schema v4 migrates v1–v3 transactionally without replacing IDs, event/exception payloads, calendar metadata, visibility, default selection, or preferences. Accounts have unique `(provider_id, remote_subject)` identities. Imported calendars have unique `(account_id, remote_id)` mappings and UUID internal IDs; remote events have unique `(account_id, calendar_id, remote_id)` mappings and retain opaque shadow payload/revision separately from effective event rows. Identity checks reject wrong-account ingestion. Selection, visibility, and active/writable eligibility are separate columns. Imported exclusion retains its identity/selection row and never requests remote deletion; pending outbox work blocks exclusion, even with force.
+
+Supported ordinary remote mutations commit effective event aggregates and outbox entries in one immediate transaction. Entries retain before/after intent, operation identity, revision, and predecessor dependency. Session undo cancels the matching unsent tail; the schema can retain compensation dependencies for later worker implementation. Repository transactions recheck persisted permissions alongside expected values, so concurrent permission loss cannot bypass service checks. Adapter, calendar, and event capabilities intersect in the service; local moves and recurrence keep their existing checked behavior. Remote moves and recurring writes remain disabled. Defaults fall back to the oldest active selected writable local calendar, then an imported calendar, then none.
+
+Cursor, staged-generation, coverage, conflict, and account-lease tables reserve persistence for later phases. Their presence does not establish synchronization, claim/retry/acknowledgement recovery, conflict resolution, unsupported-rule projection, or in-flight/acknowledged undo correctness. The [phase 1 handoff](handoffs/google-phase-1.md) records the actual evidence and next implementation steps.

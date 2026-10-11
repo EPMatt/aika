@@ -105,6 +105,35 @@ export class PrototypeRepository {
       defaultCalendarId: this.defaultCalendarId,
       hiddenCalendarIds: this.hiddenCalendarIds,
       canUndo: this.canUndo(),
+      accounts: [],
+      calendarCapabilities: Object.fromEntries(
+        this.calendars.map((c) => [
+          c.id,
+          {
+            read: true,
+            create: c.writable,
+            edit: c.writable,
+            delete: c.writable,
+            recurrence: c.writable,
+            customizeMetadata: true,
+            moveEvent: c.writable,
+          },
+        ]),
+      ),
+      eventCapabilities: Object.fromEntries(
+        events.map((e) => [
+          e.id,
+          {
+            read: true,
+            create: true,
+            edit: true,
+            delete: true,
+            recurrence: true,
+            customizeMetadata: true,
+            moveEvent: true,
+          },
+        ]),
+      ),
     });
   }
   canUndo() {

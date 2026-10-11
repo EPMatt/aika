@@ -5,7 +5,7 @@ use aika_core::{
     },
     service::{
         error, resolve_local, validate_event, validate_range, CalendarManagementSnapshot,
-        CalendarService, LocalProvider,
+        CalendarService,
     },
     storage,
 };
@@ -502,7 +502,7 @@ fn describe(event: &CalendarEvent) -> String {
 }
 
 fn calendar_details(fields: CalendarArgs, previous: Option<&Calendar>) -> Result<CalendarDetails> {
-    LocalProvider::validate_details(CalendarDetails {
+    aika_core::repository::Repository::validate_details(CalendarDetails {
         name: required(
             &fields.name.or_else(|| previous.map(|c| c.name.clone())),
             "name",

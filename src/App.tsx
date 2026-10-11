@@ -52,6 +52,7 @@ import type { EventSeries } from './generated/EventSeries';
 import type { EventMutation } from './generated/EventMutation';
 import { SidebarPopup } from './SidebarPopup';
 import type { ServiceError } from './generated/ServiceError';
+import type { Capabilities } from './generated/Capabilities';
 
 const defaultCalendar = personalCalendar;
 const emptyCalendar: Calendar = {
@@ -61,9 +62,48 @@ const emptyCalendar: Calendar = {
   writable: false,
 };
 const CalendarContext = createContext(defaultCalendar);
+const CapabilitiesContext = createContext<{
+  calendars: Record<string, Capabilities>;
+  events: Record<string, Capabilities>;
+}>({ calendars: {}, events: {} });
 const CalendarsContext = createContext<Calendar[]>([defaultCalendar]);
+function CalendarProviders({
+  calendars,
+  capabilities,
+  children,
+}: {
+  calendars: Calendar[];
+  capabilities: { calendars: Record<string, Capabilities>; events: Record<string, Capabilities> };
+  children: React.ReactNode;
+}) {
+  return (
+    <CapabilitiesContext.Provider value={capabilities}>
+      <CalendarsContext.Provider value={calendars}>{children}</CalendarsContext.Provider>
+    </CapabilitiesContext.Provider>
+  );
+}
 function useEventCalendar(event: CalendarEvent) {
-  return useContext(CalendarsContext).find((c) => c.id === event.calendarId) ?? emptyCalendar;
+  const calendar =
+    useContext(CalendarsContext).find((c) => c.id === event.calendarId) ?? emptyCalendar;
+  const capabilities = useContext(CapabilitiesContext);
+  return editableEventCalendar(calendar, event, capabilities);
+}
+function editableEventCalendar(
+  calendar: Calendar,
+  event: CalendarEvent,
+  capabilities: { calendars: Record<string, Capabilities>; events: Record<string, Capabilities> },
+) {
+  const caps =
+    capabilities.events[event.id] ??
+    capabilities.events[event.id.split('@')[0]] ??
+    capabilities.calendars[event.calendarId];
+  return {
+    ...calendar,
+    writable:
+      calendar.writable &&
+      (caps?.edit ?? true) &&
+      (!(event.recurrence || event.occurrence) || (caps?.recurrence ?? true)),
+  };
 }
 function calendarStyle(calendar: Calendar): CSSProperties {
   return { '--calendar-color': calendar.color } as CSSProperties;
@@ -558,6 +598,7 @@ function TimeView({
   );
   const calendar = useContext(CalendarContext);
   const calendars = useContext(CalendarsContext);
+  const capabilities = useContext(CapabilitiesContext);
   const gesture = useRef<{ start: number; y: number; id?: string } | null>(null);
   const suppressClick = useRef(false);
   useEffect(() => {
@@ -794,8 +835,11 @@ function TimeView({
                 />
               )}
               {layoutTimedEvents(events, day).map(({ event, start, end, lane, lanes }) => {
-                const eventCalendar =
-                  calendars.find((c) => c.id === event.calendarId) ?? emptyCalendar;
+                const eventCalendar = editableEventCalendar(
+                  calendars.find((c) => c.id === event.calendarId) ?? emptyCalendar,
+                  event,
+                  capabilities,
+                );
                 return (
                   <button
                     key={event.id}
@@ -891,7 +935,20 @@ function EventEditor({
   const [calendarId, setCalendarId] = useState(event.calendarId);
   const sourceCalendar = calendars.find((c) => c.id === event.calendarId);
   const calendar = calendars.find((c) => c.id === calendarId) ?? emptyCalendar;
-  const writable = Boolean(sourceCalendar?.writable && calendar.writable);
+  const capabilities = useContext(CapabilitiesContext);
+  const caps =
+    capabilities.events[event.id] ??
+    capabilities.events[event.id.split('@')[0]] ??
+    capabilities.calendars[event.calendarId];
+  const destinationCaps = capabilities.calendars[calendarId];
+  const writable = Boolean(
+    sourceCalendar?.writable &&
+      calendar.writable &&
+      (existing ? (caps?.edit ?? true) : (destinationCaps?.create ?? true)) &&
+      (!(event.recurrence || event.occurrence) || (caps?.recurrence ?? true)),
+  );
+  const canDelete = caps?.delete ?? true;
+  const canMove = caps?.moveEvent ?? true;
   const [title, setTitle] = useState(event.title);
   const [recurrence, setRecurrence] = useState<Recurrence | undefined>(event.recurrence);
   const [resetExceptions, setResetExceptions] = useState(false);
@@ -1046,16 +1103,21 @@ function EventEditor({
               <option value={calendarId}>Calendar deleted</option>
             )}
             {calendars
-              .filter((c) => c.writable || c.id === event.calendarId)
+              .filter(
+                (c) =>
+                  c.id === event.calendarId ||
+                  (c.writable &&
+                    (existing
+                      ? canMove && (capabilities.calendars[c.id]?.moveEvent ?? true)
+                      : (capabilities.calendars[c.id]?.create ?? true))),
+              )
               .map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
                 </option>
               ))}
           </select>
-          <span className="muted">
-            {calendar.writable ? 'Editable calendar' : 'Read-only calendar'}
-          </span>
+          <span className="muted">{writable ? 'Editable calendar' : 'Read-only calendar'}</span>
         </div>
         <div className="editor-rule" />
         <div className="all-day-control">
@@ -1150,7 +1212,9 @@ function EventEditor({
             setPreview([]);
           }}
           startDate={startDate}
-          disabled={Boolean(onScope && scope === 'occurrence')}
+          disabled={
+            !writable || !(caps?.recurrence ?? true) || Boolean(onScope && scope === 'occurrence')
+          }
         />
         {scope === 'following' && recurrence?.count && !countChanged && (
           <p className="timezone-note">
@@ -1256,6 +1320,7 @@ function EventEditor({
           {existing ? (
             <IconButton
               label="Delete event"
+              disabled={!canDelete}
               className="delete-button"
               onClick={async () => {
                 setBusy(true);
@@ -1324,6 +1389,10 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [runtime, setRuntime] = useState('browser');
 
   const calendar = calendars.find((c) => c.id === defaultCalendarId) ?? emptyCalendar;
+  const [capabilityState, setCapabilityState] = useState<{
+    calendars: Record<string, Capabilities>;
+    events: Record<string, Capabilities>;
+  }>({ calendars: {}, events: {} });
   const [calendarReady, setCalendarReady] = useState(!desktop);
   const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
   const [editing, setEditing] = useState<{
@@ -1388,6 +1457,10 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       .then((snapshot) => {
         if (token !== requestVersion.current) return;
         setCalendars(snapshot.calendars);
+        setCapabilityState({
+          calendars: snapshot.calendarCapabilities ?? {},
+          events: snapshot.eventCapabilities ?? {},
+        });
         setDefaultCalendarId(snapshot.defaultCalendarId);
         setHiddenCalendarIds(snapshot.hiddenCalendarIds);
         setCalendarReady(true);
@@ -1430,6 +1503,10 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   }, []);
   const applySnapshot = (snapshot: CalendarCollectionSnapshot) => {
     setCalendars(snapshot.calendars);
+    setCapabilityState({
+      calendars: snapshot.calendarCapabilities ?? {},
+      events: snapshot.eventCapabilities ?? {},
+    });
     setDefaultCalendarId(snapshot.defaultCalendarId);
     setHiddenCalendarIds(snapshot.hiddenCalendarIds);
     setEvents(snapshot.events);
@@ -1474,7 +1551,12 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       end?: DateTime,
       position?: ClickPosition,
     ) => {
-      if (!calendarReady || !calendar.writable) return;
+      if (
+        !calendarReady ||
+        !calendar.writable ||
+        capabilityState.calendars[calendar.id]?.create === false
+      )
+        return;
       editorAnchor.current = anchor;
       editorPositionRef.current = editorPosition(anchor, position);
       const event = { ...makeEvent(day, allDay), calendarId: calendar.id };
@@ -1482,7 +1564,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       if (end && event.time.kind === 'allDay') event.time.endDate = dateKey(end);
       setEditing({ event, existing: false });
     },
-    [calendar, calendarReady],
+    [calendar, calendarReady, capabilityState],
   );
   const edit = async (event: CalendarEvent, anchor: HTMLElement) => {
     editorAnchor.current = anchor;
@@ -1529,7 +1611,14 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [gestureFailure, setGestureFailure] = useState('');
   const move = async (id: string, target: DateTime, precise = false) => {
     const event = events.find((item) => item.id === id);
-    if (!event || !calendars.find((c) => c.id === event.calendarId)?.writable) return;
+    if (
+      !event ||
+      !calendars.find((c) => c.id === event.calendarId)?.writable ||
+      capabilityState.events[event.id]?.edit === false ||
+      ((event.recurrence || event.occurrence) &&
+        capabilityState.events[event.id]?.recurrence === false)
+    )
+      return;
     try {
       const moved = moveEvent(event, target);
       if (event.time.kind === 'timed' && moved.time.kind === 'timed') {
@@ -1567,6 +1656,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     if (
       !event ||
       !calendars.find((c) => c.id === event.calendarId)?.writable ||
+      capabilityState.events[event.id]?.edit === false ||
+      ((event.recurrence || event.occurrence) &&
+        capabilityState.events[event.id]?.recurrence === false) ||
       event.time.kind !== 'timed'
     )
       return;
@@ -1649,7 +1741,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const week = weekStart(date, firstWeekday());
 
   return (
-    <CalendarsContext.Provider value={calendars}>
+    <CalendarProviders calendars={calendars} capabilities={capabilityState}>
       <CalendarContext.Provider value={calendar}>
         <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'}`} data-runtime={runtime}>
           {sidebar && (
@@ -1830,7 +1922,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                 <button
                   className="new-event-button"
                   ref={newButton}
-                  disabled={!calendarReady || !calendar.writable}
+                  disabled={
+                    !calendarReady ||
+                    !calendar.writable ||
+                    capabilityState.calendars[calendar.id]?.create === false
+                  }
                   aria-label="New event"
                   onClick={(e) => create(date.set({ hour: 9 }), e.currentTarget)}
                 >
@@ -2280,6 +2376,6 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
           </div>
         </div>
       </CalendarContext.Provider>
-    </CalendarsContext.Provider>
+    </CalendarProviders>
   );
 }
