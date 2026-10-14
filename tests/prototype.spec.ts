@@ -94,13 +94,12 @@ for (const popup of ['Settings', 'Keyboard shortcuts']) {
     const opener = page.getByRole('button', { name: `Open ${popup.toLowerCase()}`, exact: true });
     const dialog = page.getByRole('dialog', { name: popup, exact: true });
     const close = page.getByRole('button', { name: `Close ${popup.toLowerCase()}`, exact: true });
-    const shortcutText = 'N creates an event; T returns to today;';
 
     for (const dismissal of ['Escape', 'outside', 'close']) {
       await opener.click();
       await expect(page.getByRole('dialog')).toHaveCount(1);
       await expect(dialog).toBeVisible();
-      await expect(dialog.getByText(shortcutText, { exact: false })).toHaveCount(
+      await expect(dialog.getByRole('list', { name: 'Keyboard shortcuts' })).toHaveCount(
         popup === 'Keyboard shortcuts' ? 1 : 0,
       );
       await expect(dialog.getByLabel('Appearance preference')).toHaveCount(
@@ -125,6 +124,99 @@ for (const popup of ['Settings', 'Keyboard shortcuts']) {
     await expect(page.getByRole('button', { name: /Keep this event,/ })).toBeVisible();
     await page.keyboard.press('Control+z');
     await expect(page.getByRole('button', { name: /Keep this event,/ })).toHaveCount(0);
+  });
+}
+
+for (const [platform, modifier] of [
+  ['MacIntel', 'Cmd'],
+  ['Linux x86_64', 'Ctrl'],
+  ['Win32', 'Ctrl'],
+]) {
+  test(`shortcuts show labeled keycaps and the ${platform} modifier`, async ({ page }) => {
+    await page.addInitScript((value) => {
+      Object.defineProperty(navigator, 'platform', { get: () => value });
+    }, platform);
+    await page.goto('/?date=2026-10-09&scenario=empty&theme=light');
+    await page.getByRole('button', { name: 'Open keyboard shortcuts', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Keyboard shortcuts', exact: true });
+    const rows = dialog.getByRole('list', { name: 'Keyboard shortcuts' }).getByRole('listitem');
+    await expect(rows).toHaveCount(10);
+    await expect(rows.locator(':scope > span:first-child')).toHaveText([
+      'New event',
+      'Go to today',
+      'Month view',
+      'Week view',
+      'Day view',
+      'Undo',
+      'Edit focused event',
+      'Create event on focused date or time slot',
+      'Navigate month dates',
+      'Dismiss popup/editor or cancel selection',
+    ]);
+    for (const [index, key] of ['N', 'T', '1', '2', '3'].entries()) {
+      await expect(rows.nth(index).locator('kbd')).toHaveText(key);
+    }
+    const undoKeys = rows.nth(5).locator('kbd');
+    await expect(undoKeys).toHaveCount(2);
+    await expect(undoKeys.first().getByText(modifier, { exact: true })).toBeVisible();
+    await expect(undoKeys.last()).toHaveText('Z');
+    await expect(rows.nth(6).locator('kbd')).toHaveText('Enter');
+    await expect(rows.nth(7).locator('kbd')).toHaveText('Enter');
+    await expect(rows.nth(8).locator('kbd .sr-only')).toHaveText([
+      'Arrow left',
+      'Arrow up',
+      'Arrow down',
+      'Arrow right',
+    ]);
+    await expect(rows.nth(8).locator('.shortcut-separator .sr-only')).toHaveText([
+      'or',
+      'or',
+      'or',
+    ]);
+    await expect(rows.nth(9).locator('kbd .sr-only')).toHaveText('Escape');
+  });
+}
+
+for (const theme of ['light', 'dark']) {
+  test(`${theme} shortcuts fit the window and keep keycaps aligned`, async ({ page }, testInfo) => {
+    await page.goto(`/?date=2026-10-09&scenario=empty&theme=${theme}`);
+    await page.getByRole('button', { name: 'Open keyboard shortcuts', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Keyboard shortcuts', exact: true });
+    for (const viewport of [
+      { width: 1440, height: 960 },
+      { width: 900, height: 600 },
+      { width: 900, height: 420 },
+    ]) {
+      await page.setViewportSize(viewport);
+      const bounds = await dialog.boundingBox();
+      expect(bounds).not.toBeNull();
+      expect(bounds!.y).toBeGreaterThanOrEqual(17);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height - 17);
+      if (viewport.height >= 600) {
+        const needsScroll = await dialog
+          .getByRole('list', { name: 'Keyboard shortcuts' })
+          .evaluate((list) => list.scrollHeight > list.clientHeight);
+        expect(needsScroll).toBe(false);
+      }
+      const layout = await dialog.locator('.shortcut-row').evaluateAll((rows) =>
+        rows.map((row) => {
+          const label = row.children[0].getBoundingClientRect();
+          const keys = row.children[1].getBoundingClientRect();
+          return { labelRight: label.right, keysLeft: keys.left, keysRight: keys.right };
+        }),
+      );
+      for (const row of layout) {
+        expect(row.keysLeft - row.labelRight).toBeGreaterThanOrEqual(11);
+        expect(Math.abs(row.keysRight - layout[0].keysRight)).toBeLessThan(1);
+      }
+      await dialog.getByText('Dismiss popup/editor or cancel selection').scrollIntoViewIfNeeded();
+      await expect(dialog.getByText('Esc', { exact: true })).toBeInViewport();
+      await dialog.getByText('New event', { exact: true }).scrollIntoViewIfNeeded();
+      await page.screenshot({
+        path: testInfo.outputPath(`shortcuts-${theme}-${viewport.width}x${viewport.height}.png`),
+        animations: 'disabled',
+      });
+    }
   });
 }
 

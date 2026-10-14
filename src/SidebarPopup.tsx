@@ -9,6 +9,7 @@ export function SidebarPopup({
   closeLabel,
   opener,
   children,
+  className,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -16,13 +17,14 @@ export function SidebarPopup({
   closeLabel: string;
   opener: RefObject<HTMLElement | null>;
   children: ReactNode;
+  className?: string;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content
-          className="settings-dialog"
+          className={['settings-dialog', className].filter(Boolean).join(' ')}
           aria-describedby={undefined}
           onCloseAutoFocus={(event) => {
             event.preventDefault();

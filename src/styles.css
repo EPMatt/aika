@@ -1024,6 +1024,63 @@ input {
   margin-bottom: 0;
   font-size: 10px;
 }
+.shortcuts-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 36px);
+}
+.shortcuts-dialog .settings-heading {
+  flex-shrink: 0;
+}
+.shortcut-list {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0 0 3px;
+  min-height: 0;
+  overflow-y: auto;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.shortcut-row > span:first-child {
+  min-width: 0;
+}
+.shortcut-keys,
+.shortcut-key-part {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.shortcut-separator {
+  color: var(--muted);
+  font-size: 11px;
+}
+.shortcut-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--canvas);
+  box-shadow: 0 2px 0 var(--line-strong);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
 .sr-only {
   position: absolute;
   width: 1px;

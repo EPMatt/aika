@@ -51,6 +51,7 @@ import type { MutationScope } from './generated/MutationScope';
 import type { EventSeries } from './generated/EventSeries';
 import type { EventMutation } from './generated/EventMutation';
 import { SidebarPopup } from './SidebarPopup';
+import { KeyboardShortcuts } from './KeyboardShortcuts';
 import type { ServiceError } from './generated/ServiceError';
 import type { Capabilities } from './generated/Capabilities';
 
@@ -2364,12 +2365,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
             title="Keyboard shortcuts"
             closeLabel="Close keyboard shortcuts"
             opener={popupOpener}
+            className="shortcuts-dialog"
           >
-            <p className="settings-footnote">
-              N creates an event; T returns to today; 1/2/3 switches views; Ctrl/Cmd+Z undoes. Enter
-              opens a focused event to edit its dates and times. Enter on a calendar date or time
-              column creates an event. Arrow keys navigate month dates.
-            </p>
+            <KeyboardShortcuts />
           </SidebarPopup>
           <div className="sr-only" role="status" aria-live="polite">
             {announcement}
