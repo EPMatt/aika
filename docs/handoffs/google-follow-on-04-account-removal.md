@@ -1,0 +1,51 @@
+# Google follow-on 04 — Full account removal
+
+Date: 2026-10-19. Status: implemented; live phase 04 acceptance remains outstanding. This belongs to the separate [Google follow-on sequence](../plans/google-integration-follow-on-2026-10-19.md), after [phase 03](google-follow-on-03-following-recovery.md). Historical handoffs retain their recorded results.
+
+Implementation commit: `9359340f3af576c9b5b4dcc671bdede7c1c9030b` (`feat: add durable Google account removal`). This handoff is committed separately as the phase closeout.
+
+## Implemented behavior and architectural decisions
+
+[Phase 04 implementation of G12](../architecture.md#phase-04-implementation-of-g12) implements durable full account cleanup. G01–G11 and G13 retain their meaning; no ADR identifiers were reassigned. Disconnect retains cached data and calendar exclusion retains its remote identity. Permanent account removal is a separate action.
+
+- **Manage connected account → Remove account from aika** reviews selected/excluded calendars, cached resources, unresolved groups/conflicts and attempted groups. Confirmation checks an opaque revision transactionally. Unresolved work is refused by default; explicit discard and permanent-removal confirmations acknowledge that already sent or uncertain writes can still take effect in Google.
+- A committed removal record fences sync publication, disables calendar writes and prevents reconnecting the old account. Default selection is repaired. Cleanup deletes credentials before transactionally deleting account-owned calendars, effective data/exceptions, remote mappings/shadows/projections, incoming staging, cursors/coverage, groups/steps, conflicts and leases. It removes affected session undo. Other accounts and local calendars remain intact.
+- A cross-process OS file lock, shared by the service and production Google adapter at the canonical database path, spans local credential checks/writes/deletion and cleanup. It deliberately serializes credential operations across identities in that database; provider HTTP runs without it. The database retains only an opaque identity hash, lifecycle epoch and state after completion, together with a global monotonic clock.
+- Explicit OAuth sessions capture a lifecycle baseline. Credential persistence and account recording both recheck it. Refresh releases the identity lock for HTTP and checks its baseline again before writing credentials. Late work cannot restore a removed account, including after a new sign-in. Deferred disconnect cleanup carries a generation check as well, preventing an old disconnect from deleting newly signed-in credentials. Completion advances the generation again, rejecting sessions begun during cleanup. Fresh explicit sign-in after completion renews the lifecycle and creates a new account ID. Cleanup retries check the old ID under the lock before deleting credentials, so they cannot delete the fresh account's credentials.
+- Credential-store failure retains a visible cleanup-in-progress account. Unlock the store and retry removal; startup also retries cleanup without preventing local startup. Reconnection is disabled while cleanup remains pending. Crash recovery repeats idempotent credential deletion before transactional cache cleanup; no compensating Google requests are sent.
+
+Removal deletes logical aika records and credentials; it does not delete Google calendars, revoke Google's authorization grant, undo remote writes, or promise secure erasure of SQLite file pages. Desktop and CLI share the production database and lock. Embedders using separate databases must isolate their credential namespace as well.
+
+## Schema/API and migration compatibility
+
+Schema v7 adds `accounts.removal_in_progress`, `identity_lifecycles`, `lifecycle_clock`, and a reconnect fence trigger. The migration is transactional and leaves existing group snapshots, dependencies, reserved IDs, attempts and acknowledgements unchanged. Failure rolls back to v6; pre-v7 binaries cannot open upgraded databases.
+
+Generated contracts add `AccountRemovalReview` and optional `AccountSummary.removalInProgress`. Native IPC adds `review_account_removal` and `remove_account(expected, discard)`; Rust owns revision checks, unresolved-work refusal and lifecycle enforcement. The provider boundary adds lifecycle-baseline access and local credential deletion for checked cleanup. No credentials enter SQLite or renderer/domain contracts. Existing CLI and recurrence contracts retain their behavior.
+
+## Verification and evidence
+
+Final automated checks:
+
+| Check                                                                                            | Result                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CARGO_BUILD_JOBS=1 pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace`             | Passed: 134 core, 18 CLI integration, 11 domain. Three opt-in/helper tests ignored; the cross-process lock parent runs its helper explicitly. OAuth fixtures ran with local loopback access. |
+| `pnpm rust clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings` | Passed.                                                                                                                                                                                      |
+| `pnpm rust fmt --manifest-path src-tauri/Cargo.toml --all --check`                               | Passed.                                                                                                                                                                                      |
+| `pnpm types:generate`, before/after declaration SHA-256 comparison                               | Passed; no generated-contract drift.                                                                                                                                                         |
+| `pnpm build`                                                                                     | Passed: WASM, TypeScript and production Vite build; kept separate from running browser tests.                                                                                                |
+| `pnpm test`                                                                                      | Passed: 26 tests across 3 files.                                                                                                                                                             |
+| `CAL_CHROMIUM_PATH=/usr/bin/chromium pnpm test:ui --workers=2`                                   | 53 passed; one existing calendar IPC scenario exceeded its 30-second overall limit.                                                                                                          |
+| `CAL_CHROMIUM_PATH=/usr/bin/chromium pnpm test:ui tests/calendar-ipc.spec.ts --workers=1`        | Passed: all 3. All 54 distinct browser scenarios pass across the full run and serial rerun, including removal consent, recovery and accessibility.                                           |
+| `pnpm format:check`, `git diff --check`, edited-document local file-link checks                  | Passed; final handoff formatting checked separately.                                                                                                                                         |
+
+Logs are retained locally under `artifacts/google-follow-on-04/` (ignored); Playwright captures/results use `test-results/`. Initial OAuth tests denied loopback by the sandbox were rerun successfully with loopback access. Intermediate migration fixtures, native tuple wiring and the new-account renderer guard were corrected before final verification. A concurrent browser run hit one existing scenario's overall time limit; its serial rerun passed as recorded above.
+
+New regressions cover independent-connection stale reviews, unresolved-work refusal, attempted/partially acknowledged group counts, store failures and restart retries, complete cache/staging/group deletion with foreign-key checks, default repair, other-account isolation, late sync fencing, crash after credential deletion, stale cleanup after fresh sign-in, v6 pending-work migration/rollback, cross-process identity locking, late OAuth callbacks, refresh results and deferred disconnects after removal. Browser coverage verifies counts, warnings, both confirmations, stale-review rejection, cleanup retries and accessibility. Existing workspace regressions retain recurrence, authentication/permission changes, worker recovery and CLI coverage.
+
+No live Google or real OS credential-store validation was performed for phase 04. The [disposable phase 04 scenarios](../integrations/google-calendar.md#follow-on-04-disposable-acceptance-scenarios) remain unexecuted. Existing Google live validation remains confirmed by the user on 2026-10-19 without platform/client/revision details; it does not establish acceptance for these additions or every installed platform. The OS credential/configuration smoke and trusted native-input checks retain their separate requirements.
+
+## Remaining restrictions and next phase
+
+Google remote calendars and grants remain intact after removal. Uncertain requests may still complete remotely. Cleanup requires restoring access to the OS credential store; until then the account is retained and fenced. This phase does not expand recurrence compatibility or meeting capabilities.
+
+Next is Google follow-on 05: meeting organization, attendee-preserving mutations and durable notification policy. Carry forward everyone/external-only/none choices, with everyone as the default and an explicit warning before none. Invitation responses follow in phase 06. Regional/DST writes and structural whole-series schedule changes remain gated by separate equivalence/exception evidence.
