@@ -123,7 +123,7 @@ jobs:
       - name: Build desktop packages with the CLI
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-          AIKA_GOOGLE_CLIENT_ID: ${{ vars.AIKA_GOOGLE_CLIENT_ID }}
+          AIKA_GOOGLE_CLIENT_ID: ${{ secrets.AIKA_GOOGLE_CLIENT_ID }}
           AIKA_GOOGLE_CLIENT_SECRET: ${{ secrets.AIKA_GOOGLE_CLIENT_SECRET }}
         run: node scripts/release.mjs build "$RELEASE_TAG" '${{ matrix.target }}'
       - name: Inspect packaged desktop and CLI

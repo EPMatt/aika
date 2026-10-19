@@ -100,7 +100,7 @@ jobs:
           path: test-results/native/
       - run: pnpm alpha:build ${{ matrix.target }}
         env:
-          AIKA_GOOGLE_CLIENT_ID: ${{ vars.AIKA_GOOGLE_CLIENT_ID }}
+          AIKA_GOOGLE_CLIENT_ID: ${{ secrets.AIKA_GOOGLE_CLIENT_ID }}
           AIKA_GOOGLE_CLIENT_SECRET: ${{ secrets.AIKA_GOOGLE_CLIENT_SECRET }}
       - name: Inspect Linux RPM and candidate checksums
         if: runner.os == 'Linux'
