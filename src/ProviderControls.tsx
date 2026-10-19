@@ -340,10 +340,9 @@ function ConnectionDialog({
     }
   };
   useEffect(() => {
-    // Cleanup cancels Strict Mode's rehearsal before it can initiate browser/network work.
+    // Existing accounts can load their checklist; new connections require an explicit click.
     const kickoff = setTimeout(() => {
       if (account?.connectionState === 'connected') void discover(account.id, generation.current);
-      else if (!account && provider.connectionAvailable) void start();
     }, 0);
     return () => {
       clearTimeout(kickoff);
@@ -419,7 +418,7 @@ function ConnectionDialog({
               disabled={!provider.connectionAvailable || closing}
               onClick={() => void start()}
             >
-              Connect account
+              {provider.id === 'google' ? 'Sign in with Google' : 'Connect account'}
             </button>
           )}
           {!working && accountId.current && failure && (

@@ -404,31 +404,7 @@ fn authorization(config: &ClientConfig, redirect: &str, state: &str, verifier: &
     url
 }
 fn open_browser(url: &Url) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let mut cmd = std::process::Command::new("xdg-open");
-    #[cfg(target_os = "macos")]
-    let mut cmd = std::process::Command::new("open");
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("rundll32.exe");
-        c.arg("url.dll,FileProtocolHandler");
-        c
-    };
-    let mut child = cmd
-        .arg(url.as_str())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| {
-            error(
-                "browser",
-                "Could not open the system browser. Check the default browser and try again.",
-            )
-        })?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    crate::browser::open(url)
 }
 // Only a complete, matching callback consumes the listener. Malformed/wrong-state probes do not.
 fn callback(request: &str, state: &str, port: u16) -> Result<Option<String>> {
@@ -1041,10 +1017,14 @@ mod tests {
         refreshes: AtomicUsize,
         fail_refresh: AtomicBool,
         fail_page: AtomicBool,
+        fail_browser: AtomicBool,
     }
     impl GoogleTransport for Transport {
         fn browser(&self, url: &Url) -> Result<()> {
             *self.url.lock().unwrap() = Some(url.clone());
+            if self.fail_browser.load(Ordering::SeqCst) {
+                return Err(error("browser", "Could not open the system browser."));
+            }
             Ok(())
         }
         fn token(&self, _: &ClientConfig, form: Vec<(&str, String)>) -> Result<TokenResponse> {
@@ -1307,8 +1287,9 @@ mod tests {
     }
     #[test]
     fn denial_cancellation_timeout_and_store_failures_close_listener_without_identity() {
-        for outcome in ["denied", "cancelled", "timeout", "store"] {
+        for outcome in ["denied", "cancelled", "timeout", "store", "browser"] {
             let (p, t, store) = fixture();
+            t.fail_browser.store(outcome == "browser", Ordering::SeqCst);
             let s = p.start_connection().unwrap();
             let url = browser_url(&t);
             let pairs: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
@@ -1326,11 +1307,16 @@ mod tests {
                     store.fail_write.store(true, Ordering::SeqCst);
                     send(&t, "code=disposable-code");
                 }
+                "browser" => {}
                 _ => unreachable!(),
             }
             let (session, identity) = finished(&p, &s.id);
             closed(port);
             assert!(identity.is_none());
+            if outcome == "browser" {
+                assert_eq!(session.failure.as_ref().unwrap().code, "browser");
+                assert_eq!(t.exchanges.load(Ordering::SeqCst), 0);
+            }
             assert!(store.values.lock().unwrap().is_empty());
             assert_eq!(
                 session.progress,

@@ -58,6 +58,8 @@ for (const theme of ['light', 'dark']) {
         commands: [] as string[],
         selections: [] as string[][],
         failDiscovery: false,
+        failBrowser: false,
+        failBrowserAfterStart: false,
         cancelCount: 0,
       };
       const fixture = (window as any).googleTest;
@@ -125,6 +127,10 @@ for (const theme of ['light', 'dark']) {
                   eventCapabilities: {},
                 };
               case 'start_connection':
+                if (fixture.failBrowser) {
+                  fixture.failBrowser = false;
+                  throw { code: 'browser', message: 'Could not open the system browser.' };
+                }
                 active = true;
                 return {
                   id: 'session',
@@ -133,6 +139,16 @@ for (const theme of ['light', 'dark']) {
                   failure: null,
                 };
               case 'connection_status':
+                if (fixture.failBrowserAfterStart) {
+                  fixture.failBrowserAfterStart = false;
+                  active = false;
+                  return {
+                    id: 'session',
+                    progress: 'failed',
+                    accountId: null,
+                    failure: { code: 'browser', message: 'The browser launcher failed.' },
+                  };
+                }
                 connected = true;
                 active = false;
                 return {
@@ -206,6 +222,22 @@ for (const theme of ['light', 'dark']) {
     await plus.click();
     await page.getByRole('menuitem', { name: 'Google Calendar' }).click();
     const dialog = page.getByRole('dialog', { name: 'Connect Google Calendar' });
+    const signIn = dialog.getByRole('button', { name: 'Sign in with Google' });
+    await expect(signIn).toBeVisible();
+    expect(await page.evaluate(() => (window as any).googleTest.commands)).not.toContain(
+      'start_connection',
+    );
+    await expect(dialog.getByRole('status')).toHaveCount(0);
+    await page.evaluate(() => ((window as any).googleTest.failBrowser = true));
+    await signIn.click();
+    await expect(dialog.getByRole('alert')).toHaveText('Could not open the system browser.');
+    await expect(signIn).toBeEnabled();
+    await page.evaluate(() => ((window as any).googleTest.failBrowserAfterStart = true));
+    await signIn.click();
+    await expect(dialog.getByRole('alert')).toHaveText('The browser launcher failed.');
+    await expect(dialog.getByRole('status')).toHaveCount(0);
+    await expect(signIn).toBeEnabled();
+    await signIn.click();
     await expect(dialog.getByRole('checkbox', { name: 'Work' })).toBeChecked();
     await expect(dialog.getByRole('checkbox', { name: 'Hidden remotely' })).toBeChecked();
     await expect(dialog.getByRole('checkbox', { name: 'Availability' })).toBeDisabled();
@@ -332,6 +364,7 @@ test('closing during connection startup cancels the late session and preserves L
   await expect(page.getByRole('menuitem', { name: 'On this device' })).toBeFocused();
   await page.getByRole('menuitem', { name: 'Google Calendar' }).click();
   const connection = page.getByRole('dialog', { name: 'Connect Google Calendar' });
+  await connection.getByRole('button', { name: 'Sign in with Google' }).click();
   await expect(connection.getByRole('status')).toHaveText('Opening your browser…');
   await connection.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(connection).not.toBeVisible();

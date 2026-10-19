@@ -12,11 +12,21 @@ struct OsStore;
 fn entry(account: &str) -> Result<keyring::Entry> {
     keyring::Entry::new("dev.projectcal.desktop", account).map_err(store_error)
 }
-fn store_error(_: keyring::Error) -> ServiceError {
-    error(
-        "credentialUnavailable",
-        "Unlock or restore access to the system credential store before connecting an account.",
-    )
+fn store_error(cause: keyring::Error) -> ServiceError {
+    // Never expose backend error text: it can contain account attributes or secret bytes.
+    let message = match cause {
+        keyring::Error::NoStorageAccess(_) =>
+            "The system credential store could not be accessed. Unlock your keyring or wallet, approve any access prompt, and check that a default keyring exists, then try again.",
+        keyring::Error::Ambiguous(_) =>
+            "Multiple matching credentials were found in the system credential store. Resolve duplicate aika entries in your password manager, then try again.",
+        keyring::Error::BadEncoding(_) =>
+            "The saved account credential could not be read. Reconnect the account to replace it.",
+        #[cfg(target_os = "linux")]
+        keyring::Error::PlatformFailure(_) =>
+            "Could not use the Linux Secret Service. Check that a Secret Service provider (such as GNOME Keyring or KWallet) is available in your desktop session and has a default keyring, then try again.",
+        _ => "Could not use the system credential store. Restore access to your keyring or wallet, then try again.",
+    };
+    error("credentialUnavailable", message)
 }
 impl CredentialStore for OsStore {
     fn get(&self, account: &str) -> Result<Option<String>> {
@@ -74,6 +84,24 @@ impl CredentialService {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    #[test]
+    fn store_errors_give_recovery_guidance_without_backend_details() {
+        let sensitive = "private-account-and-token";
+        let backend = || Box::new(std::io::Error::other(sensitive));
+        let denied = store_error(keyring::Error::NoStorageAccess(backend()));
+        assert!(denied.message.contains("Unlock"));
+        let platform = store_error(keyring::Error::PlatformFailure(backend()));
+        #[cfg(target_os = "linux")]
+        assert!(platform.message.contains("Linux Secret Service"));
+        let ambiguous = store_error(keyring::Error::Ambiguous(Vec::new()));
+        assert!(ambiguous.message.contains("duplicate"));
+        let encoding = store_error(keyring::Error::BadEncoding(sensitive.as_bytes().to_vec()));
+        assert!(encoding.message.contains("Reconnect"));
+        for failure in [denied, platform, ambiguous, encoding] {
+            assert_eq!(failure.code, "credentialUnavailable");
+            assert!(!format!("{failure:?}").contains(sensitive));
+        }
+    }
     #[derive(Default)]
     struct Memory(Mutex<std::collections::BTreeMap<String, String>>);
     impl CredentialStore for Memory {

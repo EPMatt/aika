@@ -1,3 +1,4 @@
+mod browser;
 pub mod contracts;
 pub mod credentials;
 pub mod providers;
