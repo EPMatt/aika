@@ -1,6 +1,6 @@
 # Google Calendar integration
 
-Google account connection, cached incoming synchronization, and ordinary-event two-way editing, compatible recurring writes and organizer-owned meetings are implemented and **experimental**. Automated fixtures cover these boundaries. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform acceptance and newly introduced behavior require separate evidence. See [accepted decisions G01–G13](../architecture.md#connected-calendar-decisions), [release verification](../releases.md#unresolved-verification), and the [roadmap](../roadmap.md).
+Google account connection, cached incoming synchronization, and ordinary-event two-way editing, compatible recurring writes, organizer-owned meetings and invitation responses are implemented and **experimental**. Automated fixtures cover these boundaries. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform acceptance and newly introduced behavior require separate evidence. See [accepted decisions G01–G13](../architecture.md#connected-calendar-decisions), [release verification](../releases.md#unresolved-verification), and the [roadmap](../roadmap.md).
 
 ## Google setup and authentication boundary
 
@@ -177,7 +177,7 @@ Record OS/keyring, client/revision and actual outcomes separately from automated
 
 ## Follow-on 05: organizing meetings
 
-Organizer-owned default Google events support creating meetings, changing guests and their optional status, editing event details and cancelling meetings. The editor displays the organizer, existing responses and HTTPS conference links. Enter one guest email per line; append ` optional` for an optional guest. Email identities and organizer authority are checked natively. Invitees can view the details; accepting/tentatively accepting/declining remains phase 06.
+Organizer-owned default Google events support creating meetings, changing guests and their optional status, editing event details and cancelling meetings. The editor displays the organizer, existing responses and HTTPS conference links. Enter one guest email per line; append ` optional` for an optional guest. Email identities and organizer authority are checked natively. Invitees retain read-only organizer fields; phase 06 adds the separate response actions below.
 
 Notify guests defaults to **Everyone**. **External guests only** maps to Google's `externalOnly`; **None** requires acknowledging that silent updates can prevent synchronization or lose invitations. [Google documents this propagation warning](https://developers.google.com/workspace/calendar/api/v3/reference/events/insert). Choices survive offline operation, restart, retry, conflict recovery and checked compensation. Delivered invitations cannot be recalled by undo or local discard, and recovering ambiguous requests cannot promise exactly-once email delivery.
 
@@ -197,3 +197,24 @@ These scenarios are unexecuted. Earlier Google validation remains confirmed by t
 6. Undo unsent and acknowledged guest edits, create/cancel, and interrupted following operations after forward reconciliation. Verify checked compensation uses the original delivery policy, preserves responses, and clearly cannot recall delivered invitations. Verify recreation of a conference-bearing cancelled meeting is refused safely.
 
 Record source revision, platform/client configuration, guest mailbox types and actual Google/calendar/email observations separately from fixture results in the [phase 05 handoff](../handoffs/google-follow-on-05-meeting-organization.md).
+
+### Invitation responses (Google follow-on 06)
+
+The invitation editor offers **Accept**, **Tentative**, and **Decline** when the backend can verify the authenticated attendee on their own selected, active, writable Google calendar copy. Organizer-controlled title, dates, guests and cancellation stay read-only. The renderer supplies no attendee identity. The backend checks both verified account email and Google's `self` participant metadata; delegated/shared copies and unproven aliases are conservatively unavailable.
+
+Choose **This occurrence** or **Whole series / event** where offered. Whole-series responses review the master separately from an occurrence. Following RSVP is never offered and is rejected natively. Default, non-cancelled invitations and the existing exact UTC/all-day recurrence subset are supported; richer/DST schedules and special/locked events remain restricted. Existing conference links remain available and are preserved.
+
+Responses commit offline intent to the existing durable outbox and appear immediately in meeting details. Participant-only conditional patches use `attendeesOmitted`, one authenticated attendee and their response; other guests and organizer fields never enter the patch. [Google documents this participant-only update behavior](https://developers.google.com/workspace/calendar/api/v3/reference/events). Notifications use everyone. Retry reconciles a lost reply against the actual response before resending; email delivery cannot be promised exactly once. Google also documents limited response propagation for events with more than 200 guests.
+
+Stale revisions produce the existing checked conflict review, displaying pending and observed participant responses. Keep local retains the response while preserving observed organizer edits; Keep Google retires it. Unsent undo cancels the response. Reconcile an attempted response before undo queues checked participant-only compensation; another changed response blocks compensation. Undo can restore the previous `needsAction` state, but cannot recall notifications. Pending work survives restart; session undo history does not. Disconnect, calendar exclusion and account removal include these groups in their existing checked unresolved-work rules.
+
+### Follow-on 06 disposable acceptance scenarios
+
+1. With consenting disposable organizer and attendee accounts, invite the authenticated attendee on their own Google calendar. Accept, tentatively accept and decline; independently check organizer and attendee calendars, other guests' responses, event metadata and existing conference links. Record actual provider/email observations.
+2. Repeat with an omitted guest representation, another attendee marked as accepted/declined and provider-only guest fields. Confirm the request changes only the authenticated response. Verify delegated/shared calendars and mismatched `self`/account email do not expose response authority or organizer editing.
+3. Use a supported all-day and UTC recurring invitation, including a moved occurrence. Respond once to an occurrence and once to the whole series; verify actual provider instance identity, unaffected occurrences/other guests and no following split. Verify unsupported DST/richer schedules remain restricted.
+4. Queue responses offline, restart and reconnect. Interrupt after provider success before local acknowledgement, then retry. Verify response-state reconciliation, no duplicate event resources and actual notification behavior without assuming exactly-once mail.
+5. Change organizer fields or the participant response concurrently. Check stale review refusal, observed/pending response display, Keep local preserving organizer changes and Keep Google retiring intent. Revoke permission/authentication and recover without losing queued response intent.
+6. Undo before sending, then after acknowledgement. Check the previous response is restored conditionally, including `needsAction`, while organizer/other guest fields survive. Attempt undo while delivery is uncertain and after another participant-response change; verify reconciliation/conflict protection. Exercise discard, exclusion and account removal with queued responses.
+
+Record source revision, platform/client configuration, actual account/calendar copy identities and provider observations in the [phase 06 handoff](../handoffs/google-follow-on-06-invitation-responses.md). These scenarios have not been run for phase 06. Existing live Google validation remains confirmed by the user on 2026-10-19; it does not establish live acceptance for these additions.

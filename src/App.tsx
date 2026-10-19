@@ -937,7 +937,9 @@ function EventEditor({
   resetAffected = false,
   onPreview,
   expectedSeries,
+  onRespond,
 }: {
+  onRespond: () => void;
   expectedSeries?: EventSeries;
   scope?: MutationScope;
   onScope?: (scope: MutationScope) => void;
@@ -1003,6 +1005,25 @@ function EventEditor({
   const [details, setDetails] = useState(Boolean(location || notes));
   const [error, setError] = useState('');
   const [meeting, setMeeting] = useState<MeetingDetails | null>(null);
+  const [responseScope, setResponseScope] = useState<'occurrence' | 'series'>(
+    event.occurrence ? 'occurrence' : 'series',
+  );
+  const [responseReview, setResponseReview] = useState<MeetingDetails | null>(null);
+  useEffect(() => {
+    if (!google || !desktop) return;
+    let active = true;
+    setResponseReview(null);
+    const target = responseScope === 'series' ? event.id.split('@')[0] : event.id;
+    calendarClient
+      .meetingDetails(target)
+      .then((details) => {
+        if (active) setResponseReview(details);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [google, event.id, responseScope]);
   const [meetingExpected, setMeetingExpected] = useState<EventSeries | null>(null);
   const [guestText, setGuestText] = useState('');
   const [guestsChanged, setGuestsChanged] = useState(false);
@@ -1153,6 +1174,62 @@ function EventEditor({
               Join meeting
             </a>
           ))}
+          {meeting?.response && (
+            <div>
+              <label>
+                Respond to
+                <select
+                  aria-label="Invitation response scope"
+                  value={responseScope}
+                  disabled={busy}
+                  onChange={(e) => setResponseScope(e.target.value as 'occurrence' | 'series')}
+                >
+                  {meeting.response.scopes.map((value) => (
+                    <option key={value} value={value}>
+                      {value === 'occurrence' ? 'This occurrence' : 'Whole series / event'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p>
+                Your response:{' '}
+                {responseReview
+                  ? (responseReview.response?.current ?? 'Unavailable for this scope')
+                  : 'Loading…'}
+              </p>
+              {(['accepted', 'tentative', 'declined'] as const).map((response) => (
+                <button
+                  type="button"
+                  key={response}
+                  disabled={busy || !responseReview?.response}
+                  onClick={async () => {
+                    if (!responseReview) return;
+                    setBusy(true);
+                    setError('');
+                    try {
+                      await calendarClient.respondToInvitation({
+                        target: responseScope === 'series' ? event.id.split('@')[0] : event.id,
+                        scope: responseScope,
+                        response,
+                        expectedRevision: responseReview.revision,
+                      });
+                      onRespond();
+                    } catch (err) {
+                      setError(errorMessage(err));
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  {response === 'accepted'
+                    ? 'Accept'
+                    : response === 'tentative'
+                      ? 'Tentative'
+                      : 'Decline'}
+                </button>
+              ))}
+            </div>
+          )}
           {writable && (
             <>
               <label>
@@ -2282,6 +2359,8 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                                         ? `Occurrence ${intent.originalStart}`
                                         : 'Series'}{' '}
                                       · Notify: {intent.notifications}.{' '}
+                                      {intent.response &&
+                                        `Your response: ${intent.response.desired}. Google response: ${conflict.remoteResponses?.[intent.originalStart ?? 'series'] ?? 'unavailable'}. `}
                                       {intent.guests &&
                                         `Local guests: ${intent.guests.map((g) => `${g.email}${g.optional ? ' (optional)' : ''}`).join(', ') || 'None'}`}
                                     </p>
@@ -2560,6 +2639,10 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                         return after ? previewRecurrence(after.event) : [];
                       }
                       return previewRecurrence(event);
+                    }}
+                    onRespond={() => {
+                      setEditing(null);
+                      refresh('Invitation response saved. Undo is available.');
                     }}
                     onClose={() => setEditing(null)}
                     onSave={async (event, resetExceptions, countChanged, meeting) => {

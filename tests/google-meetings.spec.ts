@@ -1,9 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
-async function fixture(page: Page, owned = true) {
+async function fixture(page: Page, owned = true, recurring = false) {
   await page.addInitScript(
-    ({ owned }) => {
+    ({ owned, recurring }) => {
       Object.defineProperty(window, 'isTauri', { value: true });
       const date = new Date();
       const key = (d: Date) =>
@@ -17,6 +17,27 @@ async function fixture(page: Page, owned = true) {
         notes: '',
         time: { kind: 'allDay', startDate: key(date), endDate: key(tomorrow) },
       };
+      const master = recurring
+        ? {
+            ...event,
+            recurrence: {
+              frequency: 'daily',
+              interval: 1,
+              weekdays: [],
+              monthlyOn: 'date',
+              until: null,
+              count: 3,
+            },
+          }
+        : event;
+      if (recurring) {
+        (event as any).occurrence = {
+          seriesId: master.id,
+          originalStart: event.time.startDate,
+          expected: 'fixture',
+        };
+        event.id = `${master.id}@${event.time.startDate}`;
+      }
       const caps = {
         read: true,
         create: true,
@@ -34,7 +55,13 @@ async function fixture(page: Page, owned = true) {
         connectionState: 'connected',
         selectedCalendarIds: ['google'],
       };
-      const state = { requests: [] as any[], event: event as any };
+      const state = {
+        requests: [] as any[],
+        event: event as any,
+        responses: [] as any[],
+        response: 'needsAction',
+        failResponse: false,
+      };
       (window as any).meetingFixture = state;
       Object.defineProperty(window, '__TAURI_INTERNALS__', {
         value: {
@@ -73,18 +100,36 @@ async function fixture(page: Page, owned = true) {
                   syncStatus: [],
                 };
               case 'get_event_series':
-                return { event: state.event, exceptions: [] };
+                return { event: recurring ? master : state.event, exceptions: [] };
               case 'meeting_details':
                 return {
                   organizer: 'owner@example.invalid',
                   organizerOwned: owned,
+                  response: owned
+                    ? null
+                    : {
+                        current: state.response,
+                        scopes:
+                          recurring && args.target.includes('@')
+                            ? ['occurrence', 'series']
+                            : ['series'],
+                      },
                   attendees: [
                     { email: 'guest@example.invalid', optional: true, response: 'accepted' },
                   ],
                   attendeesComplete: true,
                   conferenceLinks: ['https://meet.google.com/fixture'],
-                  revision: 'meeting-r1',
+                  revision: recurring && args.target.includes('@') ? 'occurrence-r1' : 'meeting-r1',
                 };
+              case 'respond_to_invitation':
+                if (state.failResponse)
+                  throw {
+                    code: 'conflict',
+                    message: 'Invitation changed. Reload before responding.',
+                  };
+                state.responses.push(args.request);
+                state.response = args.request.response;
+                return;
               case 'mutate_meeting':
                 state.requests.push(args.request);
                 state.event = args.request.event;
@@ -96,7 +141,7 @@ async function fixture(page: Page, owned = true) {
         },
       });
     },
-    { owned },
+    { owned, recurring },
   );
   await page.goto('/');
   await page
@@ -172,4 +217,65 @@ test('invitee sees responses and conference links while organizer fields remain 
   await expect(editor.getByLabel('Notify guests')).toHaveCount(0);
   await expect(editor.getByRole('button', { name: 'Save changes', exact: true })).toBeDisabled();
   await expect(editor.getByRole('button', { name: 'Delete event', exact: true })).toBeDisabled();
+});
+
+for (const [label, response] of [
+  ['Accept', 'accepted'],
+  ['Tentative', 'tentative'],
+  ['Decline', 'declined'],
+] as const) {
+  test(`invitee can ${label.toLowerCase()} through checked participant-only intent`, async ({
+    page,
+  }) => {
+    await fixture(page, false);
+    const editor = page.getByRole('dialog', { name: 'Event editor' });
+    await expect(editor.getByLabel('Invitation response scope')).toHaveValue('series');
+    await expect(editor.getByLabel('Invitation response scope').getByRole('option')).toHaveCount(1);
+    await expect(editor.getByText('Your response: needsAction')).toBeVisible();
+    await expect(editor.getByRole('button', { name: 'Save changes', exact: true })).toBeDisabled();
+    expect((await new AxeBuilder({ page }).include('.editor').analyze()).violations).toEqual([]);
+    await editor.getByRole('button', { name: label, exact: true }).click();
+    await expect(editor).not.toBeVisible();
+    const requests = await page.evaluate(() => (window as any).meetingFixture.responses);
+    expect(requests).toEqual([
+      {
+        target: '11111111-1111-4111-8111-111111111111',
+        scope: 'series',
+        expectedRevision: 'meeting-r1',
+        response,
+      },
+    ]);
+    expect(await page.evaluate(() => (window as any).meetingFixture.requests)).toEqual([]);
+  });
+}
+
+test('stale invitation response stays open with a conflict message', async ({ page }) => {
+  await fixture(page, false);
+  await page.evaluate(() => {
+    (window as any).meetingFixture.failResponse = true;
+  });
+  const editor = page.getByRole('dialog', { name: 'Event editor' });
+  await editor.getByRole('button', { name: 'Accept', exact: true }).click();
+  await expect(editor.getByText('Invitation changed. Reload before responding.')).toBeVisible();
+  await expect(editor.getByRole('button', { name: 'Accept', exact: true })).toBeEnabled();
+});
+
+test('recurring invitee scopes review the occurrence and master separately without following RSVP', async ({
+  page,
+}) => {
+  await fixture(page, false, true);
+  const editor = page.getByRole('dialog', { name: 'Event editor' });
+  await expect(editor.getByLabel('Invitation response scope')).toHaveValue('occurrence');
+  await expect(editor.getByLabel('Invitation response scope').getByRole('option')).toHaveCount(2);
+  await editor.getByLabel('Invitation response scope').selectOption('series');
+  await expect(editor.getByRole('button', { name: 'Accept', exact: true })).toBeEnabled();
+  await editor.getByRole('button', { name: 'Accept', exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).meetingFixture.responses.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).meetingFixture.responses[0])).toMatchObject({
+    target: '11111111-1111-4111-8111-111111111111',
+    scope: 'series',
+    expectedRevision: 'meeting-r1',
+  });
 });

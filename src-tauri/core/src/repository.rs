@@ -30,7 +30,7 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 8 {
+        if version > 9 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -81,6 +81,9 @@ impl Repository {
         }
         if version < 8 {
             tx.execute_batch(include_str!("schema_v8.sql"))?;
+        }
+        if version < 9 {
+            tx.execute_batch("PRAGMA user_version=9;")?;
         }
         tx.commit()?;
         Ok(Self {
@@ -716,6 +719,13 @@ impl Repository {
         self.prune_history()?;
         let mut requirements = vec![];
         if let Some(entry) = self.history.last() {
+            if entry
+                .meeting
+                .as_ref()
+                .is_some_and(|(_, _, m)| m.response.is_some())
+            {
+                return Ok(requirements);
+            }
             for change in &entry.changes {
                 let event = change
                     .after
@@ -1672,6 +1682,12 @@ impl Repository {
                 r.get(0)
             })?;
         if let Some((target, scope, intent)) = &entry.meeting {
+            if intent.response.is_some() {
+                crate::invitation_responses::undo(&tx, target, scope, intent, &entry.changes)?;
+                tx.commit()?;
+                self.history.pop();
+                return Ok(());
+            }
             if let Some(desired) = &intent.guests {
                 for change in entry.changes.iter().filter(|c| {
                     c.after.is_some() && (*scope != MutationScope::Following || c.before.is_none())
@@ -1700,6 +1716,7 @@ impl Repository {
         Self::apply_changes(&tx, &entry.changes, true)?;
         if let Some((_, scope, intent)) = &entry.meeting {
             let reverse = MeetingIntent {
+                response: None,
                 original_start: intent.original_start.clone(),
                 before_guests: intent.guests.clone(),
                 guests: if intent.guests.is_some() && *scope != MutationScope::Following {
@@ -2290,7 +2307,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                8
+                9
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -2630,7 +2647,7 @@ mod recurrence_tests {
                 .db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            8
+            9
         );
         drop(provider);
         std::fs::remove_file(path).unwrap();
@@ -2722,7 +2739,7 @@ mod migration_v4_tests {
                 repo.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                8
+                9
             );
         }
         std::fs::remove_file(path).unwrap();

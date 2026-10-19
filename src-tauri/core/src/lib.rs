@@ -18,3 +18,5 @@ pub mod account_removal;
 pub(crate) mod lifecycle;
 
 pub mod meetings;
+
+mod invitation_responses;

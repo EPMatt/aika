@@ -341,6 +341,13 @@ impl CalendarService {
                             .map(|v| serde_json::from_str::<MeetingIntent>(&v))
                             .transpose()?
                         {
+                            if let Some(response) = &intent.response {
+                                let observed = serde_json::from_str(&item.shadow)?;
+                                same &= crate::invitation_responses::response_status(
+                                    &observed,
+                                    &response.email,
+                                ) == Some(response.before.as_str());
+                            }
                             if intent.guests.is_some() {
                                 if let Some(expected) = intent.before_guests {
                                     let observed: serde_json::Value =
@@ -631,7 +638,9 @@ impl CalendarService {
             );
         }
         let meeting_intents = crate::meetings::pending_intents(&tx, &current.event_id)?;
-        let has_guest_intent = meeting_intents.iter().any(|m| m.guests.is_some());
+        let has_guest_intent = meeting_intents
+            .iter()
+            .any(|m| m.guests.is_some() || m.response.is_some());
         if multi && keep_local {
             // Replan the conflicting resource inside its existing ordered group.
             // Acknowledged siblings and unattempted/uncertain siblings retain their
@@ -830,7 +839,16 @@ fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
     rows.into_iter()
         .map(
             |(id, account_id, calendar_id, event_id, local, remote, remote_revision)| {
+                let mut remote_responses = std::collections::BTreeMap::new();
+                for intent in crate::meetings::pending_intents(db, &event_id)? {
+                    if let Some(response) = intent.response {
+                        let selector = intent.original_start.as_ref().map(|o| format!("{event_id}@{o}")).unwrap_or_else(|| event_id.clone());
+                        let value = crate::meetings::shadow(db, &selector)?;
+                        remote_responses.insert(intent.original_start.unwrap_or_else(|| "series".into()), crate::invitation_responses::response_status(&value, &response.email).unwrap_or("unavailable").into());
+                    }
+                }
                 Ok(SyncConflict {
+                    remote_responses: Some(remote_responses),
                     id,
                     account_id,
                     calendar_id,
@@ -3411,5 +3429,309 @@ mod tests {
             .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+    fn invitation_fixture(path: &Path) -> (CalendarService, SyncClaim, String) {
+        let (mut s, mut c, calendar) = meeting_fixture(path);
+        s.providers
+            .register(Box::new(crate::google::GoogleProvider::with_lifecycle(
+                None,
+            )))
+            .unwrap();
+        s.providers.repository.db.execute("UPDATE accounts SET provider_id='google',display_name='me@example.invalid' WHERE id=?1",[&c.account.id]).unwrap();
+        s.providers
+            .repository
+            .db
+            .execute(
+                "UPDATE calendars SET remote_id='me@example.invalid' WHERE id=?1",
+                [&calendar],
+            )
+            .unwrap();
+        c.account = s.account(&c.account.id).unwrap();
+        let mut shadow = serde_json::json!({"id":"invite","etag":"r1","summary":"Organizer title","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"}});
+        shadow["organizer"] = serde_json::json!({"self":false,"email":"organizer@example.invalid"});
+        shadow["attendees"] = serde_json::json!([{"email":"me@example.invalid","self":true,"responseStatus":"needsAction"},{"email":"other@example.invalid","responseStatus":"declined"}]);
+        let id = s
+            .providers
+            .repository
+            .cache_event(
+                &c.account.id,
+                "invite",
+                event(&calendar),
+                "r1",
+                &shadow.to_string(),
+                Capabilities::read_only(),
+            )
+            .unwrap();
+        (s, c, id)
+    }
+    fn response_request(s: &CalendarService, target: &str) -> InvitationResponseMutation {
+        InvitationResponseMutation {
+            target: target.into(),
+            scope: MutationScope::Series,
+            expected_revision: s.meeting_details(target).unwrap().revision,
+            response: InvitationResponse::Accepted,
+        }
+    }
+    #[test]
+    fn invitation_offline_restart_stale_review_readonly_fields_and_unsent_undo() {
+        let path = std::env::temp_dir().join(format!("aika-rsvp-{}.sqlite", uuid::Uuid::new_v4()));
+        let (mut s, _, id) = invitation_fixture(&path);
+        let stale = response_request(&s, &id);
+        s.respond_to_invitation(stale.clone()).unwrap();
+        assert_eq!(
+            s.meeting_details(&id).unwrap().response.unwrap().current,
+            "accepted"
+        );
+        let other = CalendarService::open(&path).unwrap();
+        assert_eq!(
+            other
+                .meeting_details(&id)
+                .unwrap()
+                .response
+                .unwrap()
+                .current,
+            "accepted"
+        );
+        assert_eq!(s.respond_to_invitation(stale).unwrap_err().code, "conflict");
+        let mut e = s.get_series(&id).unwrap().event;
+        e.title = "attempt organizer edit".into();
+        assert_eq!(s.save(e, true).unwrap_err().code, "readOnly");
+        s.undo().unwrap();
+        assert_eq!(
+            s.meeting_details(&id).unwrap().response.unwrap().current,
+            "needsAction"
+        );
+        assert_eq!(
+            s.providers
+                .repository
+                .db
+                .query_row(
+                    "SELECT count(*) FROM outbox WHERE state!='acknowledged'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(other);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn invitation_attempted_undo_requires_reconciliation_then_checked_compensation() {
+        let (mut s, c, id) = invitation_fixture(Path::new(":memory:"));
+        s.respond_to_invitation(response_request(&s, &id)).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(s.undo().unwrap_err().code, "groupRecoveryRequired");
+        let mut item = ack(&op, "r2");
+        let mut value: serde_json::Value = serde_json::from_str(&op.shadow).unwrap();
+        value["attendees"][0]["responseStatus"] = serde_json::json!("accepted");
+        item.shadow = value.to_string();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Applied(Some(item))))
+            .unwrap();
+        s.undo().unwrap();
+        let reverse = s.claim_outgoing(&c).unwrap().unwrap();
+        let response = reverse.meeting.unwrap().response.unwrap();
+        assert_eq!(response.desired, "needsAction");
+        assert_eq!(reverse.before, reverse.after);
+    }
+    #[test]
+    fn invitation_following_delegate_and_stale_permissions_are_refused() {
+        let (mut s, _, id) = invitation_fixture(Path::new(":memory:"));
+        let mut r = response_request(&s, &id);
+        r.scope = MutationScope::Following;
+        assert_eq!(s.respond_to_invitation(r).unwrap_err().code, "unsupported");
+        let r = response_request(&s, &id);
+        s.providers.repository.db.execute("UPDATE calendars SET remote_id='delegated@example.invalid' WHERE id=(SELECT calendar_id FROM remote_events WHERE id=?1)",[&id]).unwrap();
+        assert!(s.meeting_details(&id).unwrap().response.is_none());
+        assert_eq!(s.respond_to_invitation(r).unwrap_err().code, "readOnly");
+    }
+    #[test]
+    fn invitation_conflict_rebase_retains_response_and_observed_organizer_fields() {
+        let (mut s, c, id) = invitation_fixture(Path::new(":memory:"));
+        s.respond_to_invitation(response_request(&s, &id)).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut item = ack(&op, "r2");
+        item.event.as_mut().unwrap().title = "Organizer changed title".into();
+        let mut value: serde_json::Value = serde_json::from_str(&op.shadow).unwrap();
+        value["attendees"][0]["responseStatus"] = serde_json::json!("tentative");
+        value["summary"] = serde_json::json!("Organizer changed title");
+        item.shadow = value.to_string();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(item))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        assert_eq!(
+            review.meeting_intents.as_ref().unwrap()[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .desired,
+            "accepted"
+        );
+        s.resolve_sync_conflict(review.clone(), true).unwrap();
+        assert!(s.resolve_sync_conflict(review, true).is_err());
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(op.before, op.after);
+        assert_eq!(
+            op.after.as_ref().unwrap().event.title,
+            "Organizer changed title"
+        );
+        assert_eq!(
+            op.meeting
+                .as_ref()
+                .unwrap()
+                .response
+                .as_ref()
+                .unwrap()
+                .before,
+            "tentative"
+        );
+    }
+    #[test]
+    fn invitation_occurrence_conflict_and_compensation_preserve_actual_instance_scope() {
+        let (mut s, mut c, cal, series, state) = recurring_meeting_fixture();
+        let db = &s.providers.repository.db;
+        db.execute("UPDATE accounts SET provider_id='google',display_name='me@example.invalid' WHERE id=?1",[&c.account.id]).unwrap();
+        db.execute(
+            "UPDATE calendars SET remote_id='me@example.invalid' WHERE id=?1",
+            [&cal],
+        )
+        .unwrap();
+        let mut q = db
+            .prepare("SELECT id,shadow_payload FROM remote_events WHERE calendar_id=?1")
+            .unwrap();
+        let rows = q
+            .query_map([&cal], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        drop(q);
+        for (id, raw) in rows {
+            let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            value["organizer"] =
+                serde_json::json!({"self":false,"email":"organizer@example.invalid"});
+            value["attendees"] = serde_json::json!([{"email":"me@example.invalid","self":true,"responseStatus":"needsAction"}]);
+            db.execute(
+                "UPDATE remote_events SET shadow_payload=?2 WHERE id=?1",
+                params![id, value.to_string()],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE incoming_items SET payload=json_set(payload,'$.shadow',?2) WHERE id=?1",
+                params![id, value.to_string()],
+            )
+            .unwrap();
+            if value["id"] == "provider-moved-id" {
+                state.lock().unwrap().0.shadow = value.to_string();
+            }
+        }
+        c.account = s.account(&c.account.id).unwrap();
+        let target = format!("{}@2026-10-03", series.event.id);
+        let mut request = response_request(&s, &target);
+        request.scope = MutationScope::Occurrence;
+        s.respond_to_invitation(request).unwrap();
+        assert_eq!(
+            s.meeting_details(&series.event.id)
+                .unwrap()
+                .response
+                .unwrap()
+                .current,
+            "needsAction"
+        );
+        assert_eq!(
+            s.meeting_details(&target)
+                .unwrap()
+                .response
+                .unwrap()
+                .current,
+            "accepted"
+        );
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(op.remote_id, "provider-moved-id");
+        let mut item = state.lock().unwrap().0.clone();
+        item.revision = "instance-r2".into();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(item))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(review, true).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(op.original_start.as_deref(), Some("2026-10-03"));
+        let mut item = state.lock().unwrap().0.clone();
+        let mut value: serde_json::Value = serde_json::from_str(&item.shadow).unwrap();
+        value["attendees"][0]["responseStatus"] = serde_json::json!("accepted");
+        item.shadow = value.to_string();
+        item.revision = "instance-r3".into();
+        state.lock().unwrap().0 = item.clone();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Applied(Some(item))))
+            .unwrap();
+        s.undo().unwrap();
+        let reverse = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(reverse.remote_id, "provider-moved-id");
+        assert_eq!(
+            reverse.meeting.unwrap().response.unwrap().desired,
+            "needsAction"
+        );
+    }
+    #[test]
+    fn v8_response_contract_migration_preserves_pending_intent_and_attempts() {
+        let path = std::env::temp_dir().join(format!(
+            "aika-rsvp-migration-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let (mut s, c, calendar) = meeting_fixture(&path);
+        let e = event(&calendar);
+        s.mutate_meeting(meeting_request(
+            &s,
+            e,
+            false,
+            NotificationPolicy::ExternalOnly,
+        ))
+        .unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        s.providers
+            .repository
+            .db
+            .execute_batch("PRAGMA user_version=8;")
+            .unwrap();
+        drop(s);
+        let mut s = open(&path);
+        let retry = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(retry.id, op.id);
+        assert!(retry.recovering);
+        assert_eq!(retry.meeting, op.meeting);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn invitation_independent_connection_invalidates_review_and_superseded_undo() {
+        let path =
+            std::env::temp_dir().join(format!("aika-rsvp-race-{}.sqlite", uuid::Uuid::new_v4()));
+        let (mut s, _, id) = invitation_fixture(&path);
+        s.respond_to_invitation(response_request(&s, &id)).unwrap();
+        let stale = response_request(&s, &id);
+        let mut other = CalendarService::open(&path).unwrap();
+        other
+            .respond_to_invitation(response_request(&other, &id))
+            .unwrap();
+        assert_eq!(s.respond_to_invitation(stale).unwrap_err().code, "conflict");
+        assert_eq!(s.undo().unwrap_err().code, "conflict");
+        drop(other);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn invitation_projection_and_fabricated_occurrence_scopes_are_refused_before_queuing() {
+        let (mut s, _, id) = invitation_fixture(Path::new(":memory:"));
+        let mut request = response_request(&s, &id);
+        request.scope = MutationScope::Occurrence;
+        request.target = format!("{id}@2026-10-01");
+        assert_eq!(
+            s.respond_to_invitation(request).unwrap_err().code,
+            "unsupported"
+        );
+        s.providers.repository.db.execute("INSERT INTO incoming_projections(id,master_remote_id) VALUES(?1,'unsupported-master')",[&id]).unwrap();
+        assert!(s.meeting_details(&id).unwrap().response.is_none());
     }
 }

@@ -314,6 +314,16 @@ async fn meeting_details(
     with_service(state.inner().clone(), move |s| s.meeting_details(&target)).await
 }
 #[tauri::command]
+async fn respond_to_invitation(
+    state: tauri::State<'_, ServiceState>,
+    request: InvitationResponseMutation,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.respond_to_invitation(request)
+    })
+    .await
+}
+#[tauri::command]
 async fn mutate_meeting(
     state: tauri::State<'_, ServiceState>,
     request: MeetingMutation,
@@ -440,7 +450,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, meeting_details, mutate_meeting, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, review_calendar_removal, discard_and_remove_calendar, review_account_removal, remove_account, review_disconnect, discard_and_disconnect, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, respond_to_invitation, meeting_details, mutate_meeting, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, review_calendar_removal, discard_and_remove_calendar, review_account_removal, remove_account, review_disconnect, discard_and_disconnect, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

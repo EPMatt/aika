@@ -4,4 +4,4 @@ import type { GroupRecoveryStep } from "./GroupRecoveryStep";
 import type { MeetingGuest } from "./MeetingGuest";
 import type { MeetingIntent } from "./MeetingIntent";
 
-export type SyncConflict = { id: string, accountId: string, calendarId: string, eventId: string, local: EventSeries | null, remote: EventSeries | null, remoteRevision: string | null, groupRevision?: string, recoverySteps?: Array<GroupRecoveryStep>, meetingIntents?: Array<MeetingIntent>, remoteAttendees?: Array<MeetingGuest>, };
+export type SyncConflict = { remoteResponses?: { [key in string]: string }, id: string, accountId: string, calendarId: string, eventId: string, local: EventSeries | null, remote: EventSeries | null, remoteRevision: string | null, groupRevision?: string, recoverySteps?: Array<GroupRecoveryStep>, meetingIntents?: Array<MeetingIntent>, remoteAttendees?: Array<MeetingGuest>, };

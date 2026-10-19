@@ -15,7 +15,7 @@
 The [Google integration follow-on plan](plans/google-integration-follow-on-2026-10-19.md) defines a separate six-phase sequence and handoff names for the remaining Google features. Its [planning handoff](handoffs/google-follow-on-00-planning.md) records user decisions and the confirmation of existing live validation.
 
 - Regional-zone/DST write expansion requires separate later equivalence evidence.
-- Invitation responses remain follow-on phase 06; unsupported Google event types remain outside current editing capabilities.
+- Google follow-on 06 adds checked accept/tentative/decline on the authenticated attendee’s own permitted calendar copy, with occurrence/series scopes, durable recovery and participant-only undo. See the [phase 06 handoff](handoffs/google-follow-on-06-invitation-responses.md). Live RSVP propagation remains unverified; delegated copies, unproven aliases, unsupported recurrence and special Google event types remain restricted.
 - Search, reminders, import/export, and backup/restore remain unimplemented product possibilities, without a committed schedule.
 
 Additional providers can use the [shared adapter boundary](integrations/google-calendar.md#provider-extension-guide). They are not current integrations.

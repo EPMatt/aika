@@ -1,3 +1,4 @@
+import type { InvitationResponseMutation } from './generated/InvitationResponseMutation';
 import type { MeetingDetails } from './generated/MeetingDetails';
 import type { MeetingMutation } from './generated/MeetingMutation';
 import type { AccountRemovalReview } from './generated/AccountRemovalReview';
@@ -27,6 +28,8 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
+  respondToInvitation: (request: InvitationResponseMutation) =>
+    mutate<void>('respond_to_invitation', { request }),
   meetingDetails: (target: string) => invoke<MeetingDetails>('meeting_details', { target }),
   mutateMeeting: (request: MeetingMutation) =>
     mutate<CalendarEvent[]>('mutate_meeting', { request }),

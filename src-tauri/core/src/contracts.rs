@@ -223,6 +223,9 @@ pub struct GroupProgress {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncConflict {
+    #[serde(default)]
+    #[ts(optional)]
+    pub remote_responses: Option<BTreeMap<String, String>>,
     pub id: String,
     pub account_id: String,
     pub calendar_id: String,
@@ -349,6 +352,7 @@ impl NotificationPolicy {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingDetails {
+    pub response: Option<InvitationResponseDetails>,
     pub organizer: Option<String>,
     pub organizer_owned: bool,
     pub attendees: Vec<MeetingAttendee>,
@@ -374,10 +378,53 @@ pub struct MeetingMutation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub response: Option<InvitationResponseIntent>,
     #[serde(default)]
     #[ts(optional)]
     pub original_start: Option<String>,
     pub before_guests: Option<Vec<MeetingGuest>>,
     pub guests: Option<Vec<MeetingGuest>>,
     pub notifications: NotificationPolicy,
+}
+
+/// Only the backend resolves attendee identity; mutation input never carries an email.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InvitationResponseMutation {
+    pub target: String,
+    pub scope: MutationScope,
+    pub expected_revision: String,
+    pub response: InvitationResponse,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InvitationResponse {
+    Accepted,
+    Tentative,
+    Declined,
+}
+impl InvitationResponse {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Tentative => "tentative",
+            Self::Declined => "declined",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationResponseDetails {
+    pub current: String,
+    pub scopes: Vec<MutationScope>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationResponseIntent {
+    pub action_id: String,
+    pub email: String,
+    pub before: String,
+    pub desired: String,
 }

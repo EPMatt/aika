@@ -1625,7 +1625,7 @@ mod migration_tests {
             repo.db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            8
+            9
         );
         drop(repo);
         std::fs::remove_file(path).unwrap();

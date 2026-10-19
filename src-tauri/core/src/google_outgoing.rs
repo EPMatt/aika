@@ -169,6 +169,9 @@ pub(super) fn deliver(
     access: &str,
     op: &OutgoingOperation,
 ) -> Result<OutgoingResult> {
+    if let Some(response) = op.meeting.as_ref().and_then(|m| m.response.as_ref()) {
+        return deliver_response(transport, access, op, response);
+    }
     if let Some(after) = &op.after {
         crate::google_recurrence::compile(&after.event)?;
     }
@@ -394,6 +397,96 @@ pub(super) fn deliver(
         }
         Err(f) if f.code == "remoteConflict" => Ok(OutgoingResult::Conflict(get()?)),
         Err(f) => Err(f),
+    }
+}
+/// RSVP patches contain exactly one participant and no organizer-owned fields.
+fn deliver_response(
+    transport: &dyn GoogleTransport,
+    access: &str,
+    op: &OutgoingOperation,
+    response: &InvitationResponseIntent,
+) -> Result<OutgoingResult> {
+    if op.operation != "update"
+        || op.before.is_none()
+        || op.before != op.after
+        || op.meeting.as_ref().is_some_and(|m| m.guests.is_some())
+        || !["needsAction", "accepted", "tentative", "declined"]
+            .contains(&response.desired.as_str())
+    {
+        return Err(error("validation", "Invalid participant-only intent."));
+    }
+    let normalize = |value| -> Result<Option<IncomingItem>> {
+        let page = events::normalized(events::EventPage {
+            items: vec![value],
+            next_page_token: None,
+            next_sync_token: None,
+            time_zone: "UTC".into(),
+        })?;
+        Ok(page.items.into_iter().next())
+    };
+    let get = || {
+        transport
+            .event_request(
+                access,
+                &op.remote_calendar,
+                &op.remote_id,
+                "GET",
+                None,
+                None,
+            )
+            .and_then(|v| v.map(normalize).transpose().map(Option::flatten))
+    };
+    let current = get()?;
+    let Some(item) = &current else {
+        return Ok(OutgoingResult::Conflict(None));
+    };
+    if item.remote_id != op.remote_id
+        || item.master != op.series_remote_id && op.original_start.is_some()
+        || item.original_start != op.original_start
+    {
+        return Err(error(
+            "providerIdentity",
+            "Google returned a different invitation resource.",
+        ));
+    }
+    let value: Value = serde_json::from_str(&item.shadow)?;
+    let status =
+        crate::invitation_responses::response_status(&value, &response.email).ok_or_else(|| {
+            error(
+                "readOnly",
+                "The authenticated attendee can no longer respond to this invitation.",
+            )
+        })?;
+    if !op.remote_calendar.eq_ignore_ascii_case(&response.email) {
+        return Err(error(
+            "providerIdentity",
+            "Invitation belongs to another calendar copy.",
+        ));
+    }
+    // Reconcile a lost reply by the participant effect itself: invitees cannot write markers.
+    if op.recovering && status == response.desired {
+        return Ok(OutgoingResult::Applied(current));
+    }
+    if item.revision.is_empty() || Some(item.revision.as_str()) != op.revision.as_deref() {
+        return Ok(OutgoingResult::Conflict(current));
+    }
+    let body = json!({"attendeesOmitted":true,"attendees":[{"email":response.email,"responseStatus":response.desired}]});
+    match transport.event_request_notifying(
+        access,
+        &op.remote_calendar,
+        &op.remote_id,
+        "PATCH",
+        Some(&body),
+        op.revision.as_deref(),
+        &NotificationPolicy::All,
+    ) {
+        Ok(Some(value)) => Ok(OutgoingResult::Applied(normalize(value)?)),
+        Ok(None) => Err(error(
+            "retryable",
+            "Google did not acknowledge the response. Retry to reconcile it.",
+        )),
+        Err(e) if e.code == "remoteConflict" => Ok(OutgoingResult::Conflict(get()?)),
+        Err(e) => Err(e),
     }
 }
 #[cfg(test)]
@@ -900,6 +993,7 @@ mod tests {
     fn meeting_guest_changes_preserve_responses_unknown_fields_and_conferences() {
         let mut op = operation("update", false);
         op.meeting = Some(MeetingIntent {
+            response: None,
             original_start: None,
             before_guests: None,
             guests: Some(vec![
@@ -935,6 +1029,7 @@ mod tests {
     fn meeting_recovery_requires_guest_intent_and_organizer_identity() {
         let mut op = operation("update", true);
         op.meeting = Some(MeetingIntent {
+            response: None,
             original_start: None,
             before_guests: None,
             guests: Some(vec![MeetingGuest {
@@ -972,6 +1067,7 @@ mod tests {
         for kind in ["create", "delete"] {
             let mut op = operation(kind, false);
             op.meeting = Some(MeetingIntent {
+                response: None,
                 original_start: None,
                 before_guests: None,
                 guests: if kind == "create" {
@@ -1009,5 +1105,123 @@ mod tests {
             "unsupported"
         );
         assert_eq!(t.requests.lock().unwrap().len(), 1);
+    }
+    fn invitation(status: &str, revision: &str) -> Value {
+        let mut v = resource("Organizer title", revision);
+        v["organizer"] = json!({"email":"organizer@example.invalid","self":false});
+        v["attendees"] = json!([{"email":"me@example.invalid","self":true,"responseStatus":status,"comment":"keep"}, {"email":"other@example.invalid","responseStatus":"declined","unknown":42}]);
+        v["conferenceData"] = json!({"conferenceId":"preserve"});
+        v
+    }
+    fn response_operation() -> OutgoingOperation {
+        let mut op = operation("update", false);
+        op.after = op.before.clone();
+        op.remote_calendar = "me@example.invalid".into();
+        op.meeting = Some(MeetingIntent {
+            response: Some(InvitationResponseIntent {
+                action_id: "response-action".into(),
+                email: "me@example.invalid".into(),
+                before: "needsAction".into(),
+                desired: "accepted".into(),
+            }),
+            original_start: None,
+            before_guests: None,
+            guests: None,
+            notifications: NotificationPolicy::All,
+        });
+        op
+    }
+    #[test]
+    fn invitation_response_patch_is_participant_only_and_conditional() {
+        let op = response_operation();
+        let t = Transport::new(vec![
+            Ok(Some(invitation("needsAction", "r1"))),
+            Ok(Some(invitation("accepted", "r2"))),
+        ]);
+        assert!(matches!(
+            deliver(&t, "access", &op).unwrap(),
+            OutgoingResult::Applied(Some(_))
+        ));
+        let requests = t.requests.lock().unwrap();
+        assert_eq!(requests[1].0, "PATCH");
+        assert_eq!(requests[1].1.as_deref(), Some("r1"));
+        assert_eq!(
+            requests[1].2,
+            Some(
+                json!({"attendeesOmitted":true,"attendees":[{"email":"me@example.invalid","responseStatus":"accepted"}]})
+            )
+        );
+        assert_eq!(requests[1].4, "all");
+    }
+    #[test]
+    fn invitation_lost_response_reconciles_without_resending_and_stale_revision_conflicts() {
+        let mut op = response_operation();
+        op.recovering = true;
+        let t = Transport::new(vec![Ok(Some(invitation("accepted", "r2")))]);
+        assert!(matches!(
+            deliver(&t, "access", &op).unwrap(),
+            OutgoingResult::Applied(Some(_))
+        ));
+        assert_eq!(t.requests.lock().unwrap().len(), 1);
+        let t = Transport::new(vec![Ok(Some(invitation("tentative", "r2")))]);
+        assert!(matches!(
+            deliver(&t, "access", &op).unwrap(),
+            OutgoingResult::Conflict(Some(_))
+        ));
+        assert_eq!(t.requests.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn invitation_identity_permission_and_mixed_field_intent_are_rejected() {
+        for case in 0..5 {
+            let mut op = response_operation();
+            let mut value = invitation("needsAction", "r1");
+            match case {
+                0 => value["attendees"][0]["self"] = json!(false),
+                1 => value["attendees"][0]["email"] = json!("delegate@example.invalid"),
+                2 => value["locked"] = json!(true),
+                3 => op.remote_calendar = "shared@example.invalid".into(),
+                _ => op.after.as_mut().unwrap().event.title = "hacked".into(),
+            }
+            let t = Transport::new(vec![Ok(Some(value))]);
+            assert!(deliver(&t, "access", &op).is_err());
+            assert!(t.requests.lock().unwrap().len() <= 1);
+        }
+    }
+    #[test]
+    fn invitation_occurrence_checks_provider_identity_and_never_changes_status_or_schedule() {
+        let mut op = response_operation();
+        op.original_start = Some("2026-10-01".into());
+        op.series_remote_id = Some("master".into());
+        let mut current = invitation("needsAction", "r1");
+        current["recurringEventId"] = json!("master");
+        current["originalStartTime"] = json!({"date":"2026-10-01"});
+        let t = Transport::new(vec![Ok(Some(current.clone())), Ok(Some(current))]);
+        deliver(&t, "access", &op).unwrap();
+        let requests = t.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let body = requests[1].2.as_ref().unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        assert!(body.get("status").is_none());
+    }
+    #[test]
+    fn invitation_response_allows_omitted_guests_without_replacing_hidden_attendees() {
+        let op = response_operation();
+        let mut value = invitation("needsAction", "r1");
+        value["attendeesOmitted"] = json!(true);
+        value["attendees"].as_array_mut().unwrap().truncate(1);
+        let t = Transport::new(vec![
+            Ok(Some(value)),
+            Ok(Some(invitation("accepted", "r2"))),
+        ]);
+        deliver(&t, "access", &op).unwrap();
+        let requests = t.requests.lock().unwrap();
+        assert_eq!(requests[1].2.as_ref().unwrap()["attendeesOmitted"], true);
+        assert_eq!(
+            requests[1].2.as_ref().unwrap()["attendees"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

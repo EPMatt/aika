@@ -12,7 +12,7 @@ type Result<T> = std::result::Result<T, ServiceError>;
 pub(crate) fn shadow(db: &Connection, target: &str) -> Result<Value> {
     let id = target.split_once('@').map_or(target, |(id, _)| id);
     let raw: Option<String> = if let Some((_, original)) = target.split_once('@') {
-        db.query_row("SELECT shadow_payload FROM remote_events WHERE id=(SELECT id FROM incoming_items WHERE json_extract(payload,'$.master')=(SELECT remote_id FROM remote_events WHERE id=?1) AND json_extract(payload,'$.original_start')=?2 LIMIT 1)", params![id,original], |r| r.get(0)).optional()?
+        db.query_row("SELECT child.shadow_payload FROM remote_events parent JOIN remote_events child ON child.account_id=parent.account_id AND child.calendar_id=parent.calendar_id JOIN incoming_items i ON i.id=child.id WHERE parent.id=?1 AND json_extract(i.payload,'$.master')=parent.remote_id AND json_extract(i.payload,'$.original_start')=?2 LIMIT 1", params![id,original], |r| r.get(0)).optional()?
     } else {
         None
     };
@@ -76,6 +76,14 @@ pub(crate) fn details(db: &Connection, target: &str) -> Result<MeetingDetails> {
         if let Some(raw) = raw {
             digest.update(&raw);
             let intent: MeetingIntent = serde_json::from_str(&raw)?;
+            if let Some(response) = &intent.response {
+                if let Some(a) = attendees
+                    .iter_mut()
+                    .find(|a| a.email.eq_ignore_ascii_case(&response.email))
+                {
+                    a.response = response.desired.clone();
+                }
+            }
             if let Some(list) = intent.guests {
                 attendees = list
                     .into_iter()
@@ -110,7 +118,28 @@ pub(crate) fn details(db: &Connection, target: &str) -> Result<MeetingDetails> {
             }
         }
     }
+    let series_response = !target.contains('@')
+        || crate::invitation_responses::available(db, id, &shadow(db, id)?)?.is_some();
+    let response = crate::invitation_responses::available(db, target, &value)?.map(|email| {
+        InvitationResponseDetails {
+            current: attendees
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(&email))
+                .map(|a| a.response.clone())
+                .unwrap_or("needsAction".into()),
+            scopes: if target.contains('@') {
+                let mut scopes = vec![MutationScope::Occurrence];
+                if series_response {
+                    scopes.push(MutationScope::Series);
+                }
+                scopes
+            } else {
+                vec![MutationScope::Series]
+            },
+        }
+    });
     Ok(MeetingDetails {
+        response,
         organizer: value["organizer"]["email"].as_str().map(str::to_owned),
         organizer_owned: value["organizer"]["self"].as_bool() == Some(true)
             || value.is_null()
@@ -287,6 +316,7 @@ impl CalendarService {
             request.scope == MutationScope::Following,
         )?;
         let intent = MeetingIntent {
+            response: None,
             original_start: if request.scope == MutationScope::Occurrence {
                 request.target.split_once('@').map(|(_, key)| key.into())
             } else {
@@ -396,14 +426,21 @@ pub(crate) fn replan_intents(
             .as_ref()
             .map(|o| format!("{event}@{o}"))
             .unwrap_or_else(|| event.into());
-        intent.before_guests = Some(guests(&shadow(db, &selector)?));
+        let observed = shadow(db, &selector)?;
+        intent.before_guests = Some(guests(&observed));
+        if let Some(response) = &mut intent.response {
+            response.before =
+                crate::invitation_responses::response_status(&observed, &response.email)
+                    .unwrap_or("needsAction")
+                    .into();
+        }
         let found = rows
             .iter()
             .find(|(_, original)| *original == intent.original_start)
             .map(|(id, _)| id.clone());
         let id = if let Some(id) = found {
             id
-        } else if intent.guests.is_some() {
+        } else if intent.guests.is_some() || intent.response.is_some() {
             // Repurpose an otherwise empty placeholder created for guest-only intent.
             let empty_master: Option<String> = if !intents
                 .iter()

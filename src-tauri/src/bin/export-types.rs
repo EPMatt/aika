@@ -18,6 +18,7 @@ use cal_desktop_lib::contracts::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/generated");
     let config = Config::default().with_out_dir(directory);
+    cal_desktop_lib::contracts::InvitationResponseMutation::export_all(&config)?;
     MeetingDetails::export_all(&config)?;
     MeetingMutation::export_all(&config)?;
     MeetingIntent::export_all(&config)?;
