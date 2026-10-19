@@ -7,6 +7,7 @@ pub mod storage;
 
 pub use aika_domain::recurrence;
 pub mod google;
+mod google_recurrence;
 pub mod repository;
 
 pub mod outgoing;

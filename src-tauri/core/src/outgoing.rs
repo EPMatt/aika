@@ -20,21 +20,28 @@ pub struct OutgoingOperation {
     pub revision: Option<String>,
     pub recovering: bool,
     pub shadow: String,
+    pub original_start: Option<String>,
+    pub series_remote_id: Option<String>,
 }
 pub enum OutgoingResult {
     Applied(Option<IncomingItem>),
     Conflict(Option<IncomingItem>),
 }
-fn series(item: &IncomingItem, id: &str, calendar: &str) -> Option<EventSeries> {
-    item.event.as_ref().map(|event| {
-        let mut event = event.clone();
-        event.id = id.into();
-        event.calendar_id = calendar.into();
-        EventSeries {
-            event,
-            exceptions: vec![],
-        }
-    })
+pub(crate) fn occurrence_event(
+    series: &EventSeries,
+    original: &str,
+) -> Result<Option<CalendarEvent>> {
+    if let Some(exception) = series
+        .exceptions
+        .iter()
+        .find(|e| e.original_start == original)
+    {
+        return Ok(exception.event.clone());
+    }
+    let mut event = aika_domain::recurrence::get_occurrence(series, original)?;
+    event.recurrence = None;
+    event.occurrence = None;
+    Ok(Some(event))
 }
 impl CalendarService {
     pub fn claim_outgoing(&mut self, claim: &SyncClaim) -> Result<Option<OutgoingOperation>> {
@@ -67,13 +74,24 @@ impl CalendarService {
             // The revision captured at mutation time may predate the predecessor's HTTP.
             let ack: Option<String> = tx.query_row(
                 "SELECT acknowledgement FROM outbox WHERE id=?1",
-                [dependency],
+                [&dependency],
                 |r| r.get(0),
             )?;
-            if let Some(ack) = ack {
+            let same_resource_kind: bool = tx.query_row("SELECT (SELECT original_start IS NULL FROM outbox WHERE id=?1) AND original_start IS NULL FROM outbox WHERE id=?2", params![id,dependency], |r| r.get(0))?;
+            if let Some(ack) = ack.filter(|_| same_resource_kind) {
                 let ack: serde_json::Value = serde_json::from_str(&ack)?;
                 revision = ack["revision"].as_str().map(str::to_owned);
             }
+        }
+        if let Some(predecessor) = revision
+            .as_deref()
+            .and_then(|r| r.strip_prefix("aikaPredecessor:"))
+        {
+            let ack: Option<String> = tx.query_row("SELECT acknowledgement FROM outbox WHERE id=?1 AND event_id=?2 AND state='acknowledged' AND original_start IS NULL", params![predecessor,event_id], |r| r.get(0)).optional()?.flatten();
+            revision = ack
+                .map(|a| serde_json::from_str::<serde_json::Value>(&a))
+                .transpose()?
+                .and_then(|a| a["revision"].as_str().map(str::to_owned));
         }
         if operation == "create" {
             revision = None;
@@ -102,28 +120,150 @@ impl CalendarService {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let instance: bool = tx.query_row(
-            "SELECT original_start IS NOT NULL OR series_remote_id IS NOT NULL FROM outbox WHERE id=?1",
+        let (original_start, mut series_remote_id, resource): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT original_start,series_remote_id,resource_id FROM outbox WHERE id=?1",
             [&id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if instance {
-            // Phase 01 must never guess a provider instance identity or enable writes
-            // through a manually inserted step. Phase 02 binds resolved identities.
-            let failure = error(
-                "unsupported",
-                "Google recurring changes are not available yet.",
-            );
-            tx.execute(
-                "UPDATE outbox SET state='blocked',acknowledgement=?2 WHERE id=?1",
-                params![id, serde_json::to_string(&failure)?],
+        if let Some(original) = &original_start {
+            let before_series = before
+                .as_deref()
+                .map(serde_json::from_str::<EventSeries>)
+                .transpose()?;
+            let after_series = after
+                .as_deref()
+                .map(serde_json::from_str::<EventSeries>)
+                .transpose()?;
+            if operation != "update"
+                || !matches!((&before_series, &after_series), (Some(b),Some(a)) if b.event == a.event && b.event.recurrence.is_some())
+            {
+                let failure = error(
+                    "unsupported",
+                    "Occurrence delivery requires a checked recurring aggregate update.",
+                );
+                tx.execute(
+                    "UPDATE outbox SET state='blocked',acknowledgement=?2 WHERE id=?1",
+                    params![id, serde_json::to_string(&failure)?],
+                )?;
+                tx.commit()?;
+                return Err(failure);
+            }
+            if series_remote_id.is_none() {
+                series_remote_id = existing.as_ref().map(|(id, _)| id.clone());
+            }
+            if resource.is_none() {
+                let master = series_remote_id
+                    .as_ref()
+                    .ok_or_else(|| {
+                        error(
+                            "providerIdentity",
+                            "The recurring master has no provider identity.",
+                        )
+                    })?
+                    .clone();
+                // Resolve with no SQLite transaction held. A fresh fence and row check
+                // reject a discarded operation or replaced worker before binding.
+                tx.commit()?;
+                let resolved = claim
+                    .adapter
+                    .resolve_outgoing_instance(
+                        &claim.account.remote_subject,
+                        &remote_calendar,
+                        &master,
+                        original,
+                    )
+                    .and_then(|item| {
+                        if item.master.as_deref() != Some(&master)
+                            || item.original_start.as_deref() != Some(original)
+                            || item.remote_id.is_empty()
+                            || item.revision.is_empty()
+                        {
+                            Err(error(
+                                "providerIdentity",
+                                "Google returned an invalid occurrence identity or revision.",
+                            ))
+                        } else {
+                            Ok(item)
+                        }
+                    });
+                let tx = self
+                    .providers
+                    .repository
+                    .db
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                guard(&tx, claim)?;
+                let unchanged: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE id=?1 AND resource_id IS NULL AND state IN ('pending','inFlight'))", [&id], |r| r.get(0))?;
+                if !unchanged {
+                    return Err(error(
+                        "syncSuperseded",
+                        "The occurrence operation changed during lookup.",
+                    ));
+                }
+                match resolved {
+                    Ok(item) => {
+                        let before: EventSeries =
+                            serde_json::from_str(before.as_deref().ok_or_else(|| {
+                                error("validation", "Occurrence intent requires a before state.")
+                            })?)?;
+                        let expected = occurrence_event(&before, original)?;
+                        let same = match (&expected, &item.event) {
+                            (Some(a), Some(b)) => {
+                                a.title == b.title
+                                    && a.time == b.time
+                                    && a.location == b.location
+                                    && a.notes == b.notes
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        tx.execute("UPDATE outbox SET resource_id=?2,series_remote_id=?3,expected_revision=?4 WHERE id=?1", params![id,item.remote_id,master,if same {item.revision.as_str()} else {"unobserved-conflict"}])?;
+                        let mapped = mapping(
+                            &tx,
+                            &claim.account.id,
+                            &calendar_id,
+                            &item,
+                            claim.adapter.event_capabilities(&item),
+                        )?;
+                        tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![mapped,serde_json::to_string(&item)?])?;
+                    }
+                    Err(f) => {
+                        if !matches!(
+                            f.code.as_str(),
+                            "network"
+                                | "retryable"
+                                | "authenticationRequired"
+                                | "credentialUnavailable"
+                        ) {
+                            tx.execute(
+                                "UPDATE outbox SET state='blocked',acknowledgement=?2 WHERE id=?1",
+                                params![id, serde_json::to_string(&f)?],
+                            )?;
+                        }
+                        tx.commit()?;
+                        return Err(f);
+                    }
+                }
+                tx.commit()?;
+                return self.claim_outgoing(claim);
+            }
+            // Instance revisions are independent of master/predecessor revisions.
+            revision = tx.query_row(
+                "SELECT expected_revision FROM outbox WHERE id=?1",
+                [&id],
+                |r| r.get(0),
             )?;
-            tx.commit()?;
-            return Err(failure);
         }
-        let shadow = existing
-            .as_ref()
-            .map(|(_, shadow)| shadow.clone())
+        let instance_shadow: Option<String> = if original_start.is_some() {
+            tx.query_row("SELECT shadow_payload FROM remote_events WHERE account_id=?1 AND calendar_id=?2 AND remote_id=?3", params![claim.account.id,calendar_id,resource], |r| r.get(0)).optional()?
+        } else {
+            None
+        };
+        let shadow = instance_shadow
+            .or_else(|| existing.as_ref().map(|(_, shadow)| shadow.clone()))
             .unwrap_or_else(|| "{}".into());
         // A compensation after a delete uses a fresh persisted ID: Google retains tombstones.
         let persisted: Option<String> =
@@ -161,6 +301,8 @@ impl CalendarService {
             revision,
             recovering: attempts > 0,
             shadow,
+            original_start,
+            series_remote_id,
         }))
     }
     pub fn apply_outgoing(
@@ -205,14 +347,32 @@ impl CalendarService {
                 };
                 let revision = item.as_ref().map(|i| i.revision.clone());
                 if let Some(item) = &item {
-                    mapping(
+                    let mapped = mapping(
                         &tx,
                         &claim.account.id,
                         &op.calendar_id,
                         item,
                         claim.adapter.event_capabilities(item),
                     )?;
-                    tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![op.event_id,serde_json::to_string(item)?])?;
+                    tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![mapped,serde_json::to_string(item)?])?;
+                } else if let Some(original) = &op.original_start {
+                    let tombstone = IncomingItem {
+                        remote_id: op.remote_id.clone(),
+                        revision: String::new(),
+                        shadow: "{}".into(),
+                        event: None,
+                        master: op.series_remote_id.clone(),
+                        original_start: Some(original.clone()),
+                        unsupported: false,
+                    };
+                    let mapped = mapping(
+                        &tx,
+                        &claim.account.id,
+                        &op.calendar_id,
+                        &tombstone,
+                        Capabilities::read_only(),
+                    )?;
+                    tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![mapped,serde_json::to_string(&tombstone)?])?;
                 } else {
                     // Keep a normalized tombstone so full/incremental replay cannot resurrect it.
                     tx.execute(
@@ -231,9 +391,7 @@ impl CalendarService {
                     tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![op.event_id,serde_json::to_string(&tombstone)?])?;
                 }
                 if conflict {
-                    let remote = item
-                        .as_ref()
-                        .and_then(|i| series(i, &op.event_id, &op.calendar_id));
+                    let remote = crate::recovery::observed_series(&tx, &op.event_id)?;
                     tx.execute("INSERT INTO conflicts(id,account_id,calendar_id,event_id,local_payload,remote_payload,remote_revision) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![uuid::Uuid::new_v4().to_string(),claim.account.id,op.calendar_id,op.event_id,op.after.as_ref().map(serde_json::to_string).transpose()?,remote.as_ref().map(serde_json::to_string).transpose()?,revision])?;
                     tx.execute("UPDATE outbox SET state='blocked',retry_at=NULL,acknowledgement=NULL WHERE id=?1", [&op.id])?;
                 } else {
@@ -349,43 +507,153 @@ impl CalendarService {
             tx.commit()?;
             return Ok(());
         }
-        // The current effective event includes any subsequent local edits, including deletion.
-        let local: Option<String> = tx
-            .query_row(
-                "SELECT payload FROM events WHERE id=?1",
-                [&current.event_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let local: Option<CalendarEvent> = local.map(|v| serde_json::from_str(&v)).transpose()?;
+        let mut local = crate::repository::Repository::read_series(&tx, &current.event_id)?;
+        let remote = current.remote.clone();
+        if let (Some(before), Some(after)) = (&remote, &local) {
+            if before.event.recurrence.is_some()
+                && (before.event.time != after.event.time
+                    || before.event.recurrence != after.event.recurrence)
+            {
+                return Err(error(
+                    "unsupported",
+                    "Keeping this Google schedule cannot prove preservation of exceptions.",
+                ));
+            }
+        }
+        if let (Some(observed), Some(desired)) = (&remote, &local) {
+            if observed.event.recurrence.is_some() {
+                let mut q = tx.prepare("SELECT original_start,before_payload,after_payload FROM outbox WHERE event_id=?1 AND state!='acknowledged' ORDER BY rowid")?;
+                let rows = q
+                    .query_map([&current.event_id], |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let resources: std::collections::BTreeSet<_> = rows
+                    .iter()
+                    .map(|(original, _, _)| original.clone())
+                    .collect();
+                if resources.len() > 1 {
+                    return Err(error("groupRecoveryRequired", "Reconcile combined master and occurrence intent before keeping local changes."));
+                }
+                let mut rebased = observed.clone();
+                if let Some(Some(original)) = resources.iter().next() {
+                    let mut replacement = occurrence_event(desired, original)?;
+                    if let (Some(wanted), Some(mut actual)) =
+                        (&replacement, occurrence_event(observed, original)?)
+                    {
+                        let mut dirty = [false; 4];
+                        for (_, before, after) in &rows {
+                            let b: EventSeries =
+                                serde_json::from_str(before.as_deref().ok_or_else(|| {
+                                    error(
+                                        "groupRecoveryRequired",
+                                        "Missing occurrence before state.",
+                                    )
+                                })?)?;
+                            let a: EventSeries =
+                                serde_json::from_str(after.as_deref().ok_or_else(|| {
+                                    error(
+                                        "groupRecoveryRequired",
+                                        "Missing occurrence after state.",
+                                    )
+                                })?)?;
+                            match (
+                                occurrence_event(&b, original)?,
+                                occurrence_event(&a, original)?,
+                            ) {
+                                (Some(b), Some(a)) => {
+                                    dirty[0] |= b.title != a.title;
+                                    dirty[1] |= b.location != a.location;
+                                    dirty[2] |= b.notes != a.notes;
+                                    dirty[3] |= b.time != a.time;
+                                }
+                                _ => dirty.fill(true),
+                            }
+                        }
+                        if dirty[0] {
+                            actual.title = wanted.title.clone();
+                        }
+                        if dirty[1] {
+                            actual.location = wanted.location.clone();
+                        }
+                        if dirty[2] {
+                            actual.notes = wanted.notes.clone();
+                        }
+                        if dirty[3] {
+                            actual.time = wanted.time.clone();
+                        }
+                        replacement = Some(actual);
+                    }
+                    // Validate correspondence against the current master, even for cancellation.
+                    let mut probe = observed.clone();
+                    probe.exceptions.retain(|e| &e.original_start != original);
+                    aika_domain::recurrence::get_occurrence(&probe, original)?;
+                    rebased.exceptions.retain(|e| &e.original_start != original);
+                    rebased.exceptions.push(EventException {
+                        original_start: original.clone(),
+                        event: replacement,
+                    });
+                    rebased
+                        .exceptions
+                        .sort_by(|a, b| a.original_start.cmp(&b.original_start));
+                } else {
+                    let mut dirty = [false; 3];
+                    for (_, before, after) in rows {
+                        let b: EventSeries =
+                            serde_json::from_str(before.as_deref().ok_or_else(|| {
+                                error(
+                                    "groupRecoveryRequired",
+                                    "Reconcile recreated series before keeping local changes.",
+                                )
+                            })?)?;
+                        let a: EventSeries =
+                            serde_json::from_str(after.as_deref().ok_or_else(|| {
+                                error(
+                                    "groupRecoveryRequired",
+                                    "Reconcile deleted series before keeping local changes.",
+                                )
+                            })?)?;
+                        dirty[0] |= b.event.title != a.event.title;
+                        dirty[1] |= b.event.location != a.event.location;
+                        dirty[2] |= b.event.notes != a.event.notes;
+                    }
+                    if dirty[0] {
+                        rebased.event.title = desired.event.title.clone();
+                    }
+                    if dirty[1] {
+                        rebased.event.location = desired.event.location.clone();
+                    }
+                    if dirty[2] {
+                        rebased.event.notes = desired.event.notes.clone();
+                    }
+                }
+                local = Some(rebased);
+            }
+        }
         tx.execute("DELETE FROM conflicts WHERE id=?1", [&current.id])?;
-        // Retain acknowledged identities for dependency/history recovery, retire all paused intent.
         tx.execute(
             "UPDATE outbox SET state='acknowledged' WHERE event_id=?1 AND state!='acknowledged'",
             [&current.event_id],
         )?;
-        if keep_local {
-            let before = current
-                .remote
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let after = local
-                .map(|event| EventSeries {
-                    event,
-                    exceptions: vec![],
-                })
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            if before.is_some() || after.is_some() {
-                tx.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![uuid::Uuid::new_v4().to_string(),current.account_id,current.calendar_id,current.event_id,if after.is_none(){"delete"}else if before.is_none(){"create"}else{"update"},before,after,current.remote_revision])?;
-            }
-        } else {
-            tx.execute("DELETE FROM events WHERE id=?1", [&current.event_id])?;
-            if let Some(s) = current.remote {
-                crate::repository::Repository::write(&tx, &s.event)?;
-            }
+        if let Some(series) = &local {
+            crate::repository::Repository::write_series(&tx, series)?;
+        }
+        if remote.is_some() || local.is_some() {
+            let change = SeriesChange {
+                id: current.event_id.clone(),
+                before: remote,
+                after: local,
+            };
+            crate::repository::Repository::queue_change(
+                &tx,
+                &change,
+                false,
+                &uuid::Uuid::new_v4().to_string(),
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -399,7 +667,7 @@ impl CalendarService {
 }
 
 fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
-    let mut q=db.prepare("SELECT id,account_id,calendar_id,event_id,(SELECT json_object('event',json(payload),'exceptions',json('[]')) FROM events WHERE id=conflicts.event_id),remote_payload,remote_revision FROM conflicts ORDER BY rowid")?;
+    let mut q=db.prepare("SELECT id,account_id,calendar_id,event_id,(SELECT json_object('event',json(payload),'exceptions',json((SELECT coalesce(json_group_array(json_object('originalStart',original_start,'event',json(payload))),'[]') FROM event_exceptions WHERE series_id=conflicts.event_id))) FROM events WHERE id=conflicts.event_id),remote_payload,remote_revision FROM conflicts ORDER BY rowid")?;
     let rows = q
         .query_map([], |r| {
             Ok((
@@ -422,7 +690,15 @@ fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
                     calendar_id,
                     event_id: event_id.clone(),
                     local: local.map(|v| serde_json::from_str(&v)).transpose()?,
-                    remote: remote.map(|v| serde_json::from_str(&v)).transpose()?,
+                    remote: if db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM incoming_items WHERE id=?1)",
+                        [&event_id],
+                        |r| r.get::<_, bool>(0),
+                    )? {
+                        crate::recovery::observed_series(db, &event_id)?
+                    } else {
+                        remote.map(|v| serde_json::from_str(&v)).transpose()?
+                    },
                     remote_revision,
                     group_revision: Some(crate::recovery::group_revision(db, &event_id)?),
                 })
@@ -1677,5 +1953,557 @@ mod tests {
         assert!(s.claim_outgoing(&c).unwrap().is_none());
         let unrelated = s.save(event(&cal), false).unwrap();
         assert_eq!(sent(&mut s, &c).event_id, unrelated.id);
+    }
+    type InstanceState = std::sync::Arc<std::sync::Mutex<(IncomingItem, u32)>>;
+    struct InstanceAdapter(InstanceState);
+    impl Provider for InstanceAdapter {
+        fn descriptor(&self) -> ProviderDescriptor {
+            Adapter.descriptor()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::google_recurring()
+        }
+        fn event_capabilities(&self, _: &IncomingItem) -> Capabilities {
+            Capabilities::google_recurring()
+        }
+        fn resolve_outgoing_instance(
+            &self,
+            _: &str,
+            _: &str,
+            master: &str,
+            original: &str,
+        ) -> Result<IncomingItem> {
+            let mut state = self.0.lock().unwrap();
+            state.1 += 1;
+            assert_eq!(state.0.master.as_deref(), Some(master));
+            assert_eq!(state.0.original_start.as_deref(), Some(original));
+            Ok(state.0.clone())
+        }
+    }
+    fn recurring_setup(
+        path: &Path,
+    ) -> (
+        CalendarService,
+        SyncClaim,
+        String,
+        EventSeries,
+        InstanceState,
+    ) {
+        let (mut s, mut claim, cal) = setup(path);
+        s.providers
+            .repository
+            .db
+            .execute(
+                "UPDATE calendars SET capabilities=?2 WHERE id=?1",
+                params![
+                    cal,
+                    serde_json::to_string(&Capabilities::google_recurring()).unwrap()
+                ],
+            )
+            .unwrap();
+        let mut e = event(&cal);
+        e.recurrence = Some(Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 2,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(6),
+            segment: None,
+        });
+        e.id = s
+            .providers
+            .repository
+            .cache_event(
+                &claim.account.id,
+                "actual-master",
+                e.clone(),
+                "master-r1",
+                "{}",
+                Capabilities::google_recurring(),
+            )
+            .unwrap();
+        let master = IncomingItem {
+            remote_id: "actual-master".into(),
+            revision: "master-r1".into(),
+            shadow: "{}".into(),
+            event: Some(e.clone()),
+            master: None,
+            original_start: None,
+            unsupported: false,
+        };
+        s.providers
+            .repository
+            .db
+            .execute(
+                "INSERT INTO incoming_items VALUES(?1,?2)",
+                params![e.id, serde_json::to_string(&master).unwrap()],
+            )
+            .unwrap();
+        let mut replacement = e.clone();
+        replacement.recurrence = None;
+        replacement.time = EventTime::AllDay {
+            start_date: "2026-10-07".into(),
+            end_date: "2026-10-08".into(),
+        };
+        let instance = IncomingItem {
+            remote_id: "provider-moved-id".into(),
+            revision: "instance-r1".into(),
+            shadow: "{}".into(),
+            event: Some(replacement.clone()),
+            master: Some("actual-master".into()),
+            original_start: Some("2026-10-03".into()),
+            unsupported: false,
+        };
+        let cancelled = IncomingItem {
+            remote_id: "provider-cancelled-id".into(),
+            revision: "cancel-r1".into(),
+            shadow: "{}".into(),
+            event: None,
+            master: Some("actual-master".into()),
+            original_start: Some("2026-10-05".into()),
+            unsupported: false,
+        };
+        for item in [&instance, &cancelled] {
+            let id = mapping(
+                &s.providers.repository.db,
+                &claim.account.id,
+                &cal,
+                item,
+                Capabilities::google_recurring(),
+            )
+            .unwrap();
+            s.providers
+                .repository
+                .db
+                .execute(
+                    "INSERT INTO incoming_items VALUES(?1,?2)",
+                    params![id, serde_json::to_string(item).unwrap()],
+                )
+                .unwrap();
+        }
+        let series = EventSeries {
+            event: e,
+            exceptions: vec![
+                EventException {
+                    original_start: "2026-10-03".into(),
+                    event: Some(replacement),
+                },
+                EventException {
+                    original_start: "2026-10-05".into(),
+                    event: None,
+                },
+            ],
+        };
+        Repository::write_series(&s.providers.repository.db, &series).unwrap();
+        let state = std::sync::Arc::new(std::sync::Mutex::new((instance, 0)));
+        claim.adapter = std::sync::Arc::new(InstanceAdapter(state.clone()));
+        (s, claim, cal, series, state)
+    }
+    fn recurring_request(
+        series: &EventSeries,
+        scope: MutationScope,
+        event: Option<CalendarEvent>,
+    ) -> EventMutation {
+        EventMutation {
+            target: if scope == MutationScope::Series {
+                series.event.id.clone()
+            } else {
+                format!("{}@2026-10-03", series.event.id)
+            },
+            scope,
+            event,
+            expected: aika_domain::recurrence::expectation(series).unwrap(),
+            reset_exceptions: false,
+            exception_policy: Some(ExceptionPolicy::Preserve),
+            count_changed: false,
+        }
+    }
+    #[test]
+    fn recurring_metadata_preserves_exceptions_rejects_reset_structure_and_stale_connections() {
+        let path =
+            std::env::temp_dir().join(format!("aika-phase02-{}.sqlite3", uuid::Uuid::new_v4()));
+        let (mut s, c, _, series, _) = recurring_setup(&path);
+        let mut other = Repository::open(&path).unwrap();
+        let mut e = series.event.clone();
+        e.title = "Series metadata".into();
+        let request = recurring_request(&series, MutationScope::Series, Some(e.clone()));
+        s.providers
+            .repository
+            .mutate_event(request.clone())
+            .unwrap();
+        let saved = s.providers.repository.get_series(&series.event.id).unwrap();
+        assert_eq!(saved.exceptions, series.exceptions);
+        assert_eq!(other.mutate_event(request).unwrap_err().code, "conflict");
+        e = saved.event.clone();
+        if let EventTime::AllDay { start_date, .. } = &mut e.time {
+            *start_date = "2026-09-30".into();
+        }
+        assert_eq!(
+            s.providers
+                .repository
+                .mutate_event(recurring_request(&saved, MutationScope::Series, Some(e)))
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        let mut reset = recurring_request(&saved, MutationScope::Series, Some(saved.event.clone()));
+        reset.reset_exceptions = true;
+        assert_eq!(
+            s.providers.repository.mutate_event(reset).unwrap_err().code,
+            "unsupported"
+        );
+        assert_eq!(
+            s.providers
+                .repository
+                .mutate_event(recurring_request(&saved, MutationScope::Following, None))
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            1
+        );
+        s.end_sync(&c, None).unwrap();
+        drop(other);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn occurrence_identity_binding_restart_overlay_and_checked_compensation() {
+        let path = std::env::temp_dir().join(format!(
+            "aika-phase02-restart-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let (mut s, c, _, series, state) = recurring_setup(&path);
+        let mut changed = aika_domain::recurrence::get_occurrence(&series, "2026-10-03").unwrap();
+        changed.title = "Moved edit".into();
+        let request = recurring_request(&series, MutationScope::Occurrence, Some(changed));
+        s.providers
+            .repository
+            .mutate_event(request.clone())
+            .unwrap();
+        s.providers.repository.undo().unwrap();
+        assert_eq!(
+            s.providers.repository.get_series(&series.event.id).unwrap(),
+            series
+        );
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        s.providers.repository.mutate_event(request).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(op.remote_id, "provider-moved-id");
+        assert_eq!(op.revision.as_deref(), Some("instance-r1"));
+        assert_eq!(state.lock().unwrap().1, 1);
+        let mut remote = state.lock().unwrap().0.clone();
+        remote.event.as_mut().unwrap().title = "Moved edit".into();
+        remote.revision = "instance-r2".into();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Applied(Some(remote.clone()))))
+            .unwrap();
+        assert_eq!(
+            s.providers
+                .repository
+                .get_series(&series.event.id)
+                .unwrap()
+                .exceptions
+                .len(),
+            2
+        );
+        state.lock().unwrap().0 = remote;
+        s.providers.repository.undo().unwrap();
+        let compensation = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(compensation.remote_id, "provider-moved-id");
+        assert_eq!(compensation.revision.as_deref(), Some("instance-r2"));
+        // Crash after identity/attempt persistence and before acknowledgement.
+        s.end_sync(&c, None).unwrap();
+        drop(s);
+        let mut reopened = open(&path);
+        let mut fresh = reopened
+            .begin_sync(&c.account.id, range())
+            .unwrap()
+            .unwrap();
+        fresh.adapter = std::sync::Arc::new(InstanceAdapter(state.clone()));
+        let recovered = reopened.claim_outgoing(&fresh).unwrap().unwrap();
+        assert!(recovered.recovering);
+        assert_eq!(recovered.id, compensation.id);
+        assert_eq!(recovered.remote_id, compensation.remote_id);
+        assert_eq!(state.lock().unwrap().1, 2);
+        let mut restored = state.lock().unwrap().0.clone();
+        restored.event.as_mut().unwrap().title = "Original".into();
+        restored.revision = "instance-r3".into();
+        reopened
+            .apply_outgoing(
+                &fresh,
+                &recovered,
+                Ok(OutgoingResult::Applied(Some(restored))),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .providers
+                .repository
+                .get_series(&series.event.id)
+                .unwrap(),
+            series
+        );
+        reopened.end_sync(&fresh, None).unwrap();
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn deleted_series_compensation_restores_exceptions_as_ordered_checked_steps() {
+        let (mut s, mut c, _, series, state) = recurring_setup(Path::new(":memory:"));
+        s.providers
+            .repository
+            .mutate_event(recurring_request(&series, MutationScope::Series, None))
+            .unwrap();
+        let delete = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &delete, Ok(OutgoingResult::Applied(None)))
+            .unwrap();
+        s.providers.repository.undo().unwrap();
+        let create = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(create.operation, "create");
+        assert_ne!(create.remote_id, delete.remote_id);
+        s.apply_outgoing(
+            &c,
+            &create,
+            Ok(OutgoingResult::Applied(Some(ack(&create, "new-master-r1")))),
+        )
+        .unwrap();
+        // Master success does not release the complete local overlay or count siblings separately.
+        assert_eq!(
+            s.providers.repository.get_series(&series.event.id).unwrap(),
+            series
+        );
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            1
+        );
+        for exception in &series.exceptions {
+            let mut base = series.clone();
+            base.exceptions.clear();
+            let event = occurrence_event(&base, &exception.original_start).unwrap();
+            let item = IncomingItem {
+                remote_id: format!("resolved-{}", exception.original_start),
+                revision: "new-instance-r1".into(),
+                shadow: "{}".into(),
+                event,
+                master: Some(create.remote_id.clone()),
+                original_start: Some(exception.original_start.clone()),
+                unsupported: false,
+            };
+            state.lock().unwrap().0 = item;
+            c.adapter = std::sync::Arc::new(InstanceAdapter(state.clone()));
+            let step = s.claim_outgoing(&c).unwrap().unwrap();
+            assert_eq!(
+                step.series_remote_id.as_deref(),
+                Some(create.remote_id.as_str())
+            );
+            assert_ne!(step.remote_id, create.remote_id);
+            let mut observed = state.lock().unwrap().0.clone();
+            observed.event = exception.event.clone();
+            observed.revision = "new-instance-r2".into();
+            s.apply_outgoing(&c, &step, Ok(OutgoingResult::Applied(Some(observed))))
+                .unwrap();
+        }
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        assert_eq!(
+            s.providers.repository.get_series(&series.event.id).unwrap(),
+            series
+        );
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            0
+        );
+    }
+    #[test]
+    fn missing_occurrence_conflict_never_tombstones_the_master() {
+        let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+        s.providers
+            .repository
+            .mutate_event(recurring_request(&series, MutationScope::Occurrence, None))
+            .unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let conflict = s.sync_conflicts().unwrap().remove(0);
+        assert!(conflict.remote.as_ref().unwrap().event.recurrence.is_some());
+        assert_eq!(conflict.local.as_ref().unwrap().exceptions.len(), 2);
+        s.resolve_sync_conflict(conflict, false).unwrap();
+        let observed = s.providers.repository.get_series(&series.event.id).unwrap();
+        assert!(observed.event.recurrence.is_some());
+        assert!(observed
+            .exceptions
+            .iter()
+            .find(|e| e.original_start == "2026-10-03")
+            .unwrap()
+            .event
+            .is_none());
+    }
+    #[test]
+    fn recurring_keep_local_rebases_metadata_and_occurrence_without_resetting_remote_exceptions() {
+        for occurrence in [false, true] {
+            let (mut s, c, _, series, state) = recurring_setup(Path::new(":memory:"));
+            let scope = if occurrence {
+                MutationScope::Occurrence
+            } else {
+                MutationScope::Series
+            };
+            let mut changed = if occurrence {
+                aika_domain::recurrence::get_occurrence(&series, "2026-10-03").unwrap()
+            } else {
+                series.event.clone()
+            };
+            changed.title = "Local intent".into();
+            s.providers
+                .repository
+                .mutate_event(recurring_request(&series, scope, Some(changed)))
+                .unwrap();
+            let op = s.claim_outgoing(&c).unwrap().unwrap();
+            let mut remote = if occurrence {
+                state.lock().unwrap().0.clone()
+            } else {
+                ack(&op, "master-r2")
+            };
+            if !occurrence {
+                remote.event = Some(series.event.clone());
+            }
+            remote.event.as_mut().unwrap().notes = "External notes".into();
+            remote.revision = "remote-r2".into();
+            s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(remote))))
+                .unwrap();
+            let stale = s.sync_conflicts().unwrap().remove(0);
+            let mut external = state.lock().unwrap().0.clone();
+            external.original_start = Some("2026-10-05".into());
+            external.remote_id = "provider-cancelled-id".into();
+            external.revision = "exception-r2".into();
+            external.event.as_mut().unwrap().title = "External restoration".into();
+            let id = mapping(
+                &s.providers.repository.db,
+                &c.account.id,
+                &op.calendar_id,
+                &external,
+                Capabilities::google_recurring(),
+            )
+            .unwrap();
+            s.providers
+                .repository
+                .db
+                .execute(
+                    "UPDATE incoming_items SET payload=?2 WHERE id=?1",
+                    params![id, serde_json::to_string(&external).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                s.resolve_sync_conflict(stale, true).unwrap_err().code,
+                "conflict"
+            );
+            let fresh = s.sync_conflicts().unwrap().remove(0);
+            s.resolve_sync_conflict(fresh, true).unwrap();
+            let saved = s.providers.repository.get_series(&series.event.id).unwrap();
+            assert_eq!(
+                saved
+                    .exceptions
+                    .iter()
+                    .find(|e| e.original_start == "2026-10-05")
+                    .unwrap()
+                    .event
+                    .as_ref()
+                    .unwrap()
+                    .title,
+                "External restoration"
+            );
+            if occurrence {
+                assert_eq!(saved.event.title, "Original");
+                assert_eq!(
+                    saved.exceptions[0].event.as_ref().unwrap().title,
+                    "Local intent"
+                );
+                assert_eq!(
+                    saved.exceptions[0].event.as_ref().unwrap().notes,
+                    "External notes"
+                );
+            } else {
+                assert_eq!(saved.event.title, "Local intent");
+                assert_eq!(saved.event.notes, "External notes");
+            }
+        }
+    }
+    #[test]
+    fn invalid_instance_revision_blocks_only_its_group() {
+        let (mut s, c, cal, series, state) = recurring_setup(Path::new(":memory:"));
+        state.lock().unwrap().0.revision.clear();
+        s.providers
+            .repository
+            .mutate_event(recurring_request(&series, MutationScope::Occurrence, None))
+            .unwrap();
+        assert_eq!(s.claim_outgoing(&c).unwrap_err().code, "providerIdentity");
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        let unrelated = s.save(event(&cal), false).unwrap();
+        assert_eq!(sent(&mut s, &c).event_id, unrelated.id);
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            1
+        );
+    }
+    #[test]
+    fn interleaved_master_and_instance_steps_use_resource_specific_revision_dependencies() {
+        for preceding_master in [false, true] {
+            let (mut s, c, _, mut series, state) = recurring_setup(Path::new(":memory:"));
+            if preceding_master {
+                let mut e = series.event.clone();
+                e.title = "First metadata".into();
+                s.providers
+                    .repository
+                    .mutate_event(recurring_request(&series, MutationScope::Series, Some(e)))
+                    .unwrap();
+                series = s.providers.repository.get_series(&series.event.id).unwrap();
+            }
+            let mut occurrence =
+                aika_domain::recurrence::get_occurrence(&series, "2026-10-03").unwrap();
+            occurrence.title = "Occurrence edit".into();
+            s.providers
+                .repository
+                .mutate_event(recurring_request(
+                    &series,
+                    MutationScope::Occurrence,
+                    Some(occurrence),
+                ))
+                .unwrap();
+            series = s.providers.repository.get_series(&series.event.id).unwrap();
+            let mut e = series.event.clone();
+            e.title = "Last metadata".into();
+            s.providers
+                .repository
+                .mutate_event(recurring_request(&series, MutationScope::Series, Some(e)))
+                .unwrap();
+            if preceding_master {
+                let op = s.claim_outgoing(&c).unwrap().unwrap();
+                assert_eq!(op.revision.as_deref(), Some("master-r1"));
+                s.apply_outgoing(
+                    &c,
+                    &op,
+                    Ok(OutgoingResult::Applied(Some(ack(&op, "master-r2")))),
+                )
+                .unwrap();
+            }
+            let instance = s.claim_outgoing(&c).unwrap().unwrap();
+            assert_eq!(instance.revision.as_deref(), Some("instance-r1"));
+            let mut observed = state.lock().unwrap().0.clone();
+            observed.revision = "instance-r2".into();
+            observed.event.as_mut().unwrap().title = "Occurrence edit".into();
+            s.apply_outgoing(&c, &instance, Ok(OutgoingResult::Applied(Some(observed))))
+                .unwrap();
+            let master = s.claim_outgoing(&c).unwrap().unwrap();
+            assert_eq!(
+                master.revision.as_deref(),
+                Some(if preceding_master {
+                    "master-r2"
+                } else {
+                    "master-r1"
+                })
+            );
+            assert!(master.original_start.is_none());
+        }
     }
 }

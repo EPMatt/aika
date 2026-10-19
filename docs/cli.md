@@ -69,7 +69,7 @@ Creation requires title, start, and end, and uses the default calendar selected 
 
 ## Recurring events
 
-These write examples apply to local calendars. Imported Google recurrence, meetings, and special event types remain read-only, even in writable calendars.
+The full scope/pattern examples below apply to local calendars. Google supports compatible all-day/UTC recurring creation, occurrence edits/cancellations/restoration, series metadata edits and whole-series deletion. Google following and structural series edits, regional/DST and ordinal-weekday rules, meetings and special event types remain unsupported. Inspect `events actions ID`; Google series edits preserve exceptions automatically and reject `--reset-exceptions`. A cancelled occurrence can be restored using an occurrence update and its original selector.
 
 ```sh
 aika-cli events create --title 'Stand-up' --start 2026-10-05T09:00 --end 2026-10-05T09:15 --time-zone Europe/Zurich --repeat weekly --weekdays mon,wed,fri

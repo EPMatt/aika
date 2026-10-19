@@ -965,6 +965,8 @@ function EventEditor({
       (existing ? (caps?.edit ?? true) : (destinationCaps?.create ?? true)) &&
       (!(event.recurrence || event.occurrence) || (caps?.recurrence ?? true)),
   );
+  const google = calendar.providerId === 'google';
+  const metadataOnly = google && existing && scope === 'series' && Boolean(event.recurrence);
   const canDelete = !deleteRestriction && (caps?.delete ?? true);
   const canMove = caps?.moveEvent ?? true;
   const [title, setTitle] = useState(event.title);
@@ -1162,6 +1164,7 @@ function EventEditor({
             type="button"
             role="switch"
             aria-label="All-day event"
+            disabled={metadataOnly}
             aria-checked={allDay}
             className={`switch ${allDay ? 'on' : ''}`}
             onClick={() => {
@@ -1182,6 +1185,7 @@ function EventEditor({
               <label htmlFor="event-start-date">Starts</label>
               <input
                 id="event-start-date"
+                disabled={metadataOnly}
                 type="date"
                 required
                 value={startDate}
@@ -1195,6 +1199,7 @@ function EventEditor({
               {!allDay && (
                 <input
                   aria-label="Start time"
+                  disabled={metadataOnly}
                   type="time"
                   required
                   value={startTime}
@@ -1210,6 +1215,7 @@ function EventEditor({
               <label htmlFor="event-end-date">Ends</label>
               <input
                 id="event-end-date"
+                disabled={metadataOnly}
                 type="date"
                 required
                 value={endDate}
@@ -1223,6 +1229,7 @@ function EventEditor({
               {!allDay && (
                 <input
                   aria-label="End time"
+                  disabled={metadataOnly}
                   type="time"
                   required
                   value={endTime}
@@ -1237,6 +1244,18 @@ function EventEditor({
           </div>
         </div>
         {!allDay && <p className="timezone-note">{eventZone.replaceAll('_', ' ')}</p>}
+        {metadataOnly && (
+          <p className="timezone-note">
+            Google series edits preserve individual changes. Edit a single occurrence to change its
+            time.
+          </p>
+        )}
+        {google && !existing && (
+          <p className="timezone-note">
+            Google repeats support all-day and UTC date-based patterns. Regional time zones and
+            following changes are unavailable.
+          </p>
+        )}
         <RepeatControls
           value={recurrence}
           onChange={(value, explicitCount) => {
@@ -1246,7 +1265,10 @@ function EventEditor({
           }}
           startDate={startDate}
           disabled={
-            !writable || !(caps?.recurrence ?? true) || Boolean(onScope && scope === 'occurrence')
+            !writable ||
+            metadataOnly ||
+            !(caps?.recurrence ?? true) ||
+            Boolean(onScope && scope === 'occurrence')
           }
         />
         {scope === 'following' && recurrence?.count && !countChanged && (
@@ -1714,7 +1736,14 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       scope,
       event,
       expected: selected.occurrence!.expected,
-      resetExceptions,
+      resetExceptions:
+        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google'
+          ? false
+          : resetExceptions,
+      exceptionPolicy:
+        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google'
+          ? 'preserve'
+          : 'reset',
       countChanged,
     };
   };
@@ -2053,6 +2082,18 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                                       <>
                                         <p>{version.event.location}</p>
                                         <p>{version.event.notes}</p>
+                                        {version.exceptions.length > 0 && (
+                                          <ul aria-label={`${String(label)} individual changes`}>
+                                            {version.exceptions.map((exception) => (
+                                              <li key={exception.originalStart}>
+                                                {exception.originalStart}:{' '}
+                                                {exception.event
+                                                  ? `${exception.event.title || 'Untitled event'} — ${exception.event.time.kind === 'timed' ? `${exception.event.time.start} – ${exception.event.time.end}` : `${exception.event.time.startDate} – ${exception.event.time.endDate}`}`
+                                                  : 'Cancelled occurrence'}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        )}
                                         <p>
                                           {version.event.time.kind === 'timed'
                                             ? `${version.event.time.start} – ${version.event.time.end}`
@@ -2307,7 +2348,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                         : undefined
                     }
                     resetAffected={Boolean(
-                      editing.series &&
+                      calendars.find((c) => c.id === editing.event.calendarId)?.providerId !==
+                        'google' &&
+                        editing.series &&
                         editing.scope !== 'occurrence' &&
                         editing.series.exceptions.some(
                           (e) =>
@@ -2388,8 +2431,24 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     onChange={(e) => setGestureScope(e.target.value as MutationScope)}
                   >
                     <option value="occurrence">This occurrence</option>
-                    <option value="following">This and following</option>
-                    <option value="series">Entire series</option>
+                    <option
+                      value="following"
+                      disabled={
+                        calendars.find((c) => c.id === gestureEdit?.original.calendarId)
+                          ?.providerId === 'google'
+                      }
+                    >
+                      This and following
+                    </option>
+                    <option
+                      value="series"
+                      disabled={
+                        calendars.find((c) => c.id === gestureEdit?.original.calendarId)
+                          ?.providerId === 'google'
+                      }
+                    >
+                      Entire series
+                    </option>
                   </select>
                 </label>
                 {gestureScope !== 'occurrence' && (
@@ -2426,7 +2485,16 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                           scope: gestureScope,
                           event: gestureEdit.changed,
                           expected: gestureEdit.original.occurrence!.expected,
-                          resetExceptions: gestureReset,
+                          resetExceptions:
+                            calendars.find((c) => c.id === gestureEdit.original.calendarId)
+                              ?.providerId === 'google'
+                              ? false
+                              : gestureReset,
+                          exceptionPolicy:
+                            calendars.find((c) => c.id === gestureEdit.original.calendarId)
+                              ?.providerId === 'google'
+                              ? 'preserve'
+                              : 'reset',
                         });
                         setGestureEdit(null);
                         refresh('Recurring event changed. Undo is available.');

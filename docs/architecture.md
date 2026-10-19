@@ -36,7 +36,7 @@ Undo records successful event changes in memory and applies checked compensation
 
 ## Connected-calendar decisions
 
-G01–G07 are accepted decisions. Account connection, incoming sync, and ordinary-event outgoing sync are implemented with automated fixtures. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform and new-feature acceptance remain separate; the [integration guide](integrations/google-calendar.md) describes current behavior. Compatible remote recurring writes and recoverable splits are future work, not an implemented guarantee.
+G01–G07 are accepted decisions. Account connection, incoming sync, and ordinary-event outgoing sync are implemented with automated fixtures. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform and new-feature acceptance remain separate; the [integration guide](integrations/google-calendar.md) describes current behavior. Compatible recurring creation, occurrence writes, series metadata edits and deletion are implemented in follow-on phase 02. Recoverable following splits remain phase 03 work.
 
 ### ADR G01: Provider types and account identities
 
@@ -68,7 +68,7 @@ Import masters/exceptions without date filters and normalize only proven equival
 
 ## Google follow-on decisions (2026-10-19)
 
-G08–G13 are accepted design decisions for the follow-on sequence. Phase 01 implements the durable foundation only; recurrence compilation, recurrence writes, account deletion, and meetings remain gated by subsequent phases. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; this does not validate new features or every installed platform.
+G08–G13 are accepted design decisions for the follow-on sequence. Phase 01 implements the durable foundation; phase 02 enables the compatible recurring write subset described below. Following splits, account deletion, and meetings remain gated by subsequent phases. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; this does not validate new features or every installed platform.
 
 ### ADR G08: Exact recurrence compatibility
 
@@ -80,7 +80,7 @@ Extend the existing outbox with durable groups, ordered steps, persisted resourc
 
 ### ADR G10: Scope-specific actions
 
-Expose typed edit/delete scopes with disabled reasons from native contracts, intersected with provider/calendar/event capabilities and enforced in Rust. Keep legacy capability booleans for compatibility; they do not independently authorize a recurrence scope. Local recurrence retains its existing behavior. All Google recurring scopes remain disabled in phase 01. Prefer explicit restrictions over a single recurrence flag that cannot describe partial support.
+Expose typed edit/delete scopes with disabled reasons from native contracts, intersected with provider/calendar/event capabilities and enforced in Rust. Keep legacy capability booleans for compatibility; they do not independently authorize a recurrence scope. Local recurrence retains its existing behavior. Phase 01 kept all Google recurring scopes disabled; phase 02 enables compatible occurrence and series scopes while following retains an explicit disabled reason. Prefer explicit restrictions over a single recurrence flag that cannot describe partial support.
 
 ### ADR G11: Explicit exception policy
 
@@ -99,3 +99,13 @@ Keep organizer, attendees, responses, and delivery policy in native durable cont
 Both workflows build Linux x64 on Ubuntu 24.04, Windows x64 on Windows 2025, Apple Silicon on macOS 15, and Intel on macOS 15 Intel. Embedded native automation currently runs only on Linux in the check workflow. Builds/package inspection do not certify desktop installation, upgrades, trusted input, or accessibility. See [contribution checks](../CONTRIBUTING.md#checks) and [release acceptance](releases.md#acceptance-checklist).
 
 Production omits the debug-only native driver, with a release compile guard. Packages are unsigned on Linux/Windows and ad-hoc signed, without notarization, on macOS. There is no automatic updater, analytics, or application server.
+
+### Phase 02 implementation of G08–G11
+
+The backend compiler maps unsplit all-day and whole-second UTC/Etc-UTC domain rules to one RRULE: daily, Monday-anchored weekly with optional weekdays, monthly by date, and yearly. INTERVAL and COUNT retain their domain meaning, including skipped invalid month/year dates. UNTIL maps an inclusive all-day date to a DATE boundary, or a UTC date to that day's fixed start clock. No bounded preview is used as the authorization test. Regional-zone/DST, ordinal-weekday, fractional-second UTC and segment rules fail before local intent commits. Unsupported imports retain their projections. Timed UNTIL imports are compatible only when their UTC limit clock exactly equals DTSTART's UTC clock. This further amends G07's former read-only import restriction without changing its fallback/coverage architecture.
+
+An optional generated `ExceptionPolicy` makes preservation explicit. Native Google validation selects `preserve`, rejects reset requests, and the shared planner carries existing exceptions into master metadata edits. Local native mutations retain reset semantics and reject a preserve policy. Structural changes to existing Google schedules are conservatively blocked: the cache cannot establish correspondence for every remote exception. Changing one instance's time remains available. Narrow If-Match patches preserve recurrence and provider-only fields during metadata edits; attendee-bearing, special, locked and conference-bearing events remain read-only.
+
+Occurrence steps keep full aggregate before/after payloads plus a series/original-start selector. Claim releases its SQLite transaction for adapter instance lookup, then rechecks the lease/epoch and operation before persisting the real resource identity and independent instance revision. Lookup compares editable before fields when no prior instance revision was captured; disagreement forces conflict. Binding survives retry/restart. Master revision dependencies reference preceding master steps explicitly; an interleaved occurrence acknowledgement never supplies a master ETag. Delivery checks the current compatible master and selected instance identity, and uses conditional PATCH (`status=cancelled` or `confirmed`) on the actual instance. Standalone projected instances never gain ordinary-write capabilities. Provider observations map to the child resource, while completion/conflict review rebuilds the master aggregate with all retained child observations.
+
+Unattempted actions cancel through existing group-aware undo. Attempted single-resource undo waits behind predecessor reconciliation and queues checked compensation. Recreating a delivered deletion reserves a fresh master ID and restores its exceptions through ordered, individually resolved instance steps in one group; partial progress retains the full overlay and resumes forward. This is deterministic restoration, not a following split/replanner. A blocked restore can be retried or discarded; delivered steps remain effective. Keep local can requeue a single occurrence or metadata change from checked observed aggregates. Combined master/exception or multiple-exception replans and attempted multi-step undo still return a recovery restriction pending phase 03. No schema migration is needed beyond v6; pre-phase-02 Google capabilities are re-evaluated from backend shadows.

@@ -89,6 +89,7 @@ fn split_keeps_phase_count_and_requires_exception_reset() {
         }),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let changes = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5").unwrap();
@@ -190,6 +191,7 @@ fn shifted_split_and_whole_tail_edit_do_not_restart_count() {
         event: Some(selected),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let tail = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5")
@@ -213,6 +215,7 @@ fn shifted_split_and_whole_tail_edit_do_not_restart_count() {
         }),
         expected: expectation(&tail).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let changed = plan_mutation(&tail, &request, "unused")
@@ -258,6 +261,7 @@ fn repeated_splits_expose_remaining_count_and_shifted_dst_gaps_do_not_consume_it
         event: Some(selected),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let tail = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5")
@@ -274,6 +278,7 @@ fn repeated_splits_expose_remaining_count_and_shifted_dst_gaps_do_not_consume_it
         event: Some(selected),
         expected: expectation(&tail).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let tail = plan_mutation(&tail, &request, "11fd0358-0197-4e97-bce7-7696de05a5dc")
@@ -306,6 +311,7 @@ fn repeated_splits_expose_remaining_count_and_shifted_dst_gaps_do_not_consume_it
         event: Some(selected),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let tail = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5")
@@ -353,6 +359,7 @@ fn monthly_date_edits_reanchor_and_keep_each_segment_count() {
         event: Some(selected),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: false,
     };
     let changes = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5").unwrap();
@@ -379,6 +386,7 @@ fn monthly_date_edits_reanchor_and_keep_each_segment_count() {
             event: Some(edited_head),
             expected: expectation(head).unwrap(),
             reset_exceptions: false,
+            exception_policy: None,
             count_changed: false,
         },
         "unused",
@@ -411,6 +419,7 @@ fn explicit_count_and_weekday_date_changes_apply_to_the_new_tail() {
         event: Some(selected),
         expected: expectation(&series).unwrap(),
         reset_exceptions: false,
+        exception_policy: None,
         count_changed: true,
     };
     let changes = plan_mutation(&series, &request, "ab8bb795-b9c7-47c6-98da-3547021948c5").unwrap();

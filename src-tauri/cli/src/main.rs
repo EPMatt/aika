@@ -739,7 +739,11 @@ fn run(cli: Cli) -> Result<String> {
                 let (_, key) = id.split_once('@').ok_or_else(|| {
                     error("validation", "This scope requires an occurrence selector.")
                 })?;
-                aika_core::recurrence::get_occurrence(&series, key)?
+                let mut probe = series.clone();
+                probe
+                    .exceptions
+                    .retain(|x| x.original_start != key || x.event.is_some());
+                aika_core::recurrence::get_occurrence(&probe, key)?
             };
             let event = event_from_args(fields, Some(&previous))?;
             if series.event.recurrence.is_none() {
@@ -761,6 +765,7 @@ fn run(cli: Cli) -> Result<String> {
                 event: Some(event),
                 expected: aika_core::recurrence::expectation(&series)?,
                 reset_exceptions,
+                exception_policy: None,
                 count_changed,
             })?;
             Ok(if scope == MutationScope::Following {
@@ -781,6 +786,7 @@ fn run(cli: Cli) -> Result<String> {
                     event: None,
                     expected: aika_core::recurrence::expectation(&series)?,
                     reset_exceptions: false,
+                    exception_policy: None,
                     count_changed: false,
                 })?;
             }

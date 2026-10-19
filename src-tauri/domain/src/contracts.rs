@@ -181,6 +181,13 @@ pub enum MutationScope {
     Series,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ExceptionPolicy {
+    Reset,
+    Preserve,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EventMutation {
@@ -189,6 +196,9 @@ pub struct EventMutation {
     pub event: Option<CalendarEvent>,
     pub expected: String,
     pub reset_exceptions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub exception_policy: Option<ExceptionPolicy>,
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub count_changed: bool,

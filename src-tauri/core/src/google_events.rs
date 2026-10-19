@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 type Result<T> = std::result::Result<T, ServiceError>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct EventPage {
+pub(crate) struct EventPage {
     #[serde(default)]
     pub items: Vec<Value>,
     pub next_page_token: Option<String>,
@@ -138,11 +138,19 @@ fn compatible(v: &Value, event: &CalendarEvent) -> Option<Recurrence> {
         vec![]
     };
     let until = if let Some(u) = fields.get("UNTIL") {
-        // Domain UNTIL is an inclusive date, so only date-valued all-day limits match.
-        if !matches!(event.time, EventTime::AllDay { .. }) {
-            return None;
-        }
-        Some(NaiveDate::parse_from_str(u, "%Y%m%d").ok()?.to_string())
+        Some(match &event.time {
+            EventTime::AllDay { .. } => NaiveDate::parse_from_str(u, "%Y%m%d").ok()?.to_string(),
+            EventTime::Timed { start, .. } => {
+                let limit = chrono::NaiveDateTime::parse_from_str(u, "%Y%m%dT%H%M%SZ").ok()?;
+                let start = chrono::DateTime::parse_from_rfc3339(start)
+                    .ok()?
+                    .with_timezone(&Utc);
+                if limit.time() != start.time() {
+                    return None;
+                }
+                limit.date().to_string()
+            }
+        })
     } else {
         None
     };
@@ -181,7 +189,7 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
         }
     }
 }
-pub(super) fn normalized(page: EventPage) -> Result<IncomingPage> {
+pub(crate) fn normalized(page: EventPage) -> Result<IncomingPage> {
     let items = page
         .items
         .into_iter()

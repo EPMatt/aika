@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
 #[path = "google_events.rs"]
-mod events;
+pub(crate) mod events;
 #[path = "google_outgoing.rs"]
 mod outgoing;
 type Result<T> = std::result::Result<T, ServiceError>;
@@ -720,7 +720,7 @@ impl Provider for GoogleProvider {
         }
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ordinary()
+        Capabilities::google_recurring()
     }
     fn start_connection(&self) -> Result<ConnectionSession> {
         if self.0.config.is_none() {
@@ -833,10 +833,19 @@ impl Provider for GoogleProvider {
     }
     fn event_capabilities(&self, item: &crate::sync::IncomingItem) -> Capabilities {
         if outgoing::editable(item) {
-            Capabilities::ordinary()
+            Capabilities::google_recurring()
         } else {
             Capabilities::read_only()
         }
+    }
+    fn resolve_outgoing_instance(
+        &self,
+        subject: &str,
+        calendar: &str,
+        series: &str,
+        original: &str,
+    ) -> Result<crate::sync::IncomingItem> {
+        self.resolve_instance(subject, calendar, series, original)
     }
     fn outgoing(
         &self,
@@ -1014,6 +1023,44 @@ impl GoogleProvider {
             store_tokens(&self.0, subject, &tokens)?;
         }
         Ok(tokens.access_token)
+    }
+}
+
+pub(crate) fn cached_instance_editable(shadow: &str) -> bool {
+    serde_json::from_str(shadow)
+        .ok()
+        .and_then(|v| {
+            events::normalized(events::EventPage {
+                items: vec![v],
+                next_page_token: None,
+                next_sync_token: None,
+                time_zone: "UTC".into(),
+            })
+            .ok()
+        })
+        .and_then(|p| p.items.into_iter().next())
+        .as_ref()
+        .is_some_and(outgoing::editable_fields)
+}
+
+/// Re-evaluate persisted pre-phase-02 capability JSON without changing provider data.
+pub(crate) fn cached_capabilities(shadow: &str) -> Capabilities {
+    let item = serde_json::from_str(shadow)
+        .ok()
+        .and_then(|v| {
+            events::normalized(events::EventPage {
+                items: vec![v],
+                next_page_token: None,
+                next_sync_token: None,
+                time_zone: "UTC".into(),
+            })
+            .ok()
+        })
+        .and_then(|p| p.items.into_iter().next());
+    if item.as_ref().is_some_and(outgoing::editable) {
+        Capabilities::google_recurring()
+    } else {
+        Capabilities::read_only()
     }
 }
 

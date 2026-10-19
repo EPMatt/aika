@@ -1,4 +1,4 @@
-//! Google ordinary-event patching and recovery; unknown provider fields never enter a PATCH.
+//! Google conditional event/recurrence patching and recovery; unknown provider fields never enter a PATCH.
 use super::*;
 use crate::{
     outgoing::{OutgoingOperation, OutgoingResult},
@@ -7,14 +7,20 @@ use crate::{
 use serde_json::{json, Map, Value};
 
 pub(super) fn editable(item: &IncomingItem) -> bool {
+    item.master.is_none()
+        && item.original_start.is_none()
+        && item.event.is_some()
+        && editable_fields(item)
+}
+pub(super) fn editable_fields(item: &IncomingItem) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&item.shadow) else {
         return false;
     };
     !item.unsupported
-        && item.master.is_none()
-        && item.original_start.is_none()
-        && item.event.as_ref().is_some_and(|e| e.recurrence.is_none())
-        && v.get("recurrence").is_none()
+        && item
+            .event
+            .as_ref()
+            .is_none_or(|e| crate::google_recurrence::compile(e).is_ok())
         && v.get("attendees").is_none()
         && v.get("attendeesOmitted").and_then(Value::as_bool) != Some(true)
         && v.get("locked").and_then(Value::as_bool) != Some(true)
@@ -43,7 +49,11 @@ fn fields(e: &CalendarEvent) -> Value {
             json!({"dateTime":end,"timeZone":time_zone}),
         ),
     };
-    json!({"summary":e.title,"location":e.location,"description":e.notes,"start":start,"end":end})
+    let mut value = json!({"summary":e.title,"location":e.location,"description":e.notes,"start":start,"end":end});
+    if let Ok(Some(rule)) = crate::google_recurrence::compile(e) {
+        value["recurrence"] = json!([rule]);
+    }
+    value
 }
 fn patch(op: &OutgoingOperation) -> Value {
     let Some(after) = &op.after else {
@@ -59,6 +69,12 @@ fn patch(op: &OutgoingOperation) -> Value {
         if old[key] != all[key] {
             patch.insert(key.into(), all[key].clone());
         }
+    }
+    if before.event.recurrence != after.event.recurrence {
+        patch.insert(
+            "recurrence".into(),
+            all.get("recurrence").cloned().unwrap_or(json!([])),
+        );
     }
     if before.event.time != after.event.time {
         // Explicit null clears the other time representation on all-day/timed conversion.
@@ -101,12 +117,65 @@ fn achieved(op: &OutgoingOperation, item: &IncomingItem) -> bool {
             || remote.location == after.location)
         && (before.is_some_and(|b| b.notes == after.notes) || remote.notes == after.notes)
         && (before.is_some_and(|b| b.time == after.time) || remote.time == after.time)
+        && (before.is_some_and(|b| b.recurrence == after.recurrence)
+            || remote.recurrence == after.recurrence)
 }
 pub(super) fn deliver(
     transport: &dyn GoogleTransport,
     access: &str,
     op: &OutgoingOperation,
 ) -> Result<OutgoingResult> {
+    if let Some(after) = &op.after {
+        crate::google_recurrence::compile(&after.event)?;
+    }
+    let instance = op.original_start.is_some();
+    let mut delivery = op.clone();
+    if let Some(original) = &op.original_start {
+        let master = op
+            .series_remote_id
+            .as_ref()
+            .ok_or_else(|| error("providerIdentity", "Missing recurring master identity."))?;
+        let current_master = transport
+            .event_request(access, &op.remote_calendar, master, "GET", None, None)?
+            .map(normalize)
+            .transpose()?
+            .flatten();
+        if !current_master.as_ref().is_some_and(editable) {
+            return Err(error(
+                "readOnly",
+                "The Google recurring master is read-only or no longer available.",
+            ));
+        }
+        for (source, destination) in [
+            (&op.before, &mut delivery.before),
+            (&op.after, &mut delivery.after),
+        ] {
+            *destination = source
+                .as_ref()
+                .map(|s| crate::outgoing::occurrence_event(s, original))
+                .transpose()?
+                .flatten()
+                .map(|event| EventSeries {
+                    event,
+                    exceptions: vec![],
+                });
+        }
+        delivery.operation = "update".into();
+    }
+    let op = &delivery;
+    let normalize_response = |value| {
+        if instance {
+            let page = events::normalized(events::EventPage {
+                items: vec![value],
+                next_page_token: None,
+                next_sync_token: None,
+                time_zone: "UTC".into(),
+            })?;
+            Ok(page.items.into_iter().next())
+        } else {
+            normalize(value)
+        }
+    };
     let get = || {
         transport
             .event_request(
@@ -117,11 +186,33 @@ pub(super) fn deliver(
                 None,
                 None,
             )
-            .and_then(|v| v.map(normalize).transpose().map(Option::flatten))
+            .and_then(|v| v.map(normalize_response).transpose().map(Option::flatten))
     };
     let current = get()?;
     if let Some(item) = &current {
-        if !editable(item) || item.revision.is_empty() {
+        if instance
+            && (item.master != op.series_remote_id || item.original_start != op.original_start)
+        {
+            return Err(error(
+                "providerIdentity",
+                "Google returned a different occurrence.",
+            ));
+        }
+        if item.remote_id != op.remote_id {
+            return Err(error(
+                "providerIdentity",
+                "Google returned a different resource.",
+            ));
+        }
+        if instance && op.after.is_none() && item.event.is_none() {
+            return Ok(OutgoingResult::Applied(current));
+        }
+        if !(if instance {
+            editable_fields(item)
+        } else {
+            editable(item)
+        }) || item.revision.is_empty()
+        {
             return Err(error(
                 "readOnly",
                 "This Google event is read-only. Review its pending changes.",
@@ -131,7 +222,8 @@ pub(super) fn deliver(
     if op.recovering
         && current.as_ref().is_some_and(|i| {
             let shadow: Value = serde_json::from_str(&i.shadow).unwrap_or_default();
-            shadow["extendedProperties"]["private"]["aikaOperation"] == op.id && achieved(op, i)
+            shadow["extendedProperties"]["private"]["aikaOperation"] == op.id
+                && (achieved(op, i) || (instance && op.after.is_none() && i.event.is_none()))
         })
     {
         return Ok(OutgoingResult::Applied(current));
@@ -194,6 +286,13 @@ pub(super) fn deliver(
         return Ok(OutgoingResult::Conflict(current));
     }
     let mut body = patch(op);
+    if instance {
+        body["status"] = json!(if op.after.is_some() {
+            "confirmed"
+        } else {
+            "cancelled"
+        });
+    }
     let shadow: Value = current
         .as_ref()
         .and_then(|i| serde_json::from_str(&i.shadow).ok())
@@ -221,7 +320,7 @@ pub(super) fn deliver(
                 return Ok(OutgoingResult::Conflict(None));
             }
             Ok(OutgoingResult::Applied(
-                value.map(normalize).transpose()?.flatten(),
+                value.map(normalize_response).transpose()?.flatten(),
             ))
         }
         Err(f) if f.code == "remoteConflict" => Ok(OutgoingResult::Conflict(get()?)),
@@ -231,7 +330,7 @@ pub(super) fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    type RecordedRequest = (String, Option<String>, Option<Value>);
+    type RecordedRequest = (String, Option<String>, Option<Value>, String);
     struct Transport {
         responses: Mutex<std::collections::VecDeque<Result<Option<Value>>>>,
         requests: Mutex<Vec<RecordedRequest>>,
@@ -261,7 +360,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            resource: &str,
             method: &str,
             body: Option<&Value>,
             revision: Option<&str>,
@@ -270,6 +369,7 @@ mod tests {
                 method.into(),
                 revision.map(str::to_owned),
                 body.cloned(),
+                resource.into(),
             ));
             self.responses
                 .lock()
@@ -321,6 +421,8 @@ mod tests {
             },
             recovering,
             shadow: "{}".into(),
+            original_start: None,
+            series_remote_id: None,
         }
     }
     #[test]
@@ -447,11 +549,11 @@ mod tests {
         ));
     }
     #[test]
-    fn meetings_special_types_and_recurrence_never_reach_write_transport() {
+    fn meetings_special_types_and_unsupported_recurrence_never_reach_write_transport() {
         for (key, value) in [
             ("attendees", json!([{ "email":"fixture@example.invalid" }])),
             ("eventType", json!("outOfOffice")),
-            ("recurrence", json!(["RRULE:FREQ=DAILY"])),
+            ("recurrence", json!(["RRULE:FREQ=HOURLY"])),
             ("locked", json!(true)),
             ("conferenceData", json!({"conferenceId":"fixture"})),
         ] {
@@ -503,11 +605,139 @@ mod tests {
             revision: Some("etag".into()),
             recovering: false,
             shadow: "{}".into(),
+            original_start: None,
+            series_remote_id: None,
         };
         let p = patch(&op);
         assert_eq!(p["summary"], "after");
         assert!(p.get("location").is_none());
         assert!(p.get("attendees").is_none());
         assert!(p["start"]["date"].is_null());
+    }
+    fn daily() -> Recurrence {
+        Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 2,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(6),
+            segment: None,
+        }
+    }
+    fn recurring_resource(title: &str, revision: &str) -> Value {
+        let mut v = resource(title, revision);
+        v["recurrence"] = json!(["RRULE:FREQ=DAILY;INTERVAL=2;COUNT=6"]);
+        v
+    }
+    fn instance_resource(title: &str, revision: &str, cancelled: bool) -> Value {
+        let mut v = resource(title, revision);
+        v["id"] = json!("actual-moved-instance");
+        v["recurringEventId"] = json!("remote");
+        v["originalStartTime"] = json!({"date":"2026-10-03"});
+        v["status"] = json!(if cancelled { "cancelled" } else { "confirmed" });
+        v["start"] = json!({"date":"2026-10-07"});
+        v["end"] = json!({"date":"2026-10-08"});
+        v
+    }
+    fn occurrence_operation(cancelled_before: bool, cancelled_after: bool) -> OutgoingOperation {
+        let mut op = operation("update", false);
+        let mut before = op.before.take().unwrap();
+        before.event.recurrence = Some(daily());
+        let mut replacement = before.event.clone();
+        replacement.recurrence = None;
+        replacement.time = EventTime::AllDay {
+            start_date: "2026-10-07".into(),
+            end_date: "2026-10-08".into(),
+        };
+        before.exceptions = vec![EventException {
+            original_start: "2026-10-03".into(),
+            event: if cancelled_before {
+                None
+            } else {
+                Some(replacement.clone())
+            },
+        }];
+        let mut after = before.clone();
+        replacement.title = "After".into();
+        after.exceptions[0].event = if cancelled_after {
+            None
+        } else {
+            Some(replacement)
+        };
+        op.before = Some(before);
+        op.after = Some(after);
+        op.remote_id = "actual-moved-instance".into();
+        op.original_start = Some("2026-10-03".into());
+        op.series_remote_id = Some("remote".into());
+        op
+    }
+    #[test]
+    fn recurring_create_compiles_rule_and_metadata_patch_preserves_remote_fields() {
+        let mut create = operation("create", false);
+        create.after.as_mut().unwrap().event.recurrence = Some(daily());
+        let t = Transport::new(vec![Ok(None), Ok(Some(recurring_resource("After", "r2")))]);
+        assert!(matches!(
+            deliver(&t, "access", &create).unwrap(),
+            OutgoingResult::Applied(Some(_))
+        ));
+        assert_eq!(
+            t.requests.lock().unwrap()[1].2.as_ref().unwrap()["recurrence"],
+            json!(["RRULE:FREQ=DAILY;INTERVAL=2;COUNT=6"])
+        );
+        let mut op = operation("update", false);
+        op.before.as_mut().unwrap().event.recurrence = Some(daily());
+        op.after.as_mut().unwrap().event.recurrence = Some(daily());
+        let t = Transport::new(vec![
+            Ok(Some(recurring_resource("Before", "r1"))),
+            Ok(Some(recurring_resource("After", "r2"))),
+        ]);
+        deliver(&t, "access", &op).unwrap();
+        let requests = t.requests.lock().unwrap();
+        let patch = requests[1].2.as_ref().unwrap();
+        assert_eq!(patch["summary"], "After");
+        for key in ["recurrence", "start", "end", "reminders", "attendees"] {
+            assert!(patch.get(key).is_none(), "{key}");
+        }
+    }
+    #[test]
+    fn moved_occurrence_cancel_restore_and_lost_responses_use_actual_identity() {
+        for (before, after) in [(false, false), (false, true), (true, false)] {
+            let op = occurrence_operation(before, after);
+            let t = Transport::new(vec![
+                Ok(Some(recurring_resource("Before", "master-etag"))),
+                Ok(Some(instance_resource("Before", "r1", before))),
+                Ok(Some(instance_resource("After", "r2", after))),
+            ]);
+            let OutgoingResult::Applied(Some(item)) = deliver(&t, "access", &op).unwrap() else {
+                panic!("expected applied")
+            };
+            assert_eq!(item.remote_id, "actual-moved-instance");
+            assert_eq!(item.event.is_none(), after);
+            let requests = t.requests.lock().unwrap();
+            assert_eq!(requests[0].3, "remote");
+            assert_eq!(requests[1].3, "actual-moved-instance");
+            assert_eq!(requests[2].3, "actual-moved-instance");
+            assert_eq!(requests[2].0, "PATCH");
+            assert_eq!(requests[2].1.as_deref(), Some("r1"));
+            assert_eq!(
+                requests[2].2.as_ref().unwrap()["status"],
+                if after { "cancelled" } else { "confirmed" }
+            );
+            drop(requests);
+            let mut recovered = op.clone();
+            recovered.recovering = true;
+            let mut remote = instance_resource("After", "r2", after);
+            remote["extendedProperties"]["private"]["aikaOperation"] = json!(op.id);
+            let t = Transport::new(vec![
+                Ok(Some(recurring_resource("Before", "master-etag"))),
+                Ok(Some(remote)),
+            ]);
+            assert!(matches!(
+                deliver(&t, "access", &recovered).unwrap(),
+                OutgoingResult::Applied(Some(_))
+            ));
+            assert_eq!(t.requests.lock().unwrap().len(), 2);
+        }
     }
 }

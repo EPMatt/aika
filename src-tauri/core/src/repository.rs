@@ -355,6 +355,14 @@ impl Repository {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_else(Capabilities::local);
+        let google: bool = self.db.query_row(
+            "SELECT provider_id='google' FROM calendars WHERE id=?1",
+            [calendar],
+            |r| r.get(0),
+        )?;
+        if google && writable {
+            caps.recurrence = true;
+        }
         if !writable {
             caps = caps.intersect(&Capabilities::read_only());
         }
@@ -362,6 +370,13 @@ impl Repository {
     }
     pub fn event_capabilities(&self, event: &str) -> Result<Capabilities> {
         let master = event.split_once('@').map_or(event, |(id, _)| id);
+        let shadow: Option<String> = self.db.query_row("SELECT r.shadow_payload FROM remote_events r JOIN calendars c ON c.id=r.calendar_id WHERE r.id=?1 AND c.provider_id='google'", [master], |r| r.get(0)).optional()?;
+        if let Some(shadow) = shadow {
+            if let Some((_, original)) = event.split_once('@') {
+                Self::require_cached_occurrence(&self.db, master, original)?;
+            }
+            return Self::google_cached_capabilities(&self.db, master, &shadow);
+        }
         let json: Option<String> = self
             .db
             .query_row(
@@ -374,6 +389,27 @@ impl Repository {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_else(Capabilities::local))
+    }
+    fn require_cached_occurrence(db: &Connection, master: &str, original: &str) -> Result<()> {
+        let shadow: Option<String> = db.query_row("SELECT child.shadow_payload FROM remote_events parent JOIN calendars c ON c.id=parent.calendar_id JOIN remote_events child ON child.calendar_id=parent.calendar_id AND child.account_id=parent.account_id JOIN incoming_items i ON i.id=child.id WHERE parent.id=?1 AND c.provider_id='google' AND json_extract(i.payload,'$.master')=parent.remote_id AND json_extract(i.payload,'$.original_start')=?2", params![master,original], |r| r.get(0)).optional()?;
+        if shadow
+            .as_ref()
+            .is_some_and(|s| !crate::google::cached_instance_editable(s))
+        {
+            return Err(error(
+                "readOnly",
+                "This Google occurrence contains unsupported meeting or provider fields.",
+            ));
+        }
+        Ok(())
+    }
+    fn google_cached_capabilities(db: &Connection, id: &str, shadow: &str) -> Result<Capabilities> {
+        let unobserved_create: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE event_id=?1 AND operation='create' AND state!='acknowledged')", [id], |r| r.get(0))?;
+        Ok(if shadow == "{}" && unobserved_create {
+            Capabilities::google_recurring()
+        } else {
+            crate::google::cached_capabilities(shadow)
+        })
     }
     /// Cache ingestion preserves opaque provider payload and revisions separately from editor fields.
     /// Pagination/cursor publication is introduced by the incoming-sync phase.
@@ -409,7 +445,12 @@ impl Repository {
         tx.commit()?;
         Ok(event.id)
     }
-    fn queue_change(db: &Connection, change: &SeriesChange, undo: bool, group: &str) -> Result<()> {
+    pub(crate) fn queue_change(
+        db: &Connection,
+        change: &SeriesChange,
+        undo: bool,
+        group: &str,
+    ) -> Result<()> {
         let expected = if undo { &change.after } else { &change.before };
         let value = if undo { &change.before } else { &change.after };
         let Some(series) = value.as_ref().or(expected.as_ref()) else {
@@ -459,7 +500,89 @@ impl Repository {
             "INSERT OR IGNORE INTO operation_groups(id,account_id,calendar_id) VALUES(?1,?2,?3)",
             params![group, account, series.event.calendar_id],
         )?;
-        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on,group_id,step_index) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT count(*) FROM outbox WHERE group_id=?10))", params![uuid::Uuid::new_v4().to_string(),account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)}),group])?;
+        let original = match (expected, value) {
+            (Some(b), Some(a)) if b.event == a.event => {
+                let keys: std::collections::BTreeSet<_> = b
+                    .exceptions
+                    .iter()
+                    .chain(&a.exceptions)
+                    .map(|x| x.original_start.clone())
+                    .collect();
+                let changed: Vec<_> = keys
+                    .into_iter()
+                    .filter(|k| {
+                        b.exceptions.iter().find(|x| &x.original_start == k)
+                            != a.exceptions.iter().find(|x| &x.original_start == k)
+                    })
+                    .collect();
+                if changed.len() > 1 {
+                    return Err(error(
+                        "unsupported",
+                        "Google occurrence writes require one changed exception.",
+                    ));
+                }
+                changed.into_iter().next()
+            }
+            _ => None,
+        };
+        if let (Some(before), Some(after)) = (expected, value) {
+            if (before.event.recurrence.is_some() || after.event.recurrence.is_some())
+                && (before.event.time != after.event.time
+                    || before.event.recurrence != after.event.recurrence)
+            {
+                return Err(error(
+                    "unsupported",
+                    "Google schedule edits cannot prove preservation of remote exceptions.",
+                ));
+            }
+            if before.event != after.event && before.exceptions != after.exceptions {
+                return Err(error(
+                    "groupRecoveryRequired",
+                    "Reconcile master and occurrence changes separately.",
+                ));
+            }
+        }
+        // Aggregate ordering can interleave master and instance resources. Capture
+        // a revision dependency on the actual master, not an instance ETag.
+        let revision = if original.is_none() && series.event.recurrence.is_some() {
+            let predecessor: Option<String> = db.query_row("SELECT id FROM outbox WHERE event_id=?1 AND original_start IS NULL AND state!='acknowledged' ORDER BY rowid DESC LIMIT 1", [&change.id], |r| r.get(0)).optional()?;
+            predecessor
+                .map(|id| format!("aikaPredecessor:{id}"))
+                .or(revision)
+        } else {
+            revision
+        };
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on,group_id,step_index) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT count(*) FROM outbox WHERE group_id=?10))", params![operation_id,account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)}),group])?;
+        if let Some(original) = original {
+            // Never invent an instance id. Preflight binds it before the first write.
+            db.execute("UPDATE outbox SET series_remote_id=coalesce((SELECT resource_id FROM outbox p WHERE p.event_id=?2 AND p.operation='create' AND p.state!='acknowledged' AND p.rowid<(SELECT rowid FROM outbox WHERE id=?1) ORDER BY p.rowid DESC LIMIT 1),(SELECT remote_id FROM remote_events WHERE id=?2)),original_start=?3,resource_id=NULL,expected_revision=NULL WHERE id=?1", params![operation_id,change.id,original])?;
+        }
+        if expected.is_none() {
+            if let Some(restored) = value {
+                // Reserve the master once, then restore exceptions through provider lookups.
+                let mut head = EventSeries {
+                    event: restored.event.clone(),
+                    exceptions: vec![],
+                };
+                for exception in &restored.exceptions {
+                    let mut tail = head.clone();
+                    tail.exceptions.push(exception.clone());
+                    Self::queue_change(
+                        db,
+                        &SeriesChange {
+                            id: change.id.clone(),
+                            before: Some(head),
+                            after: Some(tail.clone()),
+                        },
+                        false,
+                        group,
+                    )?;
+                    head = tail;
+                }
+                db.execute("UPDATE operation_group_series SET before_payload=NULL,after_payload=?3 WHERE group_id=?1 AND event_id=?2",params![group,change.id,after])?;
+            }
+        }
         Ok(())
     }
     pub fn undo_requirements(&mut self) -> Result<Vec<(String, Option<CalendarEvent>, String)>> {
@@ -806,7 +929,7 @@ impl Repository {
         });
         Ok(events)
     }
-    fn read_series(db: &Connection, id: &str) -> Result<Option<EventSeries>> {
+    pub(crate) fn read_series(db: &Connection, id: &str) -> Result<Option<EventSeries>> {
         let Some(event) = Self::read(db, id)? else {
             return Ok(None);
         };
@@ -839,12 +962,16 @@ impl Repository {
         let series = Self::read_series(&tx, id)?
             .ok_or_else(|| error("notFound", "This event no longer exists."))?;
         if let Some((_, key)) = target.split_once('@') {
-            aika_domain::recurrence::get_occurrence(&series, key)?;
+            let mut probe = series.clone();
+            probe
+                .exceptions
+                .retain(|x| x.original_start != key || x.event.is_some());
+            aika_domain::recurrence::get_occurrence(&probe, key)?;
         }
         tx.commit()?;
         Ok(series)
     }
-    pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
+    pub fn mutate_event(&mut self, mut request: EventMutation) -> Result<Vec<CalendarEvent>> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -854,11 +981,47 @@ impl Repository {
             .map_or(request.target.as_str(), |(id, _)| id);
         let series = Self::read_series(&tx, id)?
             .ok_or_else(|| error("notFound", "This event no longer exists."))?;
+        let remote = Self::calendar_account_db(&tx, &series.event.calendar_id)?;
+        if remote {
+            if request.scope == MutationScope::Occurrence {
+                if let Some((_, original)) = request.target.split_once('@') {
+                    Self::require_cached_occurrence(&tx, id, original)?;
+                }
+            }
+            if request.scope == MutationScope::Following {
+                return Err(error(
+                    "unsupported",
+                    "Google following changes require the following recovery phase.",
+                ));
+            }
+            if request.reset_exceptions || request.exception_policy == Some(ExceptionPolicy::Reset)
+            {
+                return Err(error(
+                    "unsupported",
+                    "Google series edits preserve individual exceptions.",
+                ));
+            }
+            request.exception_policy = Some(ExceptionPolicy::Preserve);
+        } else if request.exception_policy == Some(ExceptionPolicy::Preserve) {
+            return Err(error(
+                "unsupported",
+                "Local series edits use the reset exception policy.",
+            ));
+        }
         let changes = aika_domain::recurrence::plan_mutation(
             &series,
             &request,
             &uuid::Uuid::new_v4().to_string(),
         )?;
+        if remote && request.scope == MutationScope::Series {
+            if let Some(after) = changes[0].after.as_ref() {
+                if after.event.time != series.event.time
+                    || after.event.recurrence != series.event.recurrence
+                {
+                    return Err(error("unsupported", "Google schedule changes cannot yet prove preservation of all remote exceptions. Metadata edits remain available."));
+                }
+            }
+        }
         Self::apply_changes(&tx, &changes, false)?;
         tx.commit()?;
         let saved = changes
@@ -869,7 +1032,7 @@ impl Repository {
         self.history.push(HistoryEntry { changes });
         Ok(saved)
     }
-    fn write_series(db: &Connection, series: &EventSeries) -> Result<()> {
+    pub(crate) fn write_series(db: &Connection, series: &EventSeries) -> Result<()> {
         Self::require_calendar(db, &series.event.calendar_id)?;
         Self::write(db, &series.event)?;
         db.execute(
@@ -883,6 +1046,13 @@ impl Repository {
             db.execute("INSERT INTO event_exceptions(series_id,original_start,calendar_id,payload) VALUES(?1,?2,?3,?4)",params![series.event.id,exception.original_start,exception.event.as_ref().map(|e|&e.calendar_id),exception.event.as_ref().map(serde_json::to_string).transpose()?])?;
         }
         Ok(())
+    }
+    fn calendar_account_db(db: &Connection, calendar: &str) -> Result<bool> {
+        Ok(db.query_row(
+            "SELECT account_id IS NOT NULL FROM calendars WHERE id=?1",
+            [calendar],
+            |r| r.get(0),
+        )?)
     }
     fn require_mutation(db: &Connection, event: &CalendarEvent, operation: &str) -> Result<()> {
         Self::require_calendar(db, &event.calendar_id)?;
@@ -909,12 +1079,38 @@ impl Repository {
         } else {
             event_caps
         };
-        let caps = caps.intersect(
-            &event_caps
+        let google: bool = db.query_row(
+            "SELECT provider_id='google' FROM calendars WHERE id=?1",
+            [&event.calendar_id],
+            |r| r.get(0),
+        )?;
+        let caps = if google {
+            Capabilities {
+                recurrence: true,
+                ..caps
+            }
+        } else {
+            caps
+        };
+        let effective_event_caps = if google && operation != "create" {
+            let shadow: Option<String> = db
+                .query_row(
+                    "SELECT shadow_payload FROM remote_events WHERE id=?1",
+                    [&event.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            shadow
+                .map(|s| Self::google_cached_capabilities(db, &event.id, &s))
+                .transpose()?
+                .unwrap_or_else(Capabilities::google_recurring)
+        } else {
+            event_caps
                 .map(|s| serde_json::from_str(&s))
                 .transpose()?
-                .unwrap_or_else(Capabilities::local),
-        );
+                .unwrap_or_else(Capabilities::local)
+        };
+        let caps = caps.intersect(&effective_event_caps);
         if !writable
             || !match operation {
                 "create" => caps.create,
@@ -929,11 +1125,8 @@ impl Repository {
                 "This calendar or event does not permit this operation.",
             ));
         }
-        if account.is_some() && event.recurrence.is_some() {
-            return Err(error(
-                "unsupported",
-                "Remote recurrence writes require the recurring-sync phase.",
-            ));
+        if account.is_some() {
+            crate::google_recurrence::compile(event)?;
         }
         Ok(())
     }
@@ -1990,6 +2183,7 @@ mod recurrence_tests {
             event,
             expected: aika_domain::recurrence::expectation(series).unwrap(),
             reset_exceptions: false,
+            exception_policy: None,
             count_changed: false,
         }
     }

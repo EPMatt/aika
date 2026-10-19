@@ -209,48 +209,63 @@ impl CalendarService {
     }
 }
 
-pub(crate) fn restore_incoming(tx: &Connection, id: &str) -> Result<()> {
-    // Rebuild the aggregate from retained provider observations.
+pub(crate) fn observed_series(tx: &Connection, id: &str) -> Result<Option<EventSeries>> {
     let payload: Option<String> = tx.query_row(
         "SELECT (SELECT payload FROM incoming_items WHERE id=?1)",
         [id],
         |r| r.get(0),
     )?;
-    tx.execute("DELETE FROM events WHERE id=?1", [id])?;
-    if let Some(payload) = payload {
-        let item: IncomingItem = serde_json::from_str(&payload)?;
-        if let Some(mut event) = item
-            .event
-            .filter(|_| !item.unsupported && item.master.is_none())
-        {
-            let calendar: String = tx.query_row(
-                "SELECT calendar_id FROM remote_events WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )?;
-            event.id = id.to_owned();
-            event.calendar_id = calendar.clone();
-            Repository::write(tx, &event)?;
-            // Google may have converted the formerly ordinary event to a series
-            // while its local edit was pending. Restore cached exceptions too.
-            if event.recurrence.is_some() {
-                let mut q = tx.prepare("SELECT i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 AND json_extract(i.payload,'$.master')=?2 ORDER BY i.id")?;
-                let items = q
-                    .query_map(params![calendar, item.remote_id], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for payload in items {
-                    let exception: IncomingItem = serde_json::from_str(&payload)?;
-                    if let Some(original) = exception.original_start {
-                        let replacement = exception.event.map(|mut e| {
-                            e.id = id.to_owned();
-                            e.calendar_id = calendar.clone();
-                            e
-                        });
-                        tx.execute("INSERT INTO event_exceptions(series_id,original_start,calendar_id,payload) VALUES(?1,?2,?3,?4) ON CONFLICT(series_id,original_start) DO UPDATE SET calendar_id=excluded.calendar_id,payload=excluded.payload", params![id,original,replacement.as_ref().map(|e| &e.calendar_id),replacement.as_ref().map(serde_json::to_string).transpose()?])?;
-                    }
-                }
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let item: IncomingItem = serde_json::from_str(&payload)?;
+    let Some(mut event) = item
+        .event
+        .filter(|_| !item.unsupported && item.master.is_none())
+    else {
+        return Ok(None);
+    };
+    let calendar: String = tx.query_row(
+        "SELECT calendar_id FROM remote_events WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    event.id = id.into();
+    event.calendar_id = calendar.clone();
+    let mut result = EventSeries {
+        event,
+        exceptions: vec![],
+    };
+    if result.event.recurrence.is_some() {
+        let mut q = tx.prepare("SELECT i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 AND json_extract(i.payload,'$.master')=?2 ORDER BY i.id")?;
+        let items = q
+            .query_map(params![calendar, item.remote_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for payload in items {
+            let exception: IncomingItem = serde_json::from_str(&payload)?;
+            if let Some(original_start) = exception.original_start {
+                let event = exception.event.map(|mut e| {
+                    e.id = id.into();
+                    e.calendar_id = calendar.clone();
+                    e
+                });
+                result.exceptions.push(EventException {
+                    original_start,
+                    event,
+                });
             }
         }
+        result
+            .exceptions
+            .sort_by(|a, b| a.original_start.cmp(&b.original_start));
+    }
+    Ok(Some(result))
+}
+pub(crate) fn restore_incoming(tx: &Connection, id: &str) -> Result<()> {
+    let observed = observed_series(tx, id)?;
+    tx.execute("DELETE FROM events WHERE id=?1", [id])?;
+    if let Some(series) = observed {
+        Repository::write_series(tx, &series)?;
     }
     Ok(())
 }

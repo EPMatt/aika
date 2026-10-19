@@ -532,7 +532,15 @@ pub fn plan_mutation(
             "Event identity does not match its series.",
         ));
     }
-    let selected = key.map(|k| get_occurrence(series, k)).transpose()?;
+    let selected = key
+        .map(|k| {
+            let mut probe = series.clone();
+            probe
+                .exceptions
+                .retain(|x| x.original_start != k || x.event.is_some());
+            get_occurrence(&probe, k)
+        })
+        .transpose()?;
     if request.scope != MutationScope::Series
         && (key.is_none() || series.event.recurrence.is_none())
     {
@@ -581,7 +589,11 @@ pub fn plan_mutation(
         request.scope == MutationScope::Series
             || key.is_some_and(|k| e.original_start.as_str() >= k)
     });
-    if request.event.is_some() && affected && !request.reset_exceptions {
+    if request.event.is_some()
+        && affected
+        && !request.reset_exceptions
+        && request.exception_policy != Some(ExceptionPolicy::Preserve)
+    {
         return Err(error(
             "exceptionsResetRequired",
             "This edit resets individual changes. Confirm reset of affected exceptions.",
@@ -617,7 +629,11 @@ pub fn plan_mutation(
             before: Some(series.clone()),
             after: changed.map(|event| EventSeries {
                 event,
-                exceptions: vec![],
+                exceptions: if request.exception_policy == Some(ExceptionPolicy::Preserve) {
+                    series.exceptions.clone()
+                } else {
+                    vec![]
+                },
             }),
         }]);
     }

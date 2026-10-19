@@ -27,6 +27,12 @@ impl Capabilities {
             move_event: true,
         }
     }
+    pub fn google_recurring() -> Self {
+        Self {
+            recurrence: true,
+            ..Self::ordinary()
+        }
+    }
     pub fn ordinary() -> Self {
         Self {
             recurrence: false,
@@ -86,8 +92,10 @@ impl EventActions {
                 .iter()
                 .map(|scope| ScopeAvailability {
                     scope: scope.clone(),
-                    disabled_reason: if recurring && remote {
-                        Some("Google recurring changes are not available yet.".into())
+                    disabled_reason: if recurring && remote && *scope == MutationScope::Following {
+                        Some(
+                            "Google following changes require the following recovery phase.".into(),
+                        )
                     } else if !allowed || (recurring && !caps.recurrence) {
                         Some("This calendar or event is read-only.".into())
                     } else {
@@ -243,15 +251,15 @@ pub struct CalendarRemovalReview {
 mod scope_tests {
     use super::*;
     #[test]
-    fn remote_recurrence_scopes_remain_disabled_even_with_writable_capabilities() {
+    fn remote_recurrence_enables_occurrence_and_series_but_explains_following() {
         let remote = EventActions::for_event(&Capabilities::local(), true, true);
         assert_eq!(remote.edit.len(), 3);
-        assert!(remote
-            .edit
-            .iter()
-            .chain(&remote.delete)
-            .all(|s| s.disabled_reason.as_deref()
-                == Some("Google recurring changes are not available yet.")));
+        for action in remote.edit.iter().chain(&remote.delete) {
+            assert_eq!(
+                action.disabled_reason.is_some(),
+                action.scope == MutationScope::Following
+            );
+        }
         let local = EventActions::for_event(&Capabilities::local(), true, false);
         assert!(local
             .edit

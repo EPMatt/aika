@@ -11,6 +11,18 @@ pub trait Provider: Send + Sync {
     fn event_capabilities(&self, _item: &crate::sync::IncomingItem) -> Capabilities {
         Capabilities::read_only()
     }
+    fn resolve_outgoing_instance(
+        &self,
+        _subject: &str,
+        _calendar: &str,
+        _series: &str,
+        _original: &str,
+    ) -> Result<crate::sync::IncomingItem> {
+        Err(error(
+            "unsupported",
+            "Provider instance lookup unavailable.",
+        ))
+    }
     fn outgoing(
         &self,
         _subject: &str,
@@ -262,7 +274,14 @@ impl ProviderRegistry {
     }
     pub fn event_actions(&self, target: &str) -> Result<EventActions> {
         let series = self.get_series(target)?;
-        let caps = self.capabilities(&series.event.calendar_id, Some(&series.event))?;
+        let caps = self
+            .capabilities(&series.event.calendar_id, Some(&series.event))?
+            .intersect(
+                &self
+                    .repository
+                    .event_capabilities(target)
+                    .unwrap_or_else(|_| Capabilities::read_only()),
+            );
         Ok(EventActions::for_event(
             &caps,
             series.event.recurrence.is_some(),

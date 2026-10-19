@@ -340,3 +340,190 @@ test('writable ordinary Google events queue offline edits and offer checked conf
     false,
   ]);
 });
+
+test('Google recurring controls preserve exceptions and explain unsupported scopes', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'isTauri', { value: true });
+    const id = '9eed7866-4246-4a81-9281-9c5d94c174df';
+    const now = new Date();
+    const day = (offset: number) => {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    const master = {
+      id,
+      calendarId: 'imported',
+      title: 'Google repeat',
+      location: '',
+      notes: '',
+      time: { kind: 'allDay', startDate: day(0), endDate: day(1) },
+      recurrence: {
+        frequency: 'daily',
+        interval: 1,
+        weekdays: [],
+        monthlyOn: 'date',
+        count: 5,
+        until: null,
+      },
+    };
+    const occurrence = {
+      ...master,
+      id: `${id}@${day(0)}`,
+      occurrence: { seriesId: id, originalStart: day(0), expected: 'checked-series' },
+    };
+    const caps = {
+      read: true,
+      create: true,
+      edit: true,
+      delete: true,
+      recurrence: true,
+      customizeMetadata: true,
+      moveEvent: false,
+    };
+    const actions = ['occurrence', 'following', 'series'].map((scope) => ({
+      scope,
+      disabledReason:
+        scope === 'following'
+          ? 'Google following changes require the following recovery phase.'
+          : null,
+    }));
+    const fixture = { requests: [] as any[], event: occurrence, conflicts: [] as any[] };
+    (window as any).recurringGoogleFixture = fixture;
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      value: {
+        invoke: async (command: string, args: any) => {
+          switch (command) {
+            case 'get_app_info':
+              return { name: 'aika', version: 'fixture', provider: 'local' };
+            case 'get_preferences':
+              return { appearance: 'light', view: 'month', sidebar: true };
+            case 'list_providers':
+              return [];
+            case 'sync_conflicts':
+              return structuredClone(fixture.conflicts);
+            case 'set_preferences':
+            case 'request_sync':
+              return;
+            case 'calendar_snapshot':
+              return {
+                calendars: [
+                  {
+                    id: 'imported',
+                    providerId: 'google',
+                    name: 'Imported',
+                    color: '#718675',
+                    description: '',
+                    writable: true,
+                  },
+                ],
+                events: [fixture.event],
+                defaultCalendarId: 'imported',
+                hiddenCalendarIds: [],
+                canUndo: false,
+                accounts: [
+                  {
+                    id: 'account',
+                    providerId: 'google',
+                    remoteSubject: 'fixture',
+                    displayName: 'fixture@example.invalid',
+                    connectionState: 'connected',
+                    selectedCalendarIds: ['imported'],
+                  },
+                ],
+                syncStatus: [
+                  {
+                    accountId: 'account',
+                    syncing: false,
+                    lastSuccess: null,
+                    failure: null,
+                    pendingCount: 0,
+                    conflictCount: fixture.conflicts.length,
+                    calendars: [],
+                  },
+                ],
+                calendarCapabilities: { imported: caps },
+                eventCapabilities: { [id]: caps, [occurrence.id]: caps },
+                eventActions: {
+                  [id]: { edit: actions, delete: actions },
+                  [occurrence.id]: { edit: actions, delete: actions },
+                },
+              };
+            case 'get_event_series':
+              return { event: master, exceptions: [{ originalStart: day(1), event: null }] };
+            case 'preview_recurrence':
+              return [];
+            case 'mutate_recurring_event':
+              fixture.requests.push(args.request);
+              fixture.event = { ...fixture.event, title: args.request.event.title };
+              return [args.request.event];
+            default:
+              throw new Error(`Unexpected command: ${command}`);
+          }
+        },
+      },
+    });
+  });
+  await page.goto('/');
+  await page
+    .getByRole('button', { name: /Google repeat, recurring/ })
+    .first()
+    .click();
+  await expect(page.getByLabel('Event change scope')).toHaveValue('occurrence');
+  await expect(page.getByLabel('Repeat pattern')).toBeDisabled();
+  await expect(
+    page.getByLabel('Event change scope').locator('option[value="following"]'),
+  ).toHaveJSProperty('disabled', true);
+  await page.getByLabel('Event change scope').selectOption('series');
+  await expect(page.getByLabel('All-day event')).toBeDisabled();
+  await expect(page.locator('#event-start-date')).toBeDisabled();
+  await expect(
+    page.getByText('Google series edits preserve individual changes.', { exact: false }),
+  ).toBeVisible();
+  await expect(page.getByLabel('Reset individual changes', { exact: true })).toHaveCount(0);
+  await page.getByLabel('Event title', { exact: true }).fill('Preserved repeat');
+  const axe = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze();
+  expect(axe.violations).toEqual([]);
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).recurringGoogleFixture.requests.length))
+    .toBe(1);
+  expect(
+    await page.evaluate(() => (window as any).recurringGoogleFixture.requests[0]),
+  ).toMatchObject({
+    scope: 'series',
+    exceptionPolicy: 'preserve',
+    resetExceptions: false,
+    expected: 'checked-series',
+  });
+  await page.evaluate(() => {
+    const fixture = (window as any).recurringGoogleFixture;
+    fixture.conflicts = [
+      {
+        id: 'recurring-conflict',
+        accountId: 'account',
+        calendarId: 'imported',
+        eventId: fixture.event.occurrence.seriesId,
+        local: { event: fixture.event, exceptions: [{ originalStart: '2026-10-20', event: null }] },
+        remote: {
+          event: fixture.event,
+          exceptions: [
+            {
+              originalStart: '2026-10-20',
+              event: { ...fixture.event, title: 'External individual edit' },
+            },
+          ],
+        },
+        remoteRevision: 'checked',
+        groupRevision: 'complete-review',
+      },
+    ];
+    window.dispatchEvent(new Event('focus'));
+  });
+  await page.getByText('Compare versions', { exact: true }).click();
+  await expect(page.getByLabel('Local individual changes')).toContainText('Cancelled occurrence');
+  await expect(page.getByLabel('Google individual changes')).toContainText(
+    'External individual edit',
+  );
+});

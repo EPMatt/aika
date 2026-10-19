@@ -1,6 +1,6 @@
 # Google integration follow-on plan — 2026-10-19
 
-Status: phase 01 durable foundation implemented; see its [handoff](../handoffs/google-follow-on-01-durable-recurrence.md) for verification and restrictions. Phases 02–06 remain unimplemented.
+Status: phases 01–02 implemented; see the [phase 01 handoff](../handoffs/google-follow-on-01-durable-recurrence.md) and [phase 02 handoff](../handoffs/google-follow-on-02-recurring-writes.md) for verification and restrictions. Phases 03–06 remain unimplemented. Phase 02 conservatively blocks structural edits to existing Google schedules because complete exception correspondence cannot be established from the cache; metadata edits preserve exceptions. Deterministic restoration of a deleted series uses phase 01 groups; following splits and combined replanning remain phase 03 work.
 
 This is a **separate follow-on plan**, not a replacement for the initial Google integration plan or its handoffs. Phases below belong exclusively to the `google-follow-on` sequence. Do not reinterpret phase numbers in earlier plans or overwrite existing Google handoffs.
 

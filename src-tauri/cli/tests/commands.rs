@@ -1161,3 +1161,147 @@ fn native_action_scopes_are_available_to_cli_clients() {
     assert_eq!(actions["delete"][2]["scope"], "series");
     assert!(actions["edit"][0]["disabledReason"].is_null());
 }
+
+#[test]
+fn google_recurring_cli_scopes_restore_cancelled_and_reject_unsafe_intent() {
+    use aika_core::{contracts::*, repository::Repository};
+    let f = Fixture::new();
+    let mut repo = Repository::open(&f.0).unwrap();
+    let account = repo
+        .upsert_account(
+            "google",
+            "phase02-fixture",
+            "Disposable",
+            ConnectionState::Connected,
+        )
+        .unwrap();
+    let calendar = repo
+        .import_calendar(
+            &account,
+            "remote-calendar",
+            CalendarDetails {
+                name: "Google fixture".into(),
+                color: "#718675".into(),
+                description: "".into(),
+            },
+            Capabilities::ordinary(),
+        )
+        .unwrap();
+    let event = CalendarEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        calendar_id: calendar.clone(),
+        title: "Google series".into(),
+        location: "".into(),
+        notes: "".into(),
+        occurrence: None,
+        time: EventTime::AllDay {
+            start_date: "2026-10-01".into(),
+            end_date: "2026-10-02".into(),
+        },
+        recurrence: Some(Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 1,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(4),
+            segment: None,
+        }),
+    };
+    let shadow = r#"{"id":"actual-master","etag":"master-r1","summary":"Google series","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"},"recurrence":["RRULE:FREQ=DAILY;COUNT=4"]}"#;
+    let master = repo
+        .cache_event(
+            &account,
+            "actual-master",
+            event,
+            "master-r1",
+            shadow,
+            Capabilities::read_only(),
+        )
+        .unwrap();
+    repo.set_default_calendar(&calendar).unwrap();
+    drop(repo);
+    // Old capability JSON is re-evaluated from native Google shadows.
+    let actions: serde_json::Value =
+        serde_json::from_str(&f.success(&["events", "actions", &master])).unwrap();
+    assert!(actions["edit"][0]["disabledReason"].is_null());
+    assert!(actions["edit"][1]["disabledReason"]
+        .as_str()
+        .unwrap()
+        .contains("following"));
+    let selected = format!("{master}@2026-10-02");
+    f.success(&["events", "delete", &selected, "--scope", "occurrence"]);
+    f.success(&[
+        "events",
+        "update",
+        &selected,
+        "--scope",
+        "occurrence",
+        "--title",
+        "Restored occurrence",
+    ]);
+    f.success(&[
+        "events",
+        "update",
+        &master,
+        "--scope",
+        "series",
+        "--title",
+        "Metadata only",
+    ]);
+    let series = Repository::open(&f.0).unwrap().get_series(&master).unwrap();
+    assert_eq!(series.exceptions.len(), 1);
+    assert_eq!(
+        series.exceptions[0].event.as_ref().unwrap().title,
+        "Restored occurrence"
+    );
+    for options in [vec!["--interval", "2"], vec!["--reset-exceptions"]] {
+        let mut args = vec![
+            "events", "update", &master, "--scope", "series", "--title", "Unsafe",
+        ];
+        args.extend(options);
+        assert!(!f.run(&args).status.success());
+    }
+    assert!(!f
+        .run(&["events", "delete", &selected, "--scope", "following"])
+        .status
+        .success());
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Compatible",
+        "--all-day",
+        "--start",
+        "2026-10-01",
+        "--end",
+        "2026-10-02",
+        "--repeat",
+        "weekly",
+        "--interval",
+        "2",
+        "--until",
+        "2026-12-31",
+    ]);
+    assert!(created.contains("Compatible"));
+    let rejected = f.run(&[
+        "events",
+        "create",
+        "--title",
+        "Regional",
+        "--start",
+        "2026-10-01T09:00",
+        "--end",
+        "2026-10-01T10:00",
+        "--repeat",
+        "daily",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(Repository::open(&f.0)
+        .unwrap()
+        .get_series(&master)
+        .unwrap()
+        .exceptions[0]
+        .event
+        .is_some());
+}
