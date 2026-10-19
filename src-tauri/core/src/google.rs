@@ -112,6 +112,7 @@ impl TokenResponse {
     }
 }
 struct Session {
+    epoch: Option<i64>,
     public: ConnectionSession,
     identity: Option<ConnectedIdentity>,
     started: Instant,
@@ -122,9 +123,17 @@ struct Inner {
     credentials: CredentialService,
     // Serializes refresh/credential replacement for this provider without locking the repository.
     credential_work: Mutex<()>,
+    lifecycle: Option<crate::lifecycle::Lifecycle>,
     transport: Arc<dyn GoogleTransport>,
 }
 pub struct GoogleProvider(Arc<Inner>);
+impl GoogleProvider {
+    pub(crate) fn with_lifecycle(lifecycle: Option<crate::lifecycle::Lifecycle>) -> Self {
+        let mut provider = Self::default();
+        Arc::get_mut(&mut provider.0).unwrap().lifecycle = lifecycle;
+        provider
+    }
+}
 impl Default for GoogleProvider {
     fn default() -> Self {
         Self(Arc::new(Inner {
@@ -132,6 +141,7 @@ impl Default for GoogleProvider {
             sessions: Mutex::new(BTreeMap::new()),
             credentials: CredentialService::default(),
             credential_work: Mutex::new(()),
+            lifecycle: None,
             transport: Arc::new(HttpTransport),
         }))
     }
@@ -593,6 +603,11 @@ fn run_connection(
         return Err(error("cancelled", "Google connection stopped."));
     }
     let _credentials = inner.credential_work.lock().unwrap();
+    let _identity_lock = inner.lifecycle.as_ref().map(|l| l.lock()).transpose()?;
+    let epoch = inner.sessions.lock().unwrap().get(id).and_then(|s| s.epoch);
+    if let Some(l) = &inner.lifecycle {
+        l.check(&identity.sub, epoch)?;
+    }
     let tokens = response.merge(read_tokens(inner, &identity.sub)?)?;
     let mut sessions = inner.sessions.lock().unwrap();
     let session = sessions
@@ -604,6 +619,12 @@ fn run_connection(
         return Err(error("cancelled", "Google connection stopped."));
     }
     store_tokens(inner, &identity.sub, &tokens)?;
+    if let Some(l) = &inner.lifecycle {
+        l.db()?.execute(
+            "UPDATE identity_lifecycles SET state='active' WHERE identity_hash=?1",
+            [crate::lifecycle::identity("google", &identity.sub)],
+        )?;
+    }
     let identity = ConnectedIdentity {
         subject: identity.sub,
         display_name: identity.email,
@@ -762,6 +783,7 @@ impl Provider for GoogleProvider {
         sessions.insert(
             public.id.clone(),
             Session {
+                epoch: self.0.lifecycle.as_ref().map(|l| l.epoch()).transpose()?,
                 public: public.clone(),
                 identity: None,
                 started: Instant::now(),
@@ -869,8 +891,32 @@ impl Provider for GoogleProvider {
                 .event_page(&access, calendar, cursor, page, projection)?,
         )
     }
+    fn remove_credentials(&self, subject: &str) -> Result<()> {
+        self.0.credentials.delete("google", subject)
+    }
+    fn connection_epoch(&self, id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .0
+            .sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|s| s.epoch))
+    }
+    fn credential_epoch(&self) -> Result<Option<i64>> {
+        self.0.lifecycle.as_ref().map(|l| l.epoch()).transpose()
+    }
+    fn disconnect_checked(&self, subject: &str, epoch: Option<i64>) -> Result<()> {
+        let _guard = self.0.credential_work.lock().unwrap();
+        let _identity_lock = self.0.lifecycle.as_ref().map(|l| l.lock()).transpose()?;
+        if let Some(l) = &self.0.lifecycle {
+            l.check(subject, epoch)?;
+        }
+        self.0.credentials.delete("google", subject)
+    }
     fn disconnect(&self, subject: &str) -> Result<()> {
         let _guard = self.0.credential_work.lock().unwrap();
+        let _identity_lock = self.0.lifecycle.as_ref().map(|l| l.lock()).transpose()?;
         self.0.credentials.delete("google", subject)
     }
 }
@@ -1004,8 +1050,14 @@ impl GoogleProvider {
                 "Google desktop client configuration is missing.",
             )
         })?;
+        let identity_lock = self.0.lifecycle.as_ref().map(|l| l.lock()).transpose()?;
+        if let Some(l) = &self.0.lifecycle {
+            l.check(subject, None)?;
+        }
+        let epoch = self.0.lifecycle.as_ref().map(|l| l.epoch()).transpose()?;
         let mut tokens = read_tokens(&self.0, subject)?
             .ok_or_else(|| error("authenticationRequired", "Reconnect this Google account."))?;
+        drop(identity_lock);
         if tokens.expires_at <= chrono::Utc::now().timestamp() + 60 {
             let response = self.0.transport.token(
                 config,
@@ -1020,6 +1072,10 @@ impl GoogleProvider {
                 ],
             )?;
             tokens = response.merge(Some(tokens))?;
+            let _identity_lock = self.0.lifecycle.as_ref().map(|l| l.lock()).transpose()?;
+            if let Some(l) = &self.0.lifecycle {
+                l.check(subject, epoch)?;
+            }
             store_tokens(&self.0, subject, &tokens)?;
         }
         Ok(tokens.access_token)
@@ -1180,6 +1236,7 @@ mod tests {
         exchanges: AtomicUsize,
         refreshes: AtomicUsize,
         fail_refresh: AtomicBool,
+        refresh_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         fail_page: AtomicBool,
         fail_browser: AtomicBool,
         instance_pages: Mutex<std::collections::VecDeque<events::EventPage>>,
@@ -1199,6 +1256,9 @@ mod tests {
                 .any(|(k, v)| *k == "grant_type" && v == "refresh_token")
             {
                 self.refreshes.fetch_add(1, Ordering::SeqCst);
+                if let Some(hook) = self.refresh_hook.lock().unwrap().take() {
+                    hook();
+                }
                 if self.fail_refresh.load(Ordering::SeqCst) {
                     return Err(error("authenticationRequired", "Reconnect the account."));
                 }
@@ -1365,6 +1425,7 @@ mod tests {
             sessions: Mutex::new(BTreeMap::new()),
             credentials: CredentialService::testing(Box::new(store.clone())),
             credential_work: Mutex::new(()),
+            lifecycle: None,
             transport: transport.clone(),
         }));
         (provider, transport, store)
@@ -1421,6 +1482,113 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    fn lifecycle_fixture() -> (
+        GoogleProvider,
+        Arc<Transport>,
+        Arc<Store>,
+        crate::lifecycle::Lifecycle,
+    ) {
+        let (mut p, t, store) = fixture();
+        let path = std::env::temp_dir().join(format!(
+            "aika-credential-fence-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        crate::repository::Repository::open(&path).unwrap();
+        let lifecycle = crate::lifecycle::Lifecycle::new(&path);
+        Arc::get_mut(&mut p.0).unwrap().lifecycle = Some(lifecycle.clone());
+        (p, t, store, lifecycle)
+    }
+    fn removed(l: &crate::lifecycle::Lifecycle) {
+        let _lock = l.lock().unwrap();
+        let db = l.db().unwrap();
+        db.execute_batch("BEGIN IMMEDIATE; UPDATE lifecycle_clock SET epoch=epoch+1;")
+            .unwrap();
+        db.execute("INSERT INTO identity_lifecycles VALUES(?1,(SELECT epoch FROM lifecycle_clock),'removed') ON CONFLICT(identity_hash) DO UPDATE SET epoch=excluded.epoch,state=excluded.state",[crate::lifecycle::identity("google","fictional-subject")]).unwrap();
+        db.execute_batch("COMMIT").unwrap();
+    }
+    #[test]
+    fn refresh_after_removal_and_fresh_signin_cannot_restore_old_credentials() {
+        let (p, t, store, l) = lifecycle_fixture();
+        store_tokens(
+            &p.0,
+            "fictional-subject",
+            &Tokens {
+                access_token: "old".into(),
+                refresh_token: Some("old-refresh".into()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let disconnect_epoch = p.credential_epoch().unwrap();
+        let lifecycle = l.clone();
+        let values = store.clone();
+        *t.refresh_hook.lock().unwrap() = Some(Box::new(move || {
+            // A second process can acquire the identity lock while HTTP is in progress.
+            removed(&lifecycle);
+            let _lock = lifecycle.lock().unwrap();
+            values.values.lock().unwrap().clear();
+            lifecycle
+                .db()
+                .unwrap()
+                .execute("UPDATE identity_lifecycles SET state='active'", [])
+                .unwrap();
+        }));
+        assert_eq!(
+            p.access("fictional-subject").unwrap_err().code,
+            "accountRemoved"
+        );
+        assert!(store.values.lock().unwrap().is_empty());
+        store_tokens(
+            &p.0,
+            "fictional-subject",
+            &Tokens {
+                access_token: "fresh".into(),
+                refresh_token: Some("fresh-refresh".into()),
+                expires_at: i64::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.disconnect_checked("fictional-subject", disconnect_epoch)
+                .unwrap_err()
+                .code,
+            "accountRemoved"
+        );
+        assert_eq!(p.access("fictional-subject").unwrap(), "fresh");
+        std::fs::remove_file(l.0).unwrap();
+    }
+    #[test]
+    fn late_oauth_completion_is_fenced_and_explicit_new_signin_renews_lifecycle() {
+        let (p, t, store, l) = lifecycle_fixture();
+        let session = p.start_connection().unwrap();
+        browser_url(&t);
+        removed(&l);
+        let port = send(&t, "code=disposable-code");
+        let (done, _) = finished(&p, &session.id);
+        closed(port);
+        assert_eq!(done.progress, ConnectionProgress::Failed);
+        assert_eq!(done.failure.unwrap().code, "accountRemoved");
+        assert!(store.values.lock().unwrap().is_empty());
+        *t.url.lock().unwrap() = None;
+        let fresh = p.start_connection().unwrap();
+        let port = send(&t, "code=disposable-code");
+        assert_eq!(
+            finished(&p, &fresh.id).0.progress,
+            ConnectionProgress::Connected
+        );
+        closed(port);
+        assert!(l
+            .check(
+                "fictional-subject",
+                p.connection_epoch(&session.id).unwrap()
+            )
+            .is_err());
+        assert!(l
+            .check("fictional-subject", p.connection_epoch(&fresh.id).unwrap())
+            .is_ok());
+        assert!(p.access("fictional-subject").is_ok());
+        std::fs::remove_file(l.0).unwrap();
     }
     #[test]
     fn native_loopback_pkce_identity_secure_store_discovery_and_refresh() {

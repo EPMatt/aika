@@ -131,6 +131,9 @@ pub struct AccountSummary {
     pub display_name: String,
     pub connection_state: ConnectionState,
     pub selected_calendar_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub removal_in_progress: Option<bool>,
 }
 /// Backend collection enrichment stays out of the pure recurrence/WASM domain.
 #[derive(Serialize, TS)]
@@ -287,4 +290,19 @@ mod scope_tests {
         assert_eq!(ordinary.edit[0].scope, MutationScope::Series);
         assert!(ordinary.edit[0].disabled_reason.is_none());
     }
+}
+
+/// Complete local account removal, distinct from disconnect and calendar exclusion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRemovalReview {
+    pub account_id: String,
+    pub selected_calendar_count: u32,
+    pub excluded_calendar_count: u32,
+    pub cached_event_count: u32,
+    pub pending_count: u32,
+    pub conflict_count: u32,
+    pub attempted_count: u32,
+    pub removal_in_progress: bool,
+    pub revision: String,
 }

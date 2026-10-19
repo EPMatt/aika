@@ -56,7 +56,7 @@ fn calendar_review(db: &Connection, calendar: &str) -> Result<CalendarRemovalRev
     })
 }
 
-fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
+pub(crate) fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
     let mut digest = Sha256::new();
     // Include effective local data and incoming revisions as well as operation identities.
     // A second process editing/retrying/synchronizing invalidates the reviewed snapshot.
@@ -162,7 +162,12 @@ impl CalendarService {
     /// Local discard never sends compensating requests. Already sent writes may still land.
     /// Credentials are removed by the caller only after this transaction fences workers.
     pub fn discard_and_disconnect(&mut self, expected: DisconnectReview) -> Result<()> {
-        self.account(&expected.account_id)?;
+        if self.account(&expected.account_id)?.removal_in_progress == Some(true) {
+            return Err(error(
+                "accountRemoved",
+                "Account removal is in progress. Retry removal to finish cleanup.",
+            ));
+        }
         let repo = &mut self.providers.repository;
         let tx = repo
             .db

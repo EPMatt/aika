@@ -1,3 +1,4 @@
+import type { AccountRemovalReview } from './generated/AccountRemovalReview';
 import { useEffect, useRef, useState } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import { Plus } from 'lucide-react';
@@ -249,6 +250,8 @@ function ConnectionDialog({
   const [working, setWorking] = useState(false);
   const [closing, setClosing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [removalReview, setRemovalReview] = useState<AccountRemovalReview | null>(null);
+  const [confirmRemoval, setConfirmRemoval] = useState(false);
   const [disconnectReview, setDisconnectReview] = useState<DisconnectReview | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const session = useRef<string | null>(null);
@@ -377,7 +380,7 @@ function ConnectionDialog({
             {failure}
           </p>
         )}
-        {discovery && !disconnectReview && (
+        {discovery && !disconnectReview && !removalReview && (
           <fieldset disabled={working || closing} className="import-checklist">
             <legend>Calendars to include</legend>
             {discovery.calendars.length === 0 && <p>No calendars were found.</p>}
@@ -415,16 +418,16 @@ function ConnectionDialog({
           <button className="text-button" disabled={closing || saving} onClick={() => void close()}>
             Cancel
           </button>
-          {!working && !discovery && !disconnectReview && (
+          {!working && !discovery && !disconnectReview && !removalReview && (
             <button
               className="primary-button"
-              disabled={!provider.connectionAvailable || closing}
+              disabled={!provider.connectionAvailable || closing || !!account?.removalInProgress}
               onClick={() => void start()}
             >
               {provider.id === 'google' ? 'Sign in with Google' : 'Connect account'}
             </button>
           )}
-          {!working && accountId.current && failure && !disconnectReview && (
+          {!working && accountId.current && failure && !disconnectReview && !removalReview && (
             <button
               className="text-button"
               onClick={() => void discover(accountId.current!, generation.current)}
@@ -432,7 +435,7 @@ function ConnectionDialog({
               Retry discovery
             </button>
           )}
-          {discovery && !disconnectReview && (
+          {discovery && !disconnectReview && !removalReview && (
             <button
               className="primary-button"
               disabled={working || closing}
@@ -455,11 +458,16 @@ function ConnectionDialog({
             </button>
           )}
         </div>
-        {account && !working && !disconnectReview && (
+        {account?.removalInProgress && (
+          <p role="status">
+            Account removal needs credential cleanup. Choose Remove account from aika to retry.
+          </p>
+        )}
+        {account && !working && !disconnectReview && !removalReview && (
           <div className="calendar-dialog-actions">
             <button
               className="text-button"
-              disabled={!provider.connectionAvailable || closing}
+              disabled={!provider.connectionAvailable || closing || !!account?.removalInProgress}
               onClick={() => void start()}
             >
               Reconnect account
@@ -493,7 +501,118 @@ function ConnectionDialog({
             >
               Disconnect account
             </button>
+            <button
+              className="text-button"
+              disabled={closing || saving}
+              onClick={async () => {
+                setWorking(true);
+                setFailure('');
+                try {
+                  setRemovalReview(await calendarClient.reviewAccountRemoval(account.id));
+                  setConfirmRemoval(false);
+                  setConfirmDiscard(false);
+                } catch (e) {
+                  setFailure(errorMessage(e));
+                } finally {
+                  setWorking(false);
+                }
+              }}
+            >
+              Remove account from aika
+            </button>
           </div>
+        )}
+        {account && removalReview && (
+          <section aria-label="Review account removal">
+            <p>
+              Remove {account.displayName} from aika, including{' '}
+              {removalReview.selectedCalendarCount} selected and{' '}
+              {removalReview.excludedCalendarCount} excluded calendars and{' '}
+              {removalReview.cachedEventCount} cached events.
+            </p>
+            <p>
+              {removalReview.pendingCount} pending changes, {removalReview.conflictCount} conflicts,
+              and {removalReview.attemptedCount} attempted changes will be removed. Changes already
+              sent to Google may still take effect. Removal cannot undo them.
+            </p>
+            <p>
+              This permanently deletes the local cache and saved credentials. Google calendars and
+              the Google authorization grant remain intact. This cannot be undone.
+            </p>
+            {removalReview.removalInProgress && (
+              <p role="status">
+                Cleanup is in progress. Retry after unlocking your credential store.
+              </p>
+            )}
+            {(removalReview.pendingCount > 0 || removalReview.conflictCount > 0) && (
+              <label>
+                <input
+                  type="checkbox"
+                  checked={confirmDiscard}
+                  disabled={working}
+                  onChange={(e) => setConfirmDiscard(e.target.checked)}
+                />{' '}
+                Discard these local changes
+              </label>
+            )}
+            <label>
+              <input
+                type="checkbox"
+                checked={confirmRemoval}
+                disabled={working}
+                onChange={(e) => setConfirmRemoval(e.target.checked)}
+              />{' '}
+              Permanently remove this account from aika
+            </label>
+            <div className="calendar-dialog-actions">
+              <button
+                className="text-button"
+                disabled={working}
+                onClick={() => {
+                  setRemovalReview(null);
+                  setFailure('');
+                }}
+              >
+                Back
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  working ||
+                  !confirmRemoval ||
+                  ((removalReview.pendingCount > 0 || removalReview.conflictCount > 0) &&
+                    !confirmDiscard)
+                }
+                onClick={async () => {
+                  setWorking(true);
+                  setSaving(true);
+                  setFailure('');
+                  try {
+                    await calendarClient.removeAccount(removalReview, confirmDiscard);
+                    onRefresh();
+                    await close(true);
+                  } catch (e) {
+                    setFailure(errorMessage(e));
+                    onRefresh();
+                    try {
+                      setRemovalReview(await calendarClient.reviewAccountRemoval(account.id));
+                    } catch {
+                      setRemovalReview(null);
+                    }
+                    setConfirmRemoval(false);
+                    setConfirmDiscard(false);
+                  } finally {
+                    setWorking(false);
+                    setSaving(false);
+                  }
+                }}
+              >
+                {removalReview.removalInProgress
+                  ? 'Retry account removal'
+                  : 'Remove account permanently'}
+              </button>
+            </div>
+          </section>
         )}
         {account && disconnectReview && (
           <section aria-label="Review pending changes">

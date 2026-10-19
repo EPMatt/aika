@@ -856,6 +856,7 @@ mod tests {
         registry.register(Box::new(LocalProvider)).unwrap();
         registry.register(Box::new(Adapter)).unwrap();
         CalendarService {
+            lifecycle: None,
             providers: registry,
             discoveries: Default::default(),
             recorded_connections: Default::default(),
@@ -1937,7 +1938,7 @@ mod tests {
         let a = s.save(event(&cal), false).unwrap();
         let attempted = s.claim_outgoing(&c).unwrap().unwrap();
         s.save(event(&cal), false).unwrap();
-        s.providers.repository.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; PRAGMA user_version=5; CREATE TABLE operation_groups(marker TEXT); INSERT INTO operation_groups VALUES('preserve');").unwrap();
+        s.providers.repository.db.execute_batch("DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; PRAGMA user_version=5; CREATE TABLE operation_groups(marker TEXT); INSERT INTO operation_groups VALUES('preserve');").unwrap();
         drop(s);
         assert!(Repository::open(&path).is_err());
         let db = rusqlite::Connection::open(&path).unwrap();

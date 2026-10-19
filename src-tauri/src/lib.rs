@@ -169,6 +169,27 @@ async fn discard_and_remove_calendar(
     .await
 }
 #[tauri::command]
+async fn review_account_removal(
+    state: tauri::State<'_, ServiceState>,
+    account_id: String,
+) -> Result<AccountRemovalReview, ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.review_account_removal(&account_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn remove_account(
+    state: tauri::State<'_, ServiceState>,
+    expected: AccountRemovalReview,
+    discard: bool,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.remove_account(expected, discard)
+    })
+    .await
+}
+#[tauri::command]
 async fn review_disconnect(
     state: tauri::State<'_, ServiceState>,
     account_id: String,
@@ -183,30 +204,32 @@ async fn discard_and_disconnect(
     state: tauri::State<'_, ServiceState>,
     expected: DisconnectReview,
 ) -> Result<(), ServiceError> {
-    let (account, adapter) = with_service(state.inner().clone(), move |s| {
+    let (account, adapter, epoch) = with_service(state.inner().clone(), move |s| {
         let account = s.account(&expected.account_id)?;
         let adapter = s.connection_adapter(&account.provider_id)?;
+        let epoch = adapter.credential_epoch()?;
         s.discard_and_disconnect(expected)?;
-        Ok((account, adapter))
+        Ok((account, adapter, epoch))
     })
     .await?;
-    provider_work(move || adapter.disconnect(&account.remote_subject)).await
+    provider_work(move || adapter.disconnect_checked(&account.remote_subject, epoch)).await
 }
 #[tauri::command]
 async fn disconnect_account(
     state: tauri::State<'_, ServiceState>,
     account_id: String,
 ) -> Result<(), ServiceError> {
-    let (account, adapter) = with_service(state.inner().clone(), move |s| {
+    let (account, adapter, epoch) = with_service(state.inner().clone(), move |s| {
         let account = s.account(&account_id)?;
         let adapter = s.connection_adapter(&account.provider_id)?;
+        let epoch = adapter.credential_epoch()?;
         // Fence workers and concurrent CLI mutations before removing credentials.
         s.record_disconnect(&account.id)?;
-        Ok((account, adapter))
+        Ok((account, adapter, epoch))
     })
     .await?;
     let subject = account.remote_subject;
-    provider_work(move || adapter.disconnect(&subject)).await
+    provider_work(move || adapter.disconnect_checked(&subject, epoch)).await
 }
 
 #[tauri::command]
@@ -403,7 +426,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, review_calendar_removal, discard_and_remove_calendar, review_disconnect, discard_and_disconnect, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, review_calendar_removal, discard_and_remove_calendar, review_account_removal, remove_account, review_disconnect, discard_and_disconnect, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

@@ -7,6 +7,7 @@ pub use crate::repository::CalendarManagementSnapshot;
 
 /// Production facade keeps the renderer contract stable while dispatching providers.
 pub struct CalendarService {
+    pub(crate) lifecycle: Option<crate::lifecycle::Lifecycle>,
     pub(crate) providers: crate::providers::ProviderRegistry,
     pub(crate) recorded_connections:
         std::collections::BTreeMap<String, (String, std::time::Instant)>,
@@ -17,12 +18,20 @@ impl CalendarService {
         let mut providers =
             crate::providers::ProviderRegistry::new(crate::repository::Repository::open(path)?);
         providers.register(Box::new(crate::providers::LocalProvider))?;
-        providers.register(Box::<crate::google::GoogleProvider>::default())?;
-        Ok(Self {
+        let lifecycle =
+            (path != Path::new(":memory:")).then(|| crate::lifecycle::Lifecycle::new(path));
+        providers.register(Box::new(crate::google::GoogleProvider::with_lifecycle(
+            lifecycle.clone(),
+        )))?;
+        let mut service = Self {
+            lifecycle,
             providers,
             discoveries: Default::default(),
             recorded_connections: Default::default(),
-        })
+        };
+        // Cleanup is durable; a locked credential store leaves a visible retryable account.
+        let _ = service.resume_account_removals();
+        Ok(service)
     }
     pub fn providers(&self) -> Vec<ProviderDescriptor> {
         self.providers.descriptors()
@@ -51,10 +60,29 @@ impl CalendarService {
         self.recorded_connections
             .retain(|_, (_, recorded)| recorded.elapsed() < std::time::Duration::from_secs(600));
         if let Some((account, _)) = self.recorded_connections.get(&key) {
+            let current = self.account(account)?;
+            crate::lifecycle::check(
+                &self.providers.repository.db,
+                provider,
+                &current.remote_subject,
+                None,
+            )?;
             session.account_id = Some(account.clone());
             return Ok(session);
         }
         if let Some(identity) = identity {
+            let lifecycle = self.lifecycle.clone();
+            let _lock = lifecycle.as_ref().map(|l| l.lock()).transpose()?;
+            let epoch = self
+                .providers
+                .adapter(provider)?
+                .connection_epoch(&session.id)?;
+            crate::lifecycle::check(
+                &self.providers.repository.db,
+                provider,
+                &identity.subject,
+                epoch,
+            )?;
             session.account_id = Some(self.providers.repository.upsert_account(
                 provider,
                 &identity.subject,

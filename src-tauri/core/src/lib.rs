@@ -13,3 +13,6 @@ pub mod repository;
 pub mod outgoing;
 mod recovery;
 pub mod sync;
+
+pub mod account_removal;
+pub(crate) mod lifecycle;

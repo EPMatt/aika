@@ -72,6 +72,19 @@ pub trait Provider: Send + Sync {
             "Incoming synchronization unavailable.",
         ))
     }
+    /// Caller holds the lifecycle identity lock throughout deletion and SQLite cleanup.
+    fn remove_credentials(&self, subject: &str) -> Result<()> {
+        self.disconnect(subject)
+    }
+    fn connection_epoch(&self, _session: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+    fn credential_epoch(&self) -> Result<Option<i64>> {
+        Ok(None)
+    }
+    fn disconnect_checked(&self, subject: &str, _epoch: Option<i64>) -> Result<()> {
+        self.disconnect(subject)
+    }
     fn disconnect(&self, _subject: &str) -> Result<()> {
         Err(error("unsupported", "Disconnection unavailable."))
     }
@@ -787,6 +800,7 @@ mod tests {
     fn service_uses_shared_series_reads_and_remote_outbox_without_network() {
         let (r, one, _, _) = registry(Path::new(":memory:"));
         let mut service = crate::service::CalendarService {
+            lifecycle: None,
             providers: r,
             discoveries: Default::default(),
             recorded_connections: Default::default(),

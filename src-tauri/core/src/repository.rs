@@ -29,7 +29,7 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 6 {
+        if version > 7 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -75,6 +75,9 @@ impl Repository {
         if version < 6 {
             tx.execute_batch(include_str!("schema_v6.sql"))?;
         }
+        if version < 7 {
+            tx.execute_batch(include_str!("schema_v7.sql"))?;
+        }
         tx.commit()?;
         Ok(Self {
             db,
@@ -82,7 +85,7 @@ impl Repository {
         })
     }
     pub fn accounts(&self) -> Result<Vec<AccountSummary>> {
-        let mut statement = self.db.prepare("SELECT id,provider_id,remote_subject,display_name,connection_state FROM accounts ORDER BY rowid")?;
+        let mut statement = self.db.prepare("SELECT id,provider_id,remote_subject,display_name,connection_state,removal_in_progress FROM accounts ORDER BY rowid")?;
         let rows = statement
             .query_map([], |r| {
                 Ok((
@@ -91,26 +94,30 @@ impl Repository {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, provider_id, remote_subject, display_name, state)| {
-                let mut selected = self.db.prepare(
+            .map(
+                |(id, provider_id, remote_subject, display_name, state, removing)| {
+                    let mut selected = self.db.prepare(
                     "SELECT id FROM calendars WHERE account_id=?1 AND selected=1 ORDER BY rowid",
                 )?;
-                let selected_calendar_ids = selected
-                    .query_map([&id], |r| r.get(0))?
-                    .collect::<std::result::Result<Vec<String>, _>>()?;
-                Ok(AccountSummary {
-                    id,
-                    provider_id,
-                    remote_subject,
-                    display_name,
-                    connection_state: serde_json::from_str(&state)?,
-                    selected_calendar_ids,
-                })
-            })
+                    let selected_calendar_ids = selected
+                        .query_map([&id], |r| r.get(0))?
+                        .collect::<std::result::Result<Vec<String>, _>>()?;
+                    Ok(AccountSummary {
+                        id,
+                        provider_id,
+                        remote_subject,
+                        display_name,
+                        connection_state: serde_json::from_str(&state)?,
+                        selected_calendar_ids,
+                        removal_in_progress: removing.then_some(true),
+                    })
+                },
+            )
             .collect()
     }
     /// Reconnection updates display metadata/state without replacing selections or identities.
@@ -314,6 +321,20 @@ impl Repository {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removing: bool = tx
+            .query_row(
+                "SELECT removal_in_progress FROM accounts WHERE id=?1",
+                [account],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if removing {
+            return Err(error(
+                "accountRemoved",
+                "Account removal is in progress. Retry removal to finish cleanup.",
+            ));
+        }
         if state == ConnectionState::Disconnected {
             let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE account_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE account_id=?1)",[account],|r|r.get(0))?;
             if pending {
@@ -2164,7 +2185,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                6
+                7
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -2487,7 +2508,7 @@ mod recurrence_tests {
             sidebar: false,
         };
         provider.set_preferences(prefs.clone()).unwrap();
-        provider.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; DROP TABLE operation_group_series; ALTER TABLE outbox DROP COLUMN group_id; DROP TABLE operation_groups; DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring;
+        provider.db.execute_batch("DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; DROP TABLE operation_group_series; ALTER TABLE outbox DROP COLUMN group_id; DROP TABLE operation_groups; DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring;
         ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
         DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert; ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities;
         DROP TABLE accounts; PRAGMA user_version=2;").unwrap();
@@ -2504,7 +2525,7 @@ mod recurrence_tests {
                 .db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            6
+            7
         );
         drop(provider);
         std::fs::remove_file(path).unwrap();
@@ -2559,7 +2580,7 @@ mod migration_v4_tests {
                 [&event.id],
             )
             .unwrap();
-        repo.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
+        repo.db.execute_batch("DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
             DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert;
             ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities; DROP TABLE accounts; PRAGMA user_version=3;").unwrap();
         event
@@ -2596,7 +2617,7 @@ mod migration_v4_tests {
                 repo.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                6
+                7
             );
         }
         std::fs::remove_file(path).unwrap();
