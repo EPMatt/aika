@@ -1,6 +1,6 @@
 # Google Calendar integration
 
-Google account connection, cached incoming synchronization, and ordinary-event two-way editing are implemented and **experimental**. Automated fixtures cover these boundaries; live-provider and installed-platform acceptance is incomplete. See [accepted decisions G01–G07](../architecture.md#connected-calendar-decisions), [release verification](../releases.md#unresolved-verification), and the [roadmap](../roadmap.md).
+Google account connection, cached incoming synchronization, and ordinary-event two-way editing are implemented and **experimental**. Automated fixtures cover these boundaries. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform acceptance and newly introduced behavior require separate evidence. See [accepted decisions G01–G13](../architecture.md#connected-calendar-decisions), [release verification](../releases.md#unresolved-verification), and the [roadmap](../roadmap.md).
 
 ## Google setup and authentication boundary
 
@@ -73,6 +73,16 @@ Validated simple all-day and UTC timed rules can use the common recurrence domai
 
 Previously published data survives failed requests. Permission failures isolate a calendar; authentication/store failures pause an account. Status exposes progress, last success, redacted failures, availability, pending/conflict counts, and range completeness. See [incremental sync](https://developers.google.com/workspace/calendar/api/guides/sync) and [events listing](https://developers.google.com/workspace/calendar/api/v3/reference/events/list).
 
+### Durable recurrence foundation (Google follow-on 01)
+
+Schema v6 transactionally upgrades existing databases, retaining pending operations, dependencies, attempts, and acknowledgements as singleton groups. New intent records one group per action, ordered outbox steps, complete before/after series snapshots, and stable create identities before HTTP. Incoming reads remain cache-first. Groups serialize against every affected series; acknowledged members retain their local overlay while any sibling is unfinished. Incoming shadows continue updating independently. Pending/attempted counts count actions once, including successful steps of an unfinished group.
+
+Permission and validation failures block the group while unrelated resources continue. Authentication retains existing account-wide pause behavior. Restart recovers uncertain requests through the existing operation-marker/conditional-revision protocol before resending, using persisted step/resource identities. Completion publishes all observed members together, preserving later pending overlays. Checked calendar/account discard retires complete same-calendar groups, fences workers, and preserves already successful remote steps. Conflict reviews include group progress and all affected local aggregates; **Keep Google** retires the connected pending component and restores retained incoming observations. **Keep local** for multi-step groups and compensation after an attempted multi-step action return `groupRecoveryRequired` until the checked recurrence replanner arrives in phase 03. Wholly unattempted complete groups can be cancelled together; partial undo is refused.
+
+Native snapshots expose `eventActions` with typed edit/delete scopes and disabled reasons. The renderer consumes these restrictions; `aika-cli events actions ID` prints the same native contract as JSON. Rust validates scopes before mutations, independently of renderer controls. Every Google recurring scope remains disabled. Ordinary-event delivery and local recurrence semantics remain available as before.
+
+The backend can look up actual instance identities through Google's [instances endpoint](https://developers.google.com/workspace/calendar/api/v3/reference/events/instances), matching series identity and canonical `originalStartTime`, including moved/cancelled instances, pagination, and ambiguous/missing-result rejection. It never constructs an instance ID. Selector metadata is reserved in the outbox; phase 02 must bind resolved identities and implement recurrence delivery before enabling any occurrence writes. The phase 01 claim path explicitly blocks occurrence-selector steps.
+
 ### Outgoing edits, recovery, and undo
 
 Writer/owner calendars support ordinary-event create/edit/delete, including offline changes committed atomically with durable outbox work. Meetings with attendees, recurring events, special event types, and remote calendar moves remain read-only/unsupported. Calendar metadata customization is local presentation.
@@ -94,3 +104,14 @@ Define public DTOs in Rust and regenerate TypeScript. Backend checks must enforc
 ## Verification boundary
 
 Use the [contribution checks](../../CONTRIBUTING.md#checks) and [native testing guide](../../CONTRIBUTING.md#native-testing). Automated fixtures establish protocol/repository behavior, not real Google propagation or installed browser/store behavior. Live checks must cover actual consent, identity/discovery, refresh/reconnection, external CRUD and recurrence, offline restart, permission loss, conditional-write conflicts, uncertain responses, retries, and undo using disposable data. Record platform, client/consent status, source revision, actual results, and unresolved cases without credentials. Acceptance and remaining evidence live in [releases](../releases.md#unresolved-verification).
+
+### Follow-on 01 disposable acceptance scenarios
+
+Use a disposable account/calendar and back up the test database. These scenarios are added for phase 01; they have not received live acceptance in this implementation session.
+
+1. Queue ordinary create/edit/delete intent offline on schema v5, upgrade to v6, restart offline, and verify unchanged cache and action counts. Reconnect and confirm delivery without duplicate creates.
+2. Interrupt delivery after a remote write but before its acknowledgement. Restart and confirm that the reserved identity and operation marker recover the result before resend. Repeat after delete/undo/recreate with a subsequent queued edit.
+3. Open an imported recurring event and inspect `aika-cli events actions ID`: all edit/delete scopes must have disabled reasons; ordinary edits and local recurrence must remain available.
+4. Change permission/authentication while work is pending. Check explicit retry, unrelated-event progress, checked discard warnings, and rejection of late worker publication. Do not interpret local discard as undoing a successful Google write.
+
+Record source revision, platform, client configuration status, and actual provider observations separately from fixture results. Live recurring writes, splits, and meetings belong to later phases.

@@ -1138,3 +1138,26 @@ fn google_ordinary_offline_crud_queues_durable_intent_without_starting_worker() 
         0
     );
 }
+
+#[test]
+fn native_action_scopes_are_available_to_cli_clients() {
+    let f = Fixture::new();
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Series",
+        "--start",
+        "2026-10-01",
+        "--end",
+        "2026-10-02",
+        "--all-day",
+        "--repeat",
+        "daily",
+    ]);
+    let output = f.success(&["events", "actions", id(&created)]);
+    let actions: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(actions["edit"].as_array().unwrap().len(), 3);
+    assert_eq!(actions["delete"][2]["scope"], "series");
+    assert!(actions["edit"][0]["disabledReason"].is_null());
+}

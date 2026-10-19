@@ -138,6 +138,9 @@ impl CalendarService {
     pub fn accounts(&self) -> Result<Vec<AccountSummary>> {
         self.providers.accounts()
     }
+    pub fn event_actions(&self, target: &str) -> Result<EventActions> {
+        self.providers.event_actions(target)
+    }
     pub fn get_series(&self, target: &str) -> Result<EventSeries> {
         self.providers.get_series(target)
     }

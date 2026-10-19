@@ -46,7 +46,7 @@ impl CalendarService {
         guard(&tx, claim)?;
         // In-flight operations belong to this account lease. A new lease recovers them;
         // acknowledged dependencies unblock exactly one operation per event.
-        let row = tx.query_row("SELECT o.id,o.event_id,o.calendar_id,c.remote_id,o.operation,o.before_payload,o.after_payload,o.expected_revision,o.attempts,o.depends_on FROM outbox o JOIN calendars c ON c.id=o.calendar_id WHERE o.account_id=?1 AND o.state IN ('pending','inFlight') AND (o.retry_at IS NULL OR julianday(o.retry_at)<=julianday('now')) AND c.active=1 AND c.selected=1 AND NOT EXISTS(SELECT 1 FROM conflicts f WHERE f.event_id=o.event_id) AND (o.depends_on IS NULL OR EXISTS(SELECT 1 FROM outbox d WHERE d.id=o.depends_on AND d.state='acknowledged')) ORDER BY o.rowid LIMIT 1", [&claim.account.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,u32>(8)?,r.get::<_,Option<String>>(9)?))).optional()?;
+        let row = tx.query_row("SELECT o.id,o.event_id,o.calendar_id,c.remote_id,o.operation,o.before_payload,o.after_payload,o.expected_revision,o.attempts,o.depends_on FROM outbox o JOIN calendars c ON c.id=o.calendar_id WHERE o.account_id=?1 AND o.state IN ('pending','inFlight') AND (o.retry_at IS NULL OR julianday(o.retry_at)<=julianday('now')) AND c.active=1 AND c.selected=1 AND NOT EXISTS(SELECT 1 FROM outbox b WHERE b.group_id=o.group_id AND b.state='blocked') AND NOT EXISTS(SELECT 1 FROM conflicts f JOIN operation_group_series m ON m.event_id=f.event_id WHERE m.group_id=o.group_id) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.group_id=o.group_id AND p.step_index<o.step_index AND p.state!='acknowledged') AND NOT EXISTS(SELECT 1 FROM active_group_series a JOIN operation_group_series m ON m.event_id=a.event_id JOIN operation_groups older ON older.id=a.group_id JOIN operation_groups own ON own.id=o.group_id WHERE m.group_id=o.group_id AND older.rowid<own.rowid) AND (o.depends_on IS NULL OR EXISTS(SELECT 1 FROM outbox d WHERE d.id=o.depends_on AND d.state='acknowledged')) ORDER BY o.rowid LIMIT 1", [&claim.account.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,u32>(8)?,r.get::<_,Option<String>>(9)?))).optional()?;
         let Some((
             id,
             event_id,
@@ -102,21 +102,52 @@ impl CalendarService {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let instance: bool = tx.query_row(
+            "SELECT original_start IS NOT NULL OR series_remote_id IS NOT NULL FROM outbox WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
+        if instance {
+            // Phase 01 must never guess a provider instance identity or enable writes
+            // through a manually inserted step. Phase 02 binds resolved identities.
+            let failure = error(
+                "unsupported",
+                "Google recurring changes are not available yet.",
+            );
+            tx.execute(
+                "UPDATE outbox SET state='blocked',acknowledgement=?2 WHERE id=?1",
+                params![id, serde_json::to_string(&failure)?],
+            )?;
+            tx.commit()?;
+            return Err(failure);
+        }
         let shadow = existing
             .as_ref()
             .map(|(_, shadow)| shadow.clone())
             .unwrap_or_else(|| "{}".into());
         // A compensation after a delete uses a fresh persisted ID: Google retains tombstones.
-        let remote_id = match existing {
-            Some((remote, _)) if !(operation == "create" && attempts == 0) => remote,
-            _ => {
-                let remote = uuid::Uuid::new_v4().simple().to_string();
+        let persisted: Option<String> =
+            tx.query_row("SELECT resource_id FROM outbox WHERE id=?1", [&id], |r| {
+                r.get(0)
+            })?;
+        let remote_id = if let Some(remote) = persisted {
+            if operation == "create" && attempts == 0 {
                 tx.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) VALUES(?1,?2,?3,?4,NULL,?6,?5) ON CONFLICT(id) DO UPDATE SET remote_id=excluded.remote_id,revision=NULL,capabilities=excluded.capabilities",params![event_id,claim.account.id,calendar_id,remote,serde_json::to_string(&Capabilities::ordinary())?,shadow])?;
                 tx.execute("DELETE FROM incoming_items WHERE id=?1", [&event_id])?;
-                remote
+            }
+            remote
+        } else {
+            match existing {
+                Some((remote, _)) if !(operation == "create" && attempts == 0) => remote,
+                _ => {
+                    let remote = uuid::Uuid::new_v4().simple().to_string();
+                    tx.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) VALUES(?1,?2,?3,?4,NULL,?6,?5) ON CONFLICT(id) DO UPDATE SET remote_id=excluded.remote_id,revision=NULL,capabilities=excluded.capabilities",params![event_id,claim.account.id,calendar_id,remote,serde_json::to_string(&Capabilities::ordinary())?,shadow])?;
+                    tx.execute("DELETE FROM incoming_items WHERE id=?1", [&event_id])?;
+                    remote
+                }
             }
         };
-        tx.execute("UPDATE outbox SET state='inFlight',attempts=attempts+1,expected_revision=?2 WHERE id=?1",params![id,revision])?;
+        tx.execute("UPDATE outbox SET state='inFlight',attempts=attempts+1,expected_revision=?2,resource_id=?3 WHERE id=?1",params![id,revision,remote_id])?;
         tx.commit()?;
         Ok(Some(OutgoingOperation {
             id,
@@ -207,15 +238,17 @@ impl CalendarService {
                     tx.execute("UPDATE outbox SET state='blocked',retry_at=NULL,acknowledgement=NULL WHERE id=?1", [&op.id])?;
                 } else {
                     tx.execute("UPDATE outbox SET state='acknowledged',retry_at=NULL,acknowledgement=?2 WHERE id=?1",params![op.id,serde_json::to_string(&serde_json::json!({"revision":revision}))?])?;
-                    // A late response must never replace a newer edit or undo compensation.
-                    let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE event_id=?1 AND state!='acknowledged')",[&op.event_id],|r|r.get(0))?;
-                    if !pending {
-                        tx.execute("DELETE FROM events WHERE id=?1", [&op.event_id])?;
-                        if let Some(s) = item
-                            .as_ref()
-                            .and_then(|i| series(i, &op.event_id, &op.calendar_id))
-                        {
-                            crate::repository::Repository::write(&tx, &s.event)?;
+                    // Release the complete overlay only after every step is acknowledged.
+                    let members = {
+                        let mut q = tx.prepare("SELECT event_id FROM operation_group_series WHERE group_id=(SELECT group_id FROM outbox WHERE id=?1)")?;
+                        let rows = q
+                            .query_map([&op.id], |r| r.get::<_, String>(0))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for id in members {
+                        if !crate::sync::pending(&tx, &id)? {
+                            crate::recovery::restore_incoming(&tx, &id)?;
                         }
                     }
                 }
@@ -277,6 +310,45 @@ impl CalendarService {
                 "The remote version changed. Review it again.",
             ));
         }
+        // Capture the transitive component before retiring anything. Later actions
+        // may bridge this group to additional series; never discard just one side.
+        let groups = crate::recovery::affected_groups(&tx, &current.event_id)?;
+        let mut members = std::collections::BTreeSet::from([current.event_id.clone()]);
+        let mut multi = false;
+        for group in &groups {
+            let count: u32 = tx.query_row(
+                "SELECT count(*) FROM outbox WHERE group_id=?1",
+                [group],
+                |r| r.get(0),
+            )?;
+            multi |= count > 1;
+            let mut q =
+                tx.prepare("SELECT event_id FROM operation_group_series WHERE group_id=?1")?;
+            members.extend(
+                q.query_map([group], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+        if multi && keep_local {
+            return Err(error(
+                "groupRecoveryRequired",
+                "This grouped action requires a checked replan before keeping local changes.",
+            ));
+        }
+        if !keep_local {
+            for group in &groups {
+                tx.execute(
+                    "UPDATE outbox SET state='acknowledged',retry_at=NULL WHERE group_id=?1",
+                    [group],
+                )?;
+            }
+            for id in members {
+                tx.execute("DELETE FROM conflicts WHERE event_id=?1", [&id])?;
+                crate::recovery::restore_incoming(&tx, &id)?;
+            }
+            tx.commit()?;
+            return Ok(());
+        }
         // The current effective event includes any subsequent local edits, including deletion.
         let local: Option<String> = tx
             .query_row(
@@ -321,7 +393,7 @@ impl CalendarService {
     /// Retry a reviewed permission/validation failure without dropping durable intent.
     pub fn retry_outgoing(&mut self, account: &str) -> Result<()> {
         self.account(account)?;
-        self.providers.repository.db.execute("UPDATE outbox SET state='pending',retry_at=NULL WHERE account_id=?1 AND state IN ('pending','blocked') AND NOT EXISTS(SELECT 1 FROM conflicts WHERE event_id=outbox.event_id)",[account])?;
+        self.providers.repository.db.execute("UPDATE outbox SET state='pending',retry_at=NULL WHERE account_id=?1 AND state IN ('pending','blocked') AND NOT EXISTS(SELECT 1 FROM conflicts f JOIN operation_group_series m ON m.event_id=f.event_id WHERE m.group_id=outbox.group_id)",[account])?;
         Ok(())
     }
 }
@@ -348,10 +420,11 @@ fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
                     id,
                     account_id,
                     calendar_id,
-                    event_id,
+                    event_id: event_id.clone(),
                     local: local.map(|v| serde_json::from_str(&v)).transpose()?,
                     remote: remote.map(|v| serde_json::from_str(&v)).transpose()?,
                     remote_revision,
+                    group_revision: Some(crate::recovery::group_revision(db, &event_id)?),
                 })
             },
         )
@@ -1140,10 +1213,23 @@ mod tests {
         s.apply_outgoing(&c, &deletion, Ok(OutgoingResult::Applied(None)))
             .unwrap();
         s.undo().unwrap();
+        let mut edited = e.clone();
+        edited.title = "Edited after undo".into();
+        s.save(edited, true).unwrap();
         let restore = s.claim_outgoing(&c).unwrap().unwrap();
         assert_eq!(restore.operation, "create");
         assert_ne!(restore.remote_id, created.remote_id);
         assert!(restore.revision.is_none());
+        s.apply_outgoing(
+            &c,
+            &restore,
+            Ok(OutgoingResult::Applied(Some(ack(&restore, "restored")))),
+        )
+        .unwrap();
+        let edit = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(edit.operation, "update");
+        assert_eq!(edit.remote_id, restore.remote_id);
+        assert_eq!(edit.revision.as_deref(), Some("restored"));
     }
     #[test]
     fn lease_recovery_reuses_identity_and_rejects_late_owner() {
@@ -1287,5 +1373,309 @@ mod tests {
         s.apply_outgoing(&c, &op, Err(f.clone())).unwrap_err();
         s.end_sync(&c, Some(f)).unwrap();
         assert!(s.begin_sync(&c.account.id, range()).unwrap().is_none());
+    }
+    // Test-only compiler for two resource steps. Product recurrence planners remain gated.
+    fn grouped(s: &mut CalendarService, cal: &str) -> (CalendarEvent, CalendarEvent) {
+        let a = s.save(event(cal), false).unwrap();
+        let b = s.save(event(cal), false).unwrap();
+        merge_groups(s, &a.id, &b.id);
+        (a, b)
+    }
+    fn merge_groups(s: &mut CalendarService, a: &str, b: &str) {
+        let db = &mut s.providers.repository.db;
+        let tx = db.transaction().unwrap();
+        let group: String = tx
+            .query_row(
+                "SELECT group_id FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1",
+                [a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let old: String = tx
+            .query_row(
+                "SELECT group_id FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1",
+                [b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tx.execute("INSERT INTO operation_group_series SELECT ?1,event_id,before_payload,after_payload FROM operation_group_series WHERE group_id=?2",params![group,old]).unwrap();
+        tx.execute(
+            "UPDATE outbox SET group_id=?1,step_index=1 WHERE group_id=?2",
+            params![group, old],
+        )
+        .unwrap();
+        tx.execute("DELETE FROM operation_groups WHERE id=?1", [old])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    #[test]
+    fn grouped_ack_keeps_complete_overlay_and_serializes_every_member() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let (a, b) = grouped(&mut s, &cal);
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 1);
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(first.event_id, a.id);
+        let mut response = ack(&first, "a1");
+        response.event.as_mut().unwrap().title = "Provider normalized".into();
+        s.apply_outgoing(&c, &first, Ok(OutgoingResult::Applied(Some(response))))
+            .unwrap();
+        assert_eq!(s.get_series(&a.id).unwrap().event, a);
+        // A later action touching the acknowledged member still waits for its sibling.
+        let mut changed = a.clone();
+        changed.title = "Later intent".into();
+        s.save(changed.clone(), true).unwrap();
+        let second = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(second.event_id, b.id);
+        s.apply_outgoing(
+            &c,
+            &second,
+            Ok(OutgoingResult::Applied(Some(ack(&second, "b1")))),
+        )
+        .unwrap();
+        assert_eq!(s.get_series(&a.id).unwrap().event, changed);
+        let later = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(later.event_id, a.id);
+        assert_eq!(later.revision.as_deref(), Some("a1"));
+    }
+    #[test]
+    fn grouped_block_retry_conflict_and_discard_are_action_scoped() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let (a, b) = grouped(&mut s, &cal);
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &first, Err(error("permission", "Denied")))
+            .unwrap_err();
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        let unrelated = s.save(event(&cal), false).unwrap();
+        assert_eq!(sent(&mut s, &c).event_id, unrelated.id);
+        s.retry_outgoing(&c.account.id).unwrap();
+        let retry = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(retry.remote_id, first.remote_id);
+        assert!(retry.recovering);
+        s.apply_outgoing(
+            &c,
+            &retry,
+            Ok(OutgoingResult::Applied(Some(ack(&retry, "a1")))),
+        )
+        .unwrap();
+        let second = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &second, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let reviewed = s.sync_conflicts().unwrap().remove(0);
+        assert_eq!(
+            s.resolve_sync_conflict(reviewed.clone(), true)
+                .unwrap_err()
+                .code,
+            "groupRecoveryRequired"
+        );
+        // A change to an acknowledged member invalidates the group's review.
+        s.providers.repository.db.execute("UPDATE incoming_items SET payload=json_set(payload,'$.revision','changed') WHERE id=?1",[&a.id]).unwrap();
+        assert_eq!(
+            s.resolve_sync_conflict(reviewed, false).unwrap_err().code,
+            "conflict"
+        );
+        let review = s.review_disconnect(&c.account.id).unwrap();
+        assert_eq!(review.pending_count, 1);
+        assert_eq!(review.attempted_count, 1);
+        s.discard_and_disconnect(review).unwrap();
+        assert!(s.get_series(&a.id).is_ok()); // successful first step remains remote
+        assert!(s.get_series(&b.id).is_err());
+        assert_eq!(s.get_series(&unrelated.id).unwrap().event, unrelated);
+    }
+    #[test]
+    fn grouped_restart_recovers_unacknowledged_step_without_releasing_overlay() {
+        let path =
+            std::env::temp_dir().join(format!("aika-group-crash-{}.sqlite3", uuid::Uuid::new_v4()));
+        let (mut s, c, cal) = setup(&path);
+        let (a, b) = grouped(&mut s, &cal);
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(
+            &c,
+            &first,
+            Ok(OutgoingResult::Applied(Some(ack(&first, "a1")))),
+        )
+        .unwrap();
+        let second = s.claim_outgoing(&c).unwrap().unwrap();
+        drop(s);
+        let mut s = open(&path);
+        let other = open(&path);
+        assert!(other
+            .providers
+            .repository
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM active_group_series WHERE event_id=?1)",
+                [&a.id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(s.get_series(&b.id).unwrap().event, b);
+        s.providers
+            .repository
+            .db
+            .execute("UPDATE account_leases SET expires_at='2000-01-01'", [])
+            .unwrap();
+        let next = s.begin_sync(&c.account.id, range()).unwrap().unwrap();
+        let recovered = s.claim_outgoing(&next).unwrap().unwrap();
+        assert_eq!(recovered.id, second.id);
+        assert_eq!(recovered.remote_id, second.remote_id);
+        assert!(recovered.recovering);
+        assert_eq!(
+            s.apply_outgoing(
+                &c,
+                &second,
+                Ok(OutgoingResult::Applied(Some(ack(&second, "late"))))
+            )
+            .unwrap_err()
+            .code,
+            "syncSuperseded"
+        );
+        s.apply_outgoing(
+            &next,
+            &recovered,
+            Ok(OutgoingResult::Applied(Some(ack(&recovered, "b1")))),
+        )
+        .unwrap();
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 0);
+        drop(other);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn v5_pending_work_migrates_atomically_with_stable_attempted_identities() {
+        let path = std::env::temp_dir().join(format!(
+            "aika-v6-migration-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let (mut s, c, cal) = setup(&path);
+        let a = s.save(event(&cal), false).unwrap();
+        let attempted = s.claim_outgoing(&c).unwrap().unwrap();
+        s.save(event(&cal), false).unwrap();
+        s.providers.repository.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; PRAGMA user_version=5; CREATE TABLE operation_groups(marker TEXT); INSERT INTO operation_groups VALUES('preserve');").unwrap();
+        drop(s);
+        assert!(Repository::open(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            db.query_row("SELECT marker FROM operation_groups", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserve"
+        );
+        db.execute("DROP TABLE operation_groups", []).unwrap();
+        drop(db);
+        let mut s = open(&path);
+        let identity: (String, String, u32) = s
+            .providers
+            .repository
+            .db
+            .query_row(
+                "SELECT group_id,resource_id,attempts FROM outbox WHERE id=?1",
+                [&attempted.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            (attempted.id.clone(), attempted.remote_id.clone(), 1)
+        );
+        assert_eq!(s.get_series(&a.id).unwrap().event, a);
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 2);
+        s.providers
+            .repository
+            .db
+            .execute("UPDATE account_leases SET expires_at='2000-01-01'", [])
+            .unwrap();
+        let next = s.begin_sync(&c.account.id, range()).unwrap().unwrap();
+        let recovered = s.claim_outgoing(&next).unwrap().unwrap();
+        assert_eq!(recovered.id, attempted.id);
+        assert_eq!(recovered.remote_id, attempted.remote_id);
+        assert!(recovered.recovering);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn group_review_counts_acknowledged_attempts_and_partial_undo_never_retires_a_member() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let (a, b) = grouped(&mut s, &cal);
+        assert_eq!(s.undo().unwrap_err().code, "groupRecoveryRequired");
+        assert_eq!(s.get_series(&b.id).unwrap().event, b);
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(
+            &c,
+            &first,
+            Ok(OutgoingResult::Applied(Some(ack(&first, "a1")))),
+        )
+        .unwrap();
+        let review = s.review_disconnect(&c.account.id).unwrap();
+        assert_eq!((review.pending_count, review.attempted_count), (1, 1));
+        assert_eq!(s.review_calendar_removal(&cal).unwrap().attempted_count, 1);
+        assert_eq!(s.undo().unwrap_err().code, "groupRecoveryRequired");
+        assert_eq!(s.get_series(&a.id).unwrap().event, a);
+        assert_eq!(s.get_series(&b.id).unwrap().event, b);
+    }
+    #[test]
+    fn keep_google_retires_transitively_overlapping_groups_together() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let (a, b) = grouped(&mut s, &cal);
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(
+            &c,
+            &first,
+            Ok(OutgoingResult::Applied(Some(ack(&first, "a1")))),
+        )
+        .unwrap();
+        let second = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &second, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let reviewed = s.sync_conflicts().unwrap().remove(0);
+        let mut edited = b.clone();
+        edited.title = "Later local intent".into();
+        s.save(edited, true).unwrap();
+        let tail = s.save(event(&cal), false).unwrap();
+        merge_groups(&mut s, &b.id, &tail.id);
+        assert_eq!(
+            s.resolve_sync_conflict(reviewed, false).unwrap_err().code,
+            "conflict"
+        );
+        let current = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(current, false).unwrap();
+        assert!(s.sync_conflicts().unwrap().is_empty());
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 0);
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        assert_eq!(s.get_series(&a.id).unwrap().event, a);
+        assert!(s.get_series(&b.id).is_err());
+        assert!(s.get_series(&tail.id).is_err());
+    }
+    #[test]
+    fn group_identity_constraints_and_selector_gate_prevent_unsafe_delivery() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let other = s
+            .providers
+            .repository
+            .upsert_account("fixture", "other", "Other", ConnectionState::Connected)
+            .unwrap();
+        let e = s.save(event(&cal), false).unwrap();
+        let db = &s.providers.repository.db;
+        assert!(db
+            .execute(
+                "INSERT INTO operation_groups VALUES('wrong',?1,?2)",
+                params![other, cal]
+            )
+            .is_err());
+        assert!(db
+            .execute(
+                "UPDATE outbox SET account_id=?1 WHERE event_id=?2",
+                params![other, e.id]
+            )
+            .is_err());
+        db.execute("UPDATE outbox SET series_remote_id='series',original_start='2026-10-01' WHERE event_id=?1",[&e.id]).unwrap();
+        assert_eq!(s.claim_outgoing(&c).unwrap_err().code, "unsupported");
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        let unrelated = s.save(event(&cal), false).unwrap();
+        assert_eq!(sent(&mut s, &c).event_id, unrelated.id);
     }
 }

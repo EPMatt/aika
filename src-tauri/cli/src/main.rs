@@ -91,6 +91,8 @@ enum Events {
     },
     /// Show every field of an event, identified by its full UUID.
     Get { id: String },
+    /// Show native edit/delete scopes and disabled reasons as JSON.
+    Actions { id: String },
     /// Create an event. Title, start, and end are required.
     Create(EventArgs),
     /// Update only supplied fields. Use an empty string to clear location or notes.
@@ -657,7 +659,11 @@ fn run(cli: Cli) -> Result<String> {
     } else {
         None
     };
-    if let Events::Get { id } | Events::Update { id, .. } | Events::Delete { id, .. } = &command {
+    if let Events::Get { id }
+    | Events::Actions { id }
+    | Events::Update { id, .. }
+    | Events::Delete { id, .. } = &command
+    {
         if uuid::Uuid::parse_str(id.split_once('@').map_or(id.as_str(), |(id, _)| id)).is_err() {
             return Err(error(
                 "validation",
@@ -683,6 +689,10 @@ fn run(cli: Cli) -> Result<String> {
             }
             Ok(output)
         }
+        Events::Actions { id } => Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&service.event_actions(&id)?)?
+        )),
         Events::Get { id } => {
             if let Some((_, key)) = id.split_once('@') {
                 let series = service.get_series(&id)?;

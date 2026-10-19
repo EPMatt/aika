@@ -1,3 +1,4 @@
+import type { EventActions } from './generated/EventActions';
 import type { SyncConflict } from './generated/SyncConflict';
 import type { CalendarRemovalReview } from './generated/CalendarRemovalReview';
 import { createContext, useContext, useCallback, useEffect, useRef, useState } from 'react';
@@ -72,6 +73,7 @@ const CalendarContext = createContext(defaultCalendar);
 const CapabilitiesContext = createContext<{
   calendars: Record<string, Capabilities>;
   events: Record<string, Capabilities>;
+  actions?: Record<string, EventActions>;
 }>({ calendars: {}, events: {} });
 const CalendarsContext = createContext<Calendar[]>([defaultCalendar]);
 function CalendarProviders({
@@ -80,7 +82,11 @@ function CalendarProviders({
   children,
 }: {
   calendars: Calendar[];
-  capabilities: { calendars: Record<string, Capabilities>; events: Record<string, Capabilities> };
+  capabilities: {
+    calendars: Record<string, Capabilities>;
+    events: Record<string, Capabilities>;
+    actions?: Record<string, EventActions>;
+  };
   children: React.ReactNode;
 }) {
   return (
@@ -948,13 +954,18 @@ function EventEditor({
     capabilities.events[event.id.split('@')[0]] ??
     capabilities.calendars[event.calendarId];
   const destinationCaps = capabilities.calendars[calendarId];
+  const actions =
+    capabilities.actions?.[event.id] ?? capabilities.actions?.[event.id.split('@')[0]];
+  const editRestriction = actions?.edit.find((a) => a.scope === scope)?.disabledReason;
+  const deleteRestriction = actions?.delete.find((a) => a.scope === scope)?.disabledReason;
   const writable = Boolean(
     sourceCalendar?.writable &&
       calendar.writable &&
+      !editRestriction &&
       (existing ? (caps?.edit ?? true) : (destinationCaps?.create ?? true)) &&
       (!(event.recurrence || event.occurrence) || (caps?.recurrence ?? true)),
   );
-  const canDelete = caps?.delete ?? true;
+  const canDelete = !deleteRestriction && (caps?.delete ?? true);
   const canMove = caps?.moveEvent ?? true;
   const [title, setTitle] = useState(event.title);
   const [recurrence, setRecurrence] = useState<Recurrence | undefined>(event.recurrence);
@@ -1071,6 +1082,7 @@ function EventEditor({
         disabled={busy || !writable}
         style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
       >
+        {editRestriction && <p role="status">{editRestriction}</p>}
         <div className="editor-heading">
           <span className="eyebrow">
             {!writable ? 'Event details' : existing ? 'Edit event' : 'New event'}
@@ -1084,9 +1096,23 @@ function EventEditor({
               value={scope}
               onChange={(e) => onScope(e.target.value as MutationScope)}
             >
-              <option value="occurrence">This occurrence</option>
-              <option value="following">This and following</option>
-              <option value="series">Entire series</option>
+              {(['occurrence', 'following', 'series'] as const).map((value) => {
+                const reason = actions?.edit.find((a) => a.scope === value)?.disabledReason;
+                return (
+                  <option
+                    key={value}
+                    value={value}
+                    disabled={Boolean(reason)}
+                    title={reason ?? undefined}
+                  >
+                    {value === 'occurrence'
+                      ? 'This occurrence'
+                      : value === 'following'
+                        ? 'This and following'
+                        : 'Entire series'}
+                  </option>
+                );
+              })}
             </select>
           </label>
         )}
@@ -1404,6 +1430,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [capabilityState, setCapabilityState] = useState<{
     calendars: Record<string, Capabilities>;
     events: Record<string, Capabilities>;
+    actions?: Record<string, EventActions>;
   }>({ calendars: {}, events: {} });
   const [calendarReady, setCalendarReady] = useState(!desktop);
   const [events, setEvents] = useState<CalendarEvent[]>(() => repository?.list() ?? []);
@@ -1547,6 +1574,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
         setCapabilityState({
           calendars: snapshot.calendarCapabilities ?? {},
           events: snapshot.eventCapabilities ?? {},
+          actions: snapshot.eventActions ?? {},
         });
         setDefaultCalendarId(snapshot.defaultCalendarId);
         setHiddenCalendarIds(snapshot.hiddenCalendarIds);
@@ -1593,6 +1621,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     setCapabilityState({
       calendars: snapshot.calendarCapabilities ?? {},
       events: snapshot.eventCapabilities ?? {},
+      actions: snapshot.eventActions ?? {},
     });
     setDefaultCalendarId(snapshot.defaultCalendarId);
     setHiddenCalendarIds(snapshot.hiddenCalendarIds);

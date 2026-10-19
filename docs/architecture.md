@@ -16,7 +16,7 @@ Local gestures and editor/CLI mutations use the same checked domain operations. 
 
 ## Persistence
 
-Bundled SQLite stores `calendar.sqlite3` beneath the OS application-data directory for `dev.projectcal.desktop`. The CLI defaults to that same database and can select an isolated path. Current schema v5 migrates older versions transactionally, preserving IDs, events/exceptions, calendar settings, and preferences. Newer schemas and open/migration failures return errors rather than resetting data.
+Bundled SQLite stores `calendar.sqlite3` beneath the OS application-data directory for `dev.projectcal.desktop`. The CLI defaults to that same database and can select an isolated path. Current schema v6 migrates older versions transactionally, preserving IDs, events/exceptions, calendar settings, and preferences. Newer schemas and open/migration failures return errors rather than resetting data.
 
 Normalized event JSON is stored with indexed calendar/kind/start/end columns. This preserves the contract while making bounded overlap queries possible without parsing every payload. All-day dates and timed instants are queried separately. Preferences, visibility, and default selection persist independently of event undo. Data is protected by the OS account/filesystem; it is not application-encrypted.
 
@@ -36,7 +36,7 @@ Undo records successful event changes in memory and applies checked compensation
 
 ## Connected-calendar decisions
 
-G01–G07 are accepted decisions. Account connection, incoming sync, and ordinary-event outgoing sync are implemented with automated fixtures. Live Google and installed-platform acceptance remains incomplete; the [integration guide](integrations/google-calendar.md) describes current behavior. Compatible remote recurring writes and recoverable splits are future work, not an implemented guarantee.
+G01–G07 are accepted decisions. Account connection, incoming sync, and ordinary-event outgoing sync are implemented with automated fixtures. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; installed-platform and new-feature acceptance remain separate; the [integration guide](integrations/google-calendar.md) describes current behavior. Compatible remote recurring writes and recoverable splits are future work, not an implemented guarantee.
 
 ### ADR G01: Provider types and account identities
 
@@ -65,6 +65,34 @@ Backend descriptors drive the provider picker. Discovery checks every eligible c
 ### ADR G07: Recurrence compatibility and bounded fallback
 
 Import masters/exceptions without date filters and normalize only proven equivalent rules. Preserve unsupported provider payloads and cache expanded instances for 12 months past and 24 ahead, extended by online navigation. Missing offline coverage is explicit, avoiding a false empty schedule. Imported recurrence is currently read-only. Intended compatible occurrence/series/following writes require equivalence tests and durable multi-request split recovery; a SQLite transaction cannot make separate remote requests atomic.
+
+## Google follow-on decisions (2026-10-19)
+
+G08–G13 are accepted design decisions for the follow-on sequence. Phase 01 implements the durable foundation only; recurrence compilation, recurrence writes, account deletion, and meetings remain gated by subsequent phases. Existing live Google validation was confirmed by the user on 2026-10-19 without platform/client/revision evidence; this does not validate new features or every installed platform.
+
+### ADR G08: Exact recurrence compatibility
+
+Share the pure domain and compile Google rules in the backend only when exact representation is established. Bounded preview agreement is insufficient because divergence can occur outside the window. Initially allow proven all-day/UTC rules; retain regional-zone/DST and richer schedules as read-only projections. This amends G07's intended write path, preserving its import behavior. Reject unsupported intent before committing it; do not approximate provider schedules.
+
+### ADR G09: Durable ordered operation groups
+
+Extend the existing outbox with durable groups, ordered steps, persisted resource identities, and aggregate before/after snapshots for every affected series. Single-event operations migrate as singleton groups without changing their delivery protocol. Serialize overlapping groups against every member and retain the complete overlay and incoming shadows until completion or explicit resolution. SQLite cannot make HTTP atomic: recover uncertain requests before resend, resume forward after partial success, and never automatically roll back acknowledged steps. Count actions rather than requests. Cross-calendar groups are disallowed; remote moves remain unsupported. Unrelated resources continue after a group's permission/validation failure; authentication pauses the account.
+
+### ADR G10: Scope-specific actions
+
+Expose typed edit/delete scopes with disabled reasons from native contracts, intersected with provider/calendar/event capabilities and enforced in Rust. Keep legacy capability booleans for compatibility; they do not independently authorize a recurrence scope. Local recurrence retains its existing behavior. All Google recurring scopes remain disabled in phase 01. Prefer explicit restrictions over a single recurrence flag that cannot describe partial support.
+
+### ADR G11: Explicit exception policy
+
+Google master edits preserve exceptions; local planner reset semantics remain unchanged. Future Google structural edits must establish correspondence or fail. Following splits require confirmation of future-exception reset. Do not silently reuse the local reset planner. Phase 02 introduces an explicit policy contract; phase 03 implements recoverable splitting and checked compensation after reconciliation. Until then, grouped conflict resolution/undo must refuse operations requiring a recurrence replan.
+
+### ADR G12: Durable account cleanup
+
+Full deletion will use a persisted cleanup lifecycle, checked generations, and cross-process identity locking around credential writes/deletion (never HTTP). Delete credentials before transactional cache/account cleanup; retry store failures and startup interruptions, retaining only an opaque lifecycle tombstone. A database-only delete or best-effort store cleanup can resurrect credentials through late workers. This is a future phase; current disconnect and calendar exclusion retain their established meaning.
+
+### ADR G13: Native meeting intent and notifications
+
+Keep organizer, attendees, responses, and delivery policy in native durable contracts, outside the pure recurrence domain. Future applicable writes and compensation persist everyone/external-only/none (`all` by default), warning before silent delivery. Narrow conditional updates preserve unknown fields and other attendees; resolve the authenticated attendee natively. Email delivery cannot be exactly once or recalled by undo. Meeting writes remain disabled pending phases 05–06.
 
 ## Distribution and evidence
 

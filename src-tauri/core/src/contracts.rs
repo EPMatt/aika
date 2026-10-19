@@ -57,6 +57,51 @@ impl Capabilities {
         }
     }
 }
+/// Scope availability is backend-owned; absence of a reason means available.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeAvailability {
+    pub scope: MutationScope,
+    pub disabled_reason: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EventActions {
+    pub edit: Vec<ScopeAvailability>,
+    pub delete: Vec<ScopeAvailability>,
+}
+impl EventActions {
+    pub fn for_event(caps: &Capabilities, recurring: bool, remote: bool) -> Self {
+        let scopes = if recurring {
+            vec![
+                MutationScope::Occurrence,
+                MutationScope::Following,
+                MutationScope::Series,
+            ]
+        } else {
+            vec![MutationScope::Series]
+        };
+        let available = |allowed: bool| {
+            scopes
+                .iter()
+                .map(|scope| ScopeAvailability {
+                    scope: scope.clone(),
+                    disabled_reason: if recurring && remote {
+                        Some("Google recurring changes are not available yet.".into())
+                    } else if !allowed || (recurring && !caps.recurrence) {
+                        Some("This calendar or event is read-only.".into())
+                    } else {
+                        None
+                    },
+                })
+                .collect()
+        };
+        Self {
+            edit: available(caps.edit),
+            delete: available(caps.delete),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDescriptor {
@@ -96,6 +141,7 @@ pub struct CalendarCollectionSnapshot {
     pub calendar_capabilities: BTreeMap<String, Capabilities>,
     pub event_capabilities: BTreeMap<String, Capabilities>,
     pub sync_status: Vec<AccountSyncStatus>,
+    pub event_actions: BTreeMap<String, EventActions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -165,6 +211,9 @@ pub struct SyncConflict {
     pub local: Option<EventSeries>,
     pub remote: Option<EventSeries>,
     pub remote_revision: Option<String>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub group_revision: Option<String>,
 }
 
 /// Checked review of account-wide local intent. The revision is opaque to clients.
@@ -188,4 +237,30 @@ pub struct CalendarRemovalReview {
     pub conflict_count: u32,
     pub attempted_count: u32,
     pub revision: String,
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn remote_recurrence_scopes_remain_disabled_even_with_writable_capabilities() {
+        let remote = EventActions::for_event(&Capabilities::local(), true, true);
+        assert_eq!(remote.edit.len(), 3);
+        assert!(remote
+            .edit
+            .iter()
+            .chain(&remote.delete)
+            .all(|s| s.disabled_reason.as_deref()
+                == Some("Google recurring changes are not available yet.")));
+        let local = EventActions::for_event(&Capabilities::local(), true, false);
+        assert!(local
+            .edit
+            .iter()
+            .chain(&local.delete)
+            .all(|s| s.disabled_reason.is_none()));
+        let ordinary = EventActions::for_event(&Capabilities::ordinary(), false, true);
+        assert_eq!(ordinary.edit.len(), 1);
+        assert_eq!(ordinary.edit[0].scope, MutationScope::Series);
+        assert!(ordinary.edit[0].disabled_reason.is_none());
+    }
 }

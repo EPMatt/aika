@@ -83,6 +83,16 @@ test('cached Google events stay read-only and incomplete/offline coverage has re
                 accounts: [account],
                 calendarCapabilities: { 'google-calendar': caps },
                 eventCapabilities: {},
+                eventActions: {
+                  '9eed7866-4246-4a81-9281-9c5d94c174df': {
+                    edit: [
+                      { scope: 'series', disabledReason: 'This calendar or event is read-only.' },
+                    ],
+                    delete: [
+                      { scope: 'series', disabledReason: 'This calendar or event is read-only.' },
+                    ],
+                  },
+                },
                 syncStatus: [
                   {
                     accountId: account.id,
@@ -132,6 +142,9 @@ test('cached Google events stay read-only and incomplete/offline coverage has re
   );
   await page.getByText('Cached remote event').first().click();
   await expect(page.getByLabel('Event title', { exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole('status').filter({ hasText: 'This calendar or event is read-only.' }),
+  ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Save event', exact: true })).toHaveCount(0);
   await page.keyboard.press('Escape');
   await page.evaluate(() => {

@@ -4,8 +4,9 @@ import type { AccountSyncStatus } from "./AccountSyncStatus";
 import type { Calendar } from "./Calendar";
 import type { CalendarEvent } from "./CalendarEvent";
 import type { Capabilities } from "./Capabilities";
+import type { EventActions } from "./EventActions";
 
 /**
  * Backend collection enrichment stays out of the pure recurrence/WASM domain.
  */
-export type CalendarCollectionSnapshot = { calendars: Array<Calendar>, events: Array<CalendarEvent>, defaultCalendarId: string | null, hiddenCalendarIds: Array<string>, canUndo: boolean, accounts: Array<AccountSummary>, calendarCapabilities: { [key in string]: Capabilities }, eventCapabilities: { [key in string]: Capabilities }, syncStatus: Array<AccountSyncStatus>, };
+export type CalendarCollectionSnapshot = { calendars: Array<Calendar>, events: Array<CalendarEvent>, defaultCalendarId: string | null, hiddenCalendarIds: Array<string>, canUndo: boolean, accounts: Array<AccountSummary>, calendarCapabilities: { [key in string]: Capabilities }, eventCapabilities: { [key in string]: Capabilities }, syncStatus: Array<AccountSyncStatus>, eventActions: { [key in string]: EventActions }, };

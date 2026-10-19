@@ -79,7 +79,7 @@ async fn outgoing(state: ServiceState, claim: SyncClaim) -> Result<()> {
         let c = claim.clone();
         let op = match with_service(state.clone(), move |s| s.claim_outgoing(&c)).await {
             Ok(op) => op,
-            Err(f) if f.code == "permission" => {
+            Err(f) if matches!(f.code.as_str(), "permission" | "unsupported") => {
                 failure = Some(f);
                 continue;
             }

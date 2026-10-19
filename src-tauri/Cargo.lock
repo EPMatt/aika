@@ -38,6 +38,7 @@ dependencies = [
  "clap",
  "iana-time-zone",
  "rusqlite",
+ "serde_json",
  "uuid",
 ]
 

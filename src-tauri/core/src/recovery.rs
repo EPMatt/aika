@@ -20,7 +20,8 @@ fn calendar_review(db: &Connection, calendar: &str) -> Result<CalendarRemovalRev
     let mut digest = Sha256::new();
     for sql in [
         "SELECT c.*,a.sync_epoch,a.connection_state FROM calendars c JOIN accounts a ON a.id=c.account_id WHERE c.id=?1",
-        "SELECT o.*,e.payload,i.payload FROM outbox o LEFT JOIN events e ON e.id=o.event_id LEFT JOIN incoming_items i ON i.id=o.event_id WHERE o.calendar_id=?1 AND o.state!='acknowledged' ORDER BY o.id",
+        "SELECT o.*,e.payload,i.payload FROM outbox o LEFT JOIN events e ON e.id=o.event_id LEFT JOIN incoming_items i ON i.id=o.event_id WHERE o.group_id IN (SELECT group_id FROM active_group_series WHERE calendar_id=?1) ORDER BY o.id",
+        "SELECT * FROM active_group_series WHERE calendar_id=?1 ORDER BY group_id,event_id",
         "SELECT f.*,e.payload FROM conflicts f LEFT JOIN events e ON e.id=f.event_id WHERE f.calendar_id=?1 ORDER BY f.id",
         "SELECT i.id,i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 ORDER BY i.id",
     ] {
@@ -37,7 +38,7 @@ fn calendar_review(db: &Connection, calendar: &str) -> Result<CalendarRemovalRev
         }
     }
     let (pending_count, attempted_count) = db.query_row(
-        "SELECT count(*),coalesce(sum(attempts>0 OR state='inFlight'),0) FROM outbox WHERE calendar_id=?1 AND state!='acknowledged'",
+        "SELECT count(DISTINCT a.group_id),count(DISTINCT CASE WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.group_id=a.group_id AND (o.attempts>0 OR o.state='inFlight')) THEN a.group_id END) FROM active_group_series a WHERE a.calendar_id=?1",
         [calendar], |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let conflict_count = db.query_row(
@@ -61,7 +62,8 @@ fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
     // A second process editing/retrying/synchronizing invalidates the reviewed snapshot.
     for sql in [
         "SELECT sync_epoch,connection_state FROM accounts WHERE id=?1",
-        "SELECT o.*,e.payload,i.payload FROM outbox o LEFT JOIN events e ON e.id=o.event_id LEFT JOIN incoming_items i ON i.id=o.event_id WHERE o.account_id=?1 AND o.state!='acknowledged' ORDER BY o.id",
+        "SELECT o.*,e.payload,i.payload FROM outbox o LEFT JOIN events e ON e.id=o.event_id LEFT JOIN incoming_items i ON i.id=o.event_id WHERE o.group_id IN (SELECT group_id FROM active_group_series WHERE account_id=?1) ORDER BY o.id",
+        "SELECT * FROM active_group_series WHERE account_id=?1 ORDER BY group_id,event_id",
         "SELECT f.*,e.payload FROM conflicts f LEFT JOIN events e ON e.id=f.event_id WHERE f.account_id=?1 ORDER BY f.id",
         "SELECT i.id,i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.account_id=?1 ORDER BY i.id",
     ] {
@@ -79,7 +81,7 @@ fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
         }
     }
     let (pending_count, attempted_count) = db.query_row(
-        "SELECT count(*),coalesce(sum(attempts>0 OR state='inFlight'),0) FROM outbox WHERE account_id=?1 AND state!='acknowledged'",
+        "SELECT count(DISTINCT a.group_id),count(DISTINCT CASE WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.group_id=a.group_id AND (o.attempts>0 OR o.state='inFlight')) THEN a.group_id END) FROM active_group_series a WHERE a.account_id=?1",
         [account], |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let conflict_count = db.query_row(
@@ -172,58 +174,14 @@ impl CalendarService {
             ));
         }
         let affected = {
-            let mut q = tx.prepare("SELECT event_id FROM outbox WHERE account_id=?1 AND state!='acknowledged' UNION SELECT event_id FROM conflicts WHERE account_id=?1")?;
+            let mut q = tx.prepare("SELECT event_id FROM active_group_series WHERE account_id=?1 UNION SELECT event_id FROM conflicts WHERE account_id=?1")?;
             let rows = q
                 .query_map([&expected.account_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
         for id in &affected {
-            // Outgoing edits support only ordinary events. A cached tombstone or a local
-            // create without a provider acknowledgement restores to absence.
-            let payload: Option<String> = tx.query_row(
-                "SELECT (SELECT payload FROM incoming_items WHERE id=?1)",
-                [id],
-                |r| r.get(0),
-            )?;
-            tx.execute("DELETE FROM events WHERE id=?1", [id])?;
-            if let Some(payload) = payload {
-                let item: IncomingItem = serde_json::from_str(&payload)?;
-                if let Some(mut event) = item
-                    .event
-                    .filter(|_| !item.unsupported && item.master.is_none())
-                {
-                    let calendar: String = tx.query_row(
-                        "SELECT calendar_id FROM remote_events WHERE id=?1",
-                        [id],
-                        |r| r.get(0),
-                    )?;
-                    event.id = id.clone();
-                    event.calendar_id = calendar.clone();
-                    Repository::write(&tx, &event)?;
-                    // Google may have converted the formerly ordinary event to a series
-                    // while its local edit was pending. Restore cached exceptions too.
-                    if event.recurrence.is_some() {
-                        let mut q = tx.prepare("SELECT i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 AND json_extract(i.payload,'$.master')=?2 ORDER BY i.id")?;
-                        let items = q
-                            .query_map(params![calendar, item.remote_id], |r| {
-                                r.get::<_, String>(0)
-                            })?
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        for payload in items {
-                            let exception: IncomingItem = serde_json::from_str(&payload)?;
-                            if let Some(original) = exception.original_start {
-                                let replacement = exception.event.map(|mut e| {
-                                    e.id = id.clone();
-                                    e.calendar_id = calendar.clone();
-                                    e
-                                });
-                                tx.execute("INSERT INTO event_exceptions(series_id,original_start,calendar_id,payload) VALUES(?1,?2,?3,?4) ON CONFLICT(series_id,original_start) DO UPDATE SET calendar_id=excluded.calendar_id,payload=excluded.payload", params![id,original,replacement.as_ref().map(|e| &e.calendar_id),replacement.as_ref().map(serde_json::to_string).transpose()?])?;
-                            }
-                        }
-                    }
-                }
-            }
+            restore_incoming(&tx, id)?;
         }
         tx.execute(
             "DELETE FROM conflicts WHERE account_id=?1",
@@ -249,4 +207,91 @@ impl CalendarService {
             .retain(|_, (d, _)| d.account.id != expected.account_id);
         Ok(())
     }
+}
+
+pub(crate) fn restore_incoming(tx: &Connection, id: &str) -> Result<()> {
+    // Rebuild the aggregate from retained provider observations.
+    let payload: Option<String> = tx.query_row(
+        "SELECT (SELECT payload FROM incoming_items WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    tx.execute("DELETE FROM events WHERE id=?1", [id])?;
+    if let Some(payload) = payload {
+        let item: IncomingItem = serde_json::from_str(&payload)?;
+        if let Some(mut event) = item
+            .event
+            .filter(|_| !item.unsupported && item.master.is_none())
+        {
+            let calendar: String = tx.query_row(
+                "SELECT calendar_id FROM remote_events WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            event.id = id.to_owned();
+            event.calendar_id = calendar.clone();
+            Repository::write(tx, &event)?;
+            // Google may have converted the formerly ordinary event to a series
+            // while its local edit was pending. Restore cached exceptions too.
+            if event.recurrence.is_some() {
+                let mut q = tx.prepare("SELECT i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 AND json_extract(i.payload,'$.master')=?2 ORDER BY i.id")?;
+                let items = q
+                    .query_map(params![calendar, item.remote_id], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for payload in items {
+                    let exception: IncomingItem = serde_json::from_str(&payload)?;
+                    if let Some(original) = exception.original_start {
+                        let replacement = exception.event.map(|mut e| {
+                            e.id = id.to_owned();
+                            e.calendar_id = calendar.clone();
+                            e
+                        });
+                        tx.execute("INSERT INTO event_exceptions(series_id,original_start,calendar_id,payload) VALUES(?1,?2,?3,?4) ON CONFLICT(series_id,original_start) DO UPDATE SET calendar_id=excluded.calendar_id,payload=excluded.payload", params![id,original,replacement.as_ref().map(|e| &e.calendar_id),replacement.as_ref().map(serde_json::to_string).transpose()?])?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Covers acknowledged siblings too: partial progress or a changed incoming shadow
+/// invalidates conflict review even if the conflicting resource itself is unchanged.
+pub(crate) fn group_revision(db: &Connection, event: &str) -> Result<String> {
+    let mut digest = Sha256::new();
+    for sql in [
+        "SELECT o.* FROM outbox o WHERE group_id IN (WITH RECURSIVE affected(group_id) AS (SELECT group_id FROM active_group_series WHERE event_id=?1 UNION SELECT b.group_id FROM active_group_series a JOIN active_group_series b ON a.event_id=b.event_id JOIN affected g ON g.group_id=a.group_id) SELECT group_id FROM affected) ORDER BY o.id",
+        "SELECT m.*,e.payload,i.payload FROM active_group_series m LEFT JOIN events e ON e.id=m.event_id LEFT JOIN incoming_items i ON i.id=m.event_id WHERE m.group_id IN (WITH RECURSIVE affected(group_id) AS (SELECT group_id FROM active_group_series WHERE event_id=?1 UNION SELECT b.group_id FROM active_group_series a JOIN active_group_series b ON a.event_id=b.event_id JOIN affected g ON g.group_id=a.group_id) SELECT group_id FROM affected) ORDER BY m.group_id,m.event_id",
+        "SELECT x.* FROM event_exceptions x WHERE series_id IN (SELECT event_id FROM active_group_series WHERE group_id IN (WITH RECURSIVE affected(group_id) AS (SELECT group_id FROM active_group_series WHERE event_id=?1 UNION SELECT b.group_id FROM active_group_series a JOIN active_group_series b ON a.event_id=b.event_id JOIN affected g ON g.group_id=a.group_id) SELECT group_id FROM affected)) ORDER BY series_id,original_start",
+        "SELECT i.id,i.payload FROM incoming_items i JOIN remote_events r ON json_extract(i.payload,'$.master')=r.remote_id JOIN active_group_series a ON a.event_id=r.id WHERE a.group_id IN (WITH RECURSIVE affected(group_id) AS (SELECT group_id FROM active_group_series WHERE event_id=?1 UNION SELECT b.group_id FROM active_group_series a JOIN active_group_series b ON a.event_id=b.event_id JOIN affected g ON g.group_id=a.group_id) SELECT group_id FROM affected) ORDER BY i.id",
+    ] {
+        let mut q = db.prepare(sql)?;
+        let columns = q.column_count();
+        let mut rows = q.query([event])?;
+        digest.update(sql.as_bytes());
+        while let Some(row) = rows.next()? {
+            for i in 0..columns {
+                let value = format!("{:?}", row.get_ref(i)?);
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn affected_groups(db: &Connection, event: &str) -> Result<Vec<String>> {
+    let mut q = db.prepare(
+        "WITH RECURSIVE affected(group_id) AS (
+        SELECT group_id FROM active_group_series WHERE event_id=?1
+        UNION
+        SELECT b.group_id FROM active_group_series a
+        JOIN active_group_series b ON a.event_id=b.event_id
+        JOIN affected g ON g.group_id=a.group_id
+    ) SELECT group_id FROM affected ORDER BY group_id",
+    )?;
+    let rows = q
+        .query_map([event], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }

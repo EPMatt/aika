@@ -29,7 +29,7 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -71,6 +71,9 @@ impl Repository {
         }
         if version < 5 {
             tx.execute_batch(include_str!("schema_v5.sql"))?;
+        }
+        if version < 6 {
+            tx.execute_batch(include_str!("schema_v6.sql"))?;
         }
         tx.commit()?;
         Ok(Self {
@@ -399,14 +402,14 @@ impl Repository {
         let existing: Option<String> = tx.query_row("SELECT id FROM remote_events WHERE account_id=?1 AND calendar_id=?2 AND remote_id=?3", params![account,event.calendar_id,remote_id], |r| r.get(0)).optional()?;
         event.id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         tx.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,shadow_payload=excluded.shadow_payload,capabilities=excluded.capabilities", params![event.id,account,event.calendar_id,remote_id,revision,shadow,serde_json::to_string(&capabilities)?])?;
-        let pending = tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE event_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE event_id=?1)", [&event.id], |r| r.get::<_, bool>(0))?;
+        let pending = tx.query_row("SELECT EXISTS(SELECT 1 FROM active_group_series WHERE event_id=?1) OR EXISTS(SELECT 1 FROM conflicts WHERE event_id=?1)", [&event.id], |r| r.get::<_, bool>(0))?;
         if !pending {
             Self::write(&tx, &event)?;
         }
         tx.commit()?;
         Ok(event.id)
     }
-    fn queue_change(db: &Connection, change: &SeriesChange, undo: bool) -> Result<()> {
+    fn queue_change(db: &Connection, change: &SeriesChange, undo: bool, group: &str) -> Result<()> {
         let expected = if undo { &change.after } else { &change.before };
         let value = if undo { &change.before } else { &change.after };
         let Some(series) = value.as_ref().or(expected.as_ref()) else {
@@ -427,7 +430,19 @@ impl Repository {
         if undo {
             if let Some((id, state, previous, next, attempts)) = &last {
                 if state == "pending" && *attempts == 0 && previous == &after && next == &before {
+                    let size: u32 = db.query_row("SELECT count(*) FROM outbox WHERE group_id=(SELECT group_id FROM outbox WHERE id=?1)", [id], |r| r.get(0))?;
+                    if size > 1 {
+                        return Err(error(
+                            "groupRecoveryRequired",
+                            "Review the complete grouped action before undoing it.",
+                        ));
+                    }
+                    let old_group: String =
+                        db.query_row("SELECT group_id FROM outbox WHERE id=?1", [id], |r| {
+                            r.get(0)
+                        })?;
                     db.execute("DELETE FROM outbox WHERE id=?1", [id])?;
+                    db.execute("DELETE FROM operation_groups WHERE id=?1", [old_group])?;
                     return Ok(());
                 }
             }
@@ -440,7 +455,11 @@ impl Repository {
             )
             .optional()?
             .flatten();
-        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![uuid::Uuid::new_v4().to_string(),account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)})])?;
+        db.execute(
+            "INSERT OR IGNORE INTO operation_groups(id,account_id,calendar_id) VALUES(?1,?2,?3)",
+            params![group, account, series.event.calendar_id],
+        )?;
+        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on,group_id,step_index) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT count(*) FROM outbox WHERE group_id=?10))", params![uuid::Uuid::new_v4().to_string(),account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)}),group])?;
         Ok(())
     }
     pub fn undo_requirements(&mut self) -> Result<Vec<(String, Option<CalendarEvent>, String)>> {
@@ -932,6 +951,71 @@ impl Repository {
                 ));
             }
         }
+        let mut cancelled = std::collections::BTreeSet::new();
+        if undo {
+            for change in changes {
+                let group: Option<String> = db
+                    .query_row(
+                        "SELECT group_id FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1",
+                        [&change.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(group) = group {
+                    let mut q = db.prepare("SELECT event_id,before_payload,after_payload FROM operation_group_series WHERE group_id=?1")?;
+                    let members = q
+                        .query_map([&group], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let step_count: u32 = db.query_row(
+                        "SELECT count(*) FROM outbox WHERE group_id=?1",
+                        [&group],
+                        |r| r.get(0),
+                    )?;
+                    if step_count > 1 {
+                        let attempted: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE group_id=?1 AND (attempts>0 OR state!='pending'))", [&group], |r| r.get(0))?;
+                        if attempted {
+                            return Err(error("groupRecoveryRequired", "Reconcile the complete grouped action before queuing compensation."));
+                        }
+                        for (id, before, after) in members {
+                            let change = changes.iter().find(|c| c.id == id).ok_or_else(|| {
+                                error(
+                                    "groupRecoveryRequired",
+                                    "Undo must include every affected series.",
+                                )
+                            })?;
+                            if before
+                                != change
+                                    .before
+                                    .as_ref()
+                                    .map(serde_json::to_string)
+                                    .transpose()?
+                                || after
+                                    != change
+                                        .after
+                                        .as_ref()
+                                        .map(serde_json::to_string)
+                                        .transpose()?
+                            {
+                                return Err(error(
+                                    "conflict",
+                                    "The grouped action changed. Review it again.",
+                                ));
+                            }
+                            cancelled.insert(id);
+                        }
+                        db.execute("DELETE FROM outbox WHERE group_id=?1", [&group])?;
+                        db.execute("DELETE FROM operation_groups WHERE id=?1", [&group])?;
+                    }
+                }
+            }
+        }
+        let group = uuid::Uuid::new_v4().to_string();
         for change in changes {
             let value = if undo { &change.before } else { &change.after };
             let expected = if undo { &change.after } else { &change.before };
@@ -966,7 +1050,9 @@ impl Repository {
             for exception in event.exceptions.iter().filter_map(|x| x.event.as_ref()) {
                 Self::require_mutation(db, exception, "edit")?;
             }
-            Self::queue_change(db, change, undo)?;
+            if !cancelled.contains(&change.id) {
+                Self::queue_change(db, change, undo, &group)?;
+            }
             match value {
                 Some(series) => {
                     Self::write_series(db, series)?;
@@ -1052,6 +1138,7 @@ impl Repository {
             calendar_capabilities: Default::default(),
             event_capabilities: Default::default(),
             sync_status: vec![],
+            event_actions: Default::default(),
         })
     }
     pub fn snapshot_calendar(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
@@ -1233,6 +1320,68 @@ mod tests {
     }
     fn service() -> Repository {
         Repository::open(Path::new(":memory:")).unwrap()
+    }
+    #[test]
+    fn wholly_unattempted_group_undo_cancels_every_series_in_one_transaction() {
+        let mut repo = Repository::open(Path::new(":memory:")).unwrap();
+        let account = repo
+            .upsert_account("fixture", "subject", "Fixture", ConnectionState::Connected)
+            .unwrap();
+        let cal = repo
+            .import_calendar(
+                &account,
+                "remote",
+                details("Fixture"),
+                Capabilities::ordinary(),
+            )
+            .unwrap();
+        let mut a = event();
+        a.calendar_id = cal.clone();
+        let mut b = event();
+        b.id = uuid::Uuid::new_v4().to_string();
+        b.calendar_id = cal;
+        let changes: Vec<_> = [a, b]
+            .into_iter()
+            .map(|event| SeriesChange {
+                id: event.id.clone(),
+                before: None,
+                after: Some(EventSeries {
+                    event,
+                    exceptions: vec![],
+                }),
+            })
+            .collect();
+        let tx = repo.db.transaction().unwrap();
+        Repository::apply_changes(&tx, &changes, false).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM operation_groups", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tx.query_row("SELECT count(DISTINCT resource_id) FROM outbox", [], |r| {
+                r.get::<_, u32>(0)
+            })
+            .unwrap(),
+            2
+        );
+        Repository::apply_changes(&tx, &changes, true).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM operation_groups", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        tx.commit().unwrap();
+        for change in changes {
+            assert!(repo.get(&change.id).unwrap().is_none());
+        }
     }
     #[test]
     fn crud_restart_preferences_and_session_undo() {
@@ -1699,7 +1848,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                5
+                6
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -2021,7 +2170,7 @@ mod recurrence_tests {
             sidebar: false,
         };
         provider.set_preferences(prefs.clone()).unwrap();
-        provider.db.execute_batch("DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring;
+        provider.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; DROP TABLE operation_group_series; ALTER TABLE outbox DROP COLUMN group_id; DROP TABLE operation_groups; DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring;
         ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
         DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert; ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities;
         DROP TABLE accounts; PRAGMA user_version=2;").unwrap();
@@ -2038,7 +2187,7 @@ mod recurrence_tests {
                 .db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            5
+            6
         );
         drop(provider);
         std::fs::remove_file(path).unwrap();
@@ -2093,7 +2242,7 @@ mod migration_v4_tests {
                 [&event.id],
             )
             .unwrap();
-        repo.db.execute_batch("ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
+        repo.db.execute_batch("DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
             DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert;
             ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities; DROP TABLE accounts; PRAGMA user_version=3;").unwrap();
         event
@@ -2130,7 +2279,7 @@ mod migration_v4_tests {
                 repo.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                5
+                6
             );
         }
         std::fs::remove_file(path).unwrap();

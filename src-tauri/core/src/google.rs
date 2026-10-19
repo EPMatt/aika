@@ -226,6 +226,16 @@ trait GoogleTransport: Send + Sync {
             "Outgoing event transport unavailable.",
         ))
     }
+    fn instance_page(
+        &self,
+        _access: &str,
+        _calendar: &str,
+        _series: &str,
+        _original: &str,
+        _page: Option<&str>,
+    ) -> Result<events::EventPage> {
+        Err(error("unsupported", "Instance lookup unavailable."))
+    }
     fn calendar_page(&self, access: &str, page: Option<&str>) -> Result<CalendarPage>;
 }
 struct HttpTransport;
@@ -271,6 +281,40 @@ impl GoogleTransport for HttpTransport {
             )),
             _ => decode(response),
         }
+    }
+
+    fn instance_page(
+        &self,
+        access: &str,
+        calendar: &str,
+        series: &str,
+        original: &str,
+        page: Option<&str>,
+    ) -> Result<events::EventPage> {
+        if series.is_empty() || matches!(series, "." | "..") {
+            return Err(error("validation", "Invalid series identity."));
+        }
+        let mut url = event_url(calendar)?;
+        url.path_segments_mut()
+            .map_err(|_| error("validation", "Invalid instance URL."))?
+            .push(series)
+            .push("instances");
+        let mut query = vec![
+            ("originalStart", original),
+            ("showDeleted", "true"),
+            ("maxResults", "2500"),
+        ];
+        if let Some(page) = page {
+            query.push(("pageToken", page));
+        }
+        decode(
+            client()?
+                .get(url)
+                .bearer_auth(access)
+                .query(&query)
+                .send()
+                .map_err(network)?,
+        )
     }
 
     fn event_request(
@@ -869,7 +913,80 @@ fn event_url(calendar: &str) -> Result<Url> {
         .push("events");
     Ok(url)
 }
+fn resolve_instance(
+    transport: &dyn GoogleTransport,
+    access: &str,
+    calendar: &str,
+    series: &str,
+    original: &str,
+) -> Result<crate::sync::IncomingItem> {
+    let canonical = if original.len() == 10 {
+        let date = chrono::NaiveDate::parse_from_str(original, "%Y-%m-%d")
+            .map_err(|_| error("validation", "Invalid original start."))?;
+        if date.to_string() != original {
+            return Err(error("validation", "Invalid original start."));
+        }
+        original.to_owned()
+    } else {
+        aika_domain::iso(
+            chrono::DateTime::parse_from_rfc3339(original)
+                .map_err(|_| error("validation", "Invalid original start."))?
+                .with_timezone(&chrono::Utc),
+        )
+    };
+    let original = canonical.as_str();
+    let mut page = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = None;
+    loop {
+        let response =
+            transport.instance_page(access, calendar, series, original, page.as_deref())?;
+        let next_page = response.next_page_token.clone();
+        for item in events::normalized(response)?.items {
+            if item.master.as_deref() == Some(series)
+                && item.original_start.as_deref() == Some(original)
+            {
+                if found.is_some() {
+                    return Err(error(
+                        "providerIdentity",
+                        "Google returned ambiguous instance identities.",
+                    ));
+                }
+                found = Some(item);
+            }
+        }
+        match next_page {
+            Some(next) if seen.len() < 1000 && seen.insert(next.clone()) => page = Some(next),
+            Some(_) => return Err(error("google", "Google repeated an instance page.")),
+            None => break,
+        }
+    }
+    found.ok_or_else(|| {
+        error(
+            "notFound",
+            "Google did not return this occurrence. Refresh the series before editing.",
+        )
+    })
+}
+
 impl GoogleProvider {
+    /// Backend-only preflight. Callers must persist the returned provider identity
+    /// before attempting a write; IDs are never constructed from occurrence strings.
+    pub fn resolve_instance(
+        &self,
+        subject: &str,
+        calendar: &str,
+        series: &str,
+        original: &str,
+    ) -> Result<crate::sync::IncomingItem> {
+        resolve_instance(
+            self.0.transport.as_ref(),
+            &self.access(subject)?,
+            calendar,
+            series,
+            original,
+        )
+    }
     fn access(&self, subject: &str) -> Result<String> {
         let _guard = self.0.credential_work.lock().unwrap();
         let config = self.0.config.as_ref().ok_or_else(|| {
@@ -1018,6 +1135,8 @@ mod tests {
         fail_refresh: AtomicBool,
         fail_page: AtomicBool,
         fail_browser: AtomicBool,
+        instance_pages: Mutex<std::collections::VecDeque<events::EventPage>>,
+        instance_queries: Mutex<Vec<(String, String, Option<String>)>>,
     }
     impl GoogleTransport for Transport {
         fn browser(&self, url: &Url) -> Result<()> {
@@ -1073,6 +1192,25 @@ mod tests {
                 email: "test@example.invalid".into(),
                 email_verified: true,
             })
+        }
+        fn instance_page(
+            &self,
+            _: &str,
+            _: &str,
+            series: &str,
+            original: &str,
+            page: Option<&str>,
+        ) -> Result<events::EventPage> {
+            self.instance_queries.lock().unwrap().push((
+                series.into(),
+                original.into(),
+                page.map(str::to_owned),
+            ));
+            self.instance_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| error("network", "No fixture page."))
         }
         fn calendar_page(&self, _: &str, page: Option<&str>) -> Result<CalendarPage> {
             if self.fail_page.load(Ordering::SeqCst) {
@@ -1461,5 +1599,70 @@ mod tests {
         assert!(callback("GET /wrong?state=s&code=c HTTP/1.1\r\n", "s", 1)
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn instance_lookup_uses_original_start_and_provider_ids_for_moved_and_cancelled_instances() {
+        for cancelled in [false, true] {
+            let t = Transport::default();
+            let mut item = serde_json::json!({"id":"opaque-provider-instance", "etag":"r1", "recurringEventId":"series", "originalStartTime":{"date":"2026-10-01"}, "summary":"Moved", "start":{"date":"2026-12-01"}, "end":{"date":"2026-12-02"}});
+            if cancelled {
+                item["status"] = serde_json::json!("cancelled");
+                item.as_object_mut().unwrap().remove("start");
+                item.as_object_mut().unwrap().remove("end");
+            }
+            for (items, next) in [(vec![], Some("second".into())), (vec![item], None)] {
+                t.instance_pages
+                    .lock()
+                    .unwrap()
+                    .push_back(events::EventPage {
+                        items,
+                        next_page_token: next,
+                        next_sync_token: None,
+                        time_zone: "UTC".into(),
+                    });
+            }
+            let resolved =
+                resolve_instance(&t, "access", "calendar", "series", "2026-10-01").unwrap();
+            assert_eq!(resolved.remote_id, "opaque-provider-instance");
+            assert_eq!(resolved.event.is_none(), cancelled);
+            assert_eq!(
+                t.instance_queries.lock().unwrap()[1],
+                ("series".into(), "2026-10-01".into(), Some("second".into()))
+            );
+        }
+    }
+    #[test]
+    fn instance_lookup_rejects_missing_ambiguous_and_repeated_pages() {
+        for mode in ["missing", "ambiguous", "repeat"] {
+            let t = Transport::default();
+            let item = serde_json::json!({"id":"cancelled", "status":"cancelled", "recurringEventId":"series", "originalStartTime":{"date":"2026-10-01"}});
+            let items = if mode == "ambiguous" {
+                vec![item.clone(), item]
+            } else {
+                vec![]
+            };
+            let page = || events::EventPage {
+                items: items.clone(),
+                next_page_token: if mode == "repeat" {
+                    Some("same".into())
+                } else {
+                    None
+                },
+                next_sync_token: None,
+                time_zone: "UTC".into(),
+            };
+            t.instance_pages.lock().unwrap().extend([page(), page()]);
+            let failure = resolve_instance(&t, "access", "calendar", "series", "2026-10-01")
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.code,
+                match mode {
+                    "missing" => "notFound",
+                    "ambiguous" => "providerIdentity",
+                    _ => "google",
+                }
+            );
+        }
     }
 }

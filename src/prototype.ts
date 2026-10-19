@@ -107,6 +107,7 @@ export class PrototypeRepository {
       canUndo: this.canUndo(),
       accounts: [],
       syncStatus: [],
+      eventActions: {},
       calendarCapabilities: Object.fromEntries(
         this.calendars.map((c) => [
           c.id,

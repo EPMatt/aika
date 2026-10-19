@@ -197,6 +197,19 @@ impl ProviderRegistry {
             let caps = self
                 .capabilities(&event.calendar_id, Some(event))
                 .unwrap_or_else(|_| Capabilities::read_only());
+            let actions = EventActions::for_event(
+                &caps,
+                event.recurrence.is_some() || event.occurrence.is_some(),
+                self.repository
+                    .calendar_account(&event.calendar_id)?
+                    .is_some(),
+            );
+            snapshot
+                .event_actions
+                .insert(event.id.clone(), actions.clone());
+            if let Some((master, _)) = event.id.split_once('@') {
+                snapshot.event_actions.insert(master.into(), actions);
+            }
             snapshot
                 .event_capabilities
                 .insert(event.id.clone(), caps.clone());
@@ -247,8 +260,33 @@ impl ProviderRegistry {
     pub fn get_series(&self, target: &str) -> Result<EventSeries> {
         self.repository.get_series(target)
     }
+    pub fn event_actions(&self, target: &str) -> Result<EventActions> {
+        let series = self.get_series(target)?;
+        let caps = self.capabilities(&series.event.calendar_id, Some(&series.event))?;
+        Ok(EventActions::for_event(
+            &caps,
+            series.event.recurrence.is_some(),
+            self.repository
+                .calendar_account(&series.event.calendar_id)?
+                .is_some(),
+        ))
+    }
     pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
         let series = self.get_series(&request.target)?;
+        let actions = self.event_actions(&request.target)?;
+        let scopes = if request.event.is_some() {
+            actions.edit
+        } else {
+            actions.delete
+        };
+        let availability = scopes
+            .iter()
+            .find(|a| a.scope == request.scope)
+            .ok_or_else(|| error("unsupported", "This scope is unavailable for this event."))?;
+        if let Some(reason) = &availability.disabled_reason {
+            return Err(error("readOnly", reason));
+        }
+
         self.require(
             &series.event.calendar_id,
             Some(&series.event),
