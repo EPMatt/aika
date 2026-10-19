@@ -740,4 +740,74 @@ mod tests {
             assert_eq!(t.requests.lock().unwrap().len(), 2);
         }
     }
+    #[test]
+    fn split_trim_and_tail_recover_lost_http_responses_without_repeating_writes() {
+        let mut trim = operation("update", false);
+        let rule = Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 2,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(6),
+            segment: None,
+        };
+        trim.before.as_mut().unwrap().event.recurrence = Some(rule.clone());
+        trim.after.as_mut().unwrap().event.recurrence = Some(Recurrence {
+            count: Some(2),
+            ..rule
+        });
+        let mut original = resource("Before", "r1");
+        original["recurrence"] = json!(["RRULE:FREQ=DAILY;INTERVAL=2;COUNT=6"]);
+        let mut applied = resource("After", "r2");
+        applied["recurrence"] = json!(["RRULE:FREQ=DAILY;INTERVAL=2;COUNT=2"]);
+        applied["extendedProperties"]["private"]["aikaOperation"] = json!(trim.id);
+        let transport = Transport::new(vec![
+            Ok(Some(original)),
+            Err(error("network", "Lost trim response")),
+        ]);
+        assert_eq!(
+            deliver(&transport, "access", &trim).err().unwrap().code,
+            "network"
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[1].0, "PATCH");
+        assert_eq!(requests[1].1.as_deref(), Some("r1"));
+        assert_eq!(
+            requests[1].2.as_ref().unwrap()["recurrence"],
+            applied["recurrence"]
+        );
+        assert!(requests[1].2.as_ref().unwrap().get("start").is_none());
+        drop(requests);
+        trim.recovering = true;
+        let transport = Transport::new(vec![Ok(Some(applied.clone()))]);
+        assert!(matches!(
+            deliver(&transport, "access", &trim).unwrap(),
+            OutgoingResult::Applied(Some(_))
+        ));
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        let mut tail = trim.clone();
+        tail.id = "tail-operation".into();
+        tail.operation = "create".into();
+        tail.before = None;
+        tail.revision = None;
+        tail.recovering = false;
+        applied["extendedProperties"]["private"]["aikaOperation"] = json!(tail.id);
+        let transport = Transport::new(vec![Ok(None), Err(error("network", "Lost tail response"))]);
+        assert_eq!(
+            deliver(&transport, "access", &tail).err().unwrap().code,
+            "network"
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[1].0, "POST");
+        assert_eq!(requests[1].2.as_ref().unwrap()["id"], tail.remote_id);
+        drop(requests);
+        tail.recovering = true;
+        let transport = Transport::new(vec![Ok(Some(applied))]);
+        assert!(matches!(
+            deliver(&transport, "access", &tail).unwrap(),
+            OutgoingResult::Applied(Some(_))
+        ));
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
 }

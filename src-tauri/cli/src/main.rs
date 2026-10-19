@@ -106,6 +106,9 @@ enum Events {
         id: String,
         #[arg(long, value_parser = ["occurrence", "following", "series"])]
         scope: Option<String>,
+        /// Confirm resetting future Google exceptions for following deletion.
+        #[arg(long)]
+        reset_exceptions: bool,
     },
 }
 
@@ -774,7 +777,11 @@ fn run(cli: Cli) -> Result<String> {
                 output
             })
         }
-        Events::Delete { id, scope } => {
+        Events::Delete {
+            id,
+            scope,
+            reset_exceptions,
+        } => {
             let series = service.get_series(&id)?;
             let scope = mutation_scope(scope.as_deref(), series.event.recurrence.is_some())?;
             if series.event.recurrence.is_none() {
@@ -785,7 +792,7 @@ fn run(cli: Cli) -> Result<String> {
                     scope,
                     event: None,
                     expected: aika_core::recurrence::expectation(&series)?,
-                    reset_exceptions: false,
+                    reset_exceptions,
                     exception_policy: None,
                     count_changed: false,
                 })?;

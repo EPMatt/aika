@@ -244,6 +244,19 @@ pub(crate) fn observed_series(tx: &Connection, id: &str) -> Result<Option<EventS
         for payload in items {
             let exception: IncomingItem = serde_json::from_str(&payload)?;
             if let Some(original_start) = exception.original_start {
+                // Trims invalidate cached future exceptions. Preserve only keys
+                // that still belong to the observed master schedule.
+                if aika_domain::recurrence::get_occurrence(
+                    &EventSeries {
+                        event: result.event.clone(),
+                        exceptions: vec![],
+                    },
+                    &original_start,
+                )
+                .is_err()
+                {
+                    continue;
+                }
                 let event = exception.event.map(|mut e| {
                     e.id = id.into();
                     e.calendar_id = calendar.clone();

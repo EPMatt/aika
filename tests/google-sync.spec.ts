@@ -384,10 +384,7 @@ test('Google recurring controls preserve exceptions and explain unsupported scop
     };
     const actions = ['occurrence', 'following', 'series'].map((scope) => ({
       scope,
-      disabledReason:
-        scope === 'following'
-          ? 'Google following changes require the following recovery phase.'
-          : null,
+      disabledReason: null,
     }));
     const fixture = { requests: [] as any[], event: occurrence, conflicts: [] as any[] };
     (window as any).recurringGoogleFixture = fixture;
@@ -456,7 +453,10 @@ test('Google recurring controls preserve exceptions and explain unsupported scop
               return [];
             case 'mutate_recurring_event':
               fixture.requests.push(args.request);
-              fixture.event = { ...fixture.event, title: args.request.event.title };
+              fixture.event = {
+                ...fixture.event,
+                title: args.request.event?.title ?? fixture.event.title,
+              };
               return [args.request.event];
             default:
               throw new Error(`Unexpected command: ${command}`);
@@ -474,7 +474,9 @@ test('Google recurring controls preserve exceptions and explain unsupported scop
   await expect(page.getByLabel('Repeat pattern')).toBeDisabled();
   await expect(
     page.getByLabel('Event change scope').locator('option[value="following"]'),
-  ).toHaveJSProperty('disabled', true);
+  ).toHaveJSProperty('disabled', false);
+  await page.getByLabel('Event change scope').selectOption('following');
+  await expect(page.getByLabel('Reset individual changes')).toBeVisible();
   await page.getByLabel('Event change scope').selectOption('series');
   await expect(page.getByLabel('All-day event')).toBeDisabled();
   await expect(page.locator('#event-start-date')).toBeDisabled();
@@ -497,6 +499,46 @@ test('Google recurring controls preserve exceptions and explain unsupported scop
     resetExceptions: false,
     expected: 'checked-series',
   });
+  await page
+    .getByRole('button', { name: /Preserved repeat, recurring/ })
+    .first()
+    .click();
+  await page.getByLabel('Event change scope').selectOption('following');
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Confirm');
+  await page.getByLabel('Reset individual changes').check();
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).recurringGoogleFixture.requests.length))
+    .toBe(2);
+  expect(
+    await page.evaluate(() => (window as any).recurringGoogleFixture.requests[1]),
+  ).toMatchObject({
+    scope: 'following',
+    resetExceptions: true,
+    exceptionPolicy: 'reset',
+    expected: 'checked-series',
+  });
+  await page
+    .getByRole('button', { name: /Preserved repeat, recurring/ })
+    .first()
+    .click();
+  await page.getByLabel('Event change scope').selectOption('following');
+  await page.getByRole('button', { name: 'Delete event', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Confirm reset');
+  await page.getByLabel('Reset individual changes').check();
+  await page.getByRole('button', { name: 'Delete event', exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).recurringGoogleFixture.requests.length))
+    .toBe(3);
+  expect(
+    await page.evaluate(() => (window as any).recurringGoogleFixture.requests[2]),
+  ).toMatchObject({
+    scope: 'following',
+    event: null,
+    resetExceptions: true,
+    exceptionPolicy: 'reset',
+  });
   await page.evaluate(() => {
     const fixture = (window as any).recurringGoogleFixture;
     fixture.conflicts = [
@@ -517,13 +559,27 @@ test('Google recurring controls preserve exceptions and explain unsupported scop
         },
         remoteRevision: 'checked',
         groupRevision: 'complete-review',
+        recoverySteps: [
+          { title: 'Original repeat', operation: 'update', state: 'acknowledged' },
+          { title: 'Following tail', operation: 'create', state: 'blocked' },
+        ],
       },
     ];
     window.dispatchEvent(new Event('focus'));
   });
+  await expect(page.getByLabel('Grouped action progress')).toContainText(
+    'Original repeat: update — acknowledged',
+  );
+  await expect(page.getByLabel('Grouped action progress')).toContainText(
+    'Following tail: create — blocked',
+  );
   await page.getByText('Compare versions', { exact: true }).click();
   await expect(page.getByLabel('Local individual changes')).toContainText('Cancelled occurrence');
   await expect(page.getByLabel('Google individual changes')).toContainText(
     'External individual edit',
   );
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
 });

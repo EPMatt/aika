@@ -77,7 +77,7 @@ pub struct EventActions {
     pub delete: Vec<ScopeAvailability>,
 }
 impl EventActions {
-    pub fn for_event(caps: &Capabilities, recurring: bool, remote: bool) -> Self {
+    pub fn for_event(caps: &Capabilities, recurring: bool, _remote: bool) -> Self {
         let scopes = if recurring {
             vec![
                 MutationScope::Occurrence,
@@ -92,11 +92,7 @@ impl EventActions {
                 .iter()
                 .map(|scope| ScopeAvailability {
                     scope: scope.clone(),
-                    disabled_reason: if recurring && remote && *scope == MutationScope::Following {
-                        Some(
-                            "Google following changes require the following recovery phase.".into(),
-                        )
-                    } else if !allowed || (recurring && !caps.recurrence) {
+                    disabled_reason: if !allowed || (recurring && !caps.recurrence) {
                         Some("This calendar or event is read-only.".into())
                     } else {
                         None
@@ -207,6 +203,18 @@ pub struct AccountSyncStatus {
     pub pending_count: u32,
     pub conflict_count: u32,
     pub calendars: Vec<CalendarSyncStatus>,
+    #[ts(optional)]
+    pub recovery_groups: Option<Vec<GroupProgress>>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupProgress {
+    pub id: String,
+    pub title: String,
+    pub completed_steps: u32,
+    pub total_steps: u32,
+    pub blocked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -222,6 +230,17 @@ pub struct SyncConflict {
     #[serde(default)]
     #[ts(optional)]
     pub group_revision: Option<String>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub recovery_steps: Option<Vec<GroupRecoveryStep>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRecoveryStep {
+    pub title: String,
+    pub operation: String,
+    pub state: String,
 }
 
 /// Checked review of account-wide local intent. The revision is opaque to clients.
@@ -251,14 +270,11 @@ pub struct CalendarRemovalReview {
 mod scope_tests {
     use super::*;
     #[test]
-    fn remote_recurrence_enables_occurrence_and_series_but_explains_following() {
+    fn remote_recurrence_enables_all_scopes() {
         let remote = EventActions::for_event(&Capabilities::local(), true, true);
         assert_eq!(remote.edit.len(), 3);
         for action in remote.edit.iter().chain(&remote.delete) {
-            assert_eq!(
-                action.disabled_reason.is_some(),
-                action.scope == MutationScope::Following
-            );
+            assert!(action.disabled_reason.is_none());
         }
         let local = EventActions::for_event(&Capabilities::local(), true, false);
         assert!(local

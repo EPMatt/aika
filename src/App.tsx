@@ -941,7 +941,7 @@ function EventEditor({
   event: CalendarEvent;
   existing: boolean;
   onSave: (event: CalendarEvent, resetExceptions: boolean, countChanged: boolean) => Promise<void>;
-  onDelete: () => Promise<void>;
+  onDelete: (resetExceptions: boolean) => Promise<void>;
   onClose: () => void;
 }) {
   const calendars = useContext(CalendarsContext);
@@ -1252,8 +1252,8 @@ function EventEditor({
         )}
         {google && !existing && (
           <p className="timezone-note">
-            Google repeats support all-day and UTC date-based patterns. Regional time zones and
-            following changes are unavailable.
+            Google repeats support all-day and UTC date-based patterns. Regional time zones are
+            unavailable.
           </p>
         )}
         <RepeatControls
@@ -1304,8 +1304,9 @@ function EventEditor({
               checked={resetExceptions}
               onChange={(e) => setResetExceptions(e.target.checked)}
             />
-            This edit discards affected individual edits and skipped occurrences. Reset those
-            changes.
+            {google && scope === 'following'
+              ? 'Reset future individual edits and skipped occurrences, including changes outside this cache. Undo can restore only cached changes.'
+              : 'This edit discards affected individual edits and skipped occurrences. Reset those changes.'}
           </label>
         )}
         {details ? (
@@ -1380,7 +1381,11 @@ function EventEditor({
               onClick={async () => {
                 setBusy(true);
                 try {
-                  await onDelete();
+                  if (google && scope === 'following' && !resetExceptions) {
+                    setError('Confirm reset of future Google exceptions before deleting.');
+                    return;
+                  }
+                  await onDelete(resetExceptions);
                 } catch (err) {
                   setError(errorMessage(err));
                 } finally {
@@ -1737,11 +1742,13 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       event,
       expected: selected.occurrence!.expected,
       resetExceptions:
-        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google'
+        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google' &&
+        scope !== 'following'
           ? false
           : resetExceptions,
       exceptionPolicy:
-        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google'
+        calendars.find((c) => c.id === selected.calendarId)?.providerId === 'google' &&
+        scope !== 'following'
           ? 'preserve'
           : 'reset',
       countChanged,
@@ -2054,6 +2061,13 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                           </button>
                         </>
                       )}
+                      {status.recoveryGroups?.map((group) => (
+                        <p key={group.id} role="status">
+                          {group.title}: {group.completedSteps} of {group.totalSteps} Google steps
+                          completed{group.blocked ? ' — needs attention' : ' — pending'}. Retry
+                          resumes unfinished steps. Discard keeps successful remote changes.
+                        </p>
+                      ))}
                       {syncConflicts
                         .filter((c) => c.accountId === status.accountId)
                         .map((conflict) => (
@@ -2068,6 +2082,23 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                               {conflict.remote?.event.title ||
                                 (conflict.remote ? 'Untitled event' : 'Deleted event')}
                             </p>
+                            {(conflict.recoverySteps?.length ?? 0) > 1 && (
+                              <div>
+                                <p>
+                                  This action affects several Google resources. Successful steps
+                                  remain effective. Keep local replans unfinished changes; Keep
+                                  Google discards the remainder and keeps the observed partial
+                                  result.
+                                </p>
+                                <ul aria-label="Grouped action progress">
+                                  {conflict.recoverySteps!.map((step, index) => (
+                                    <li key={index}>
+                                      {step.title}: {step.operation} — {step.state}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
                             <details>
                               <summary>Compare versions</summary>
                               {[
@@ -2348,15 +2379,19 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                         : undefined
                     }
                     resetAffected={Boolean(
-                      calendars.find((c) => c.id === editing.event.calendarId)?.providerId !==
-                        'google' &&
+                      (calendars.find((c) => c.id === editing.event.calendarId)?.providerId !==
+                        'google' ||
+                        editing.scope === 'following') &&
                         editing.series &&
                         editing.scope !== 'occurrence' &&
-                        editing.series.exceptions.some(
-                          (e) =>
-                            editing.scope === 'series' ||
-                            e.originalStart >= editing.selected!.occurrence!.originalStart,
-                        ),
+                        ((editing.scope === 'following' &&
+                          calendars.find((c) => c.id === editing.event.calendarId)?.providerId ===
+                            'google') ||
+                          editing.series.exceptions.some(
+                            (e) =>
+                              editing.scope === 'series' ||
+                              e.originalStart >= editing.selected!.occurrence!.originalStart,
+                          )),
                     )}
                     onPreview={async (event, countChanged) => {
                       if (editing.selected && editing.series && editing.scope !== 'occurrence') {
@@ -2389,10 +2424,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                         setMutating(false);
                       }
                     }}
-                    onDelete={async () => {
+                    onDelete={async (resetExceptions) => {
                       setMutating(true);
                       try {
-                        if (editing.selected) await performRecurring(requestForEdit(null));
+                        if (editing.selected)
+                          await performRecurring(requestForEdit(null, resetExceptions));
                         else if (desktop)
                           await calendarClient.delete(editing.event.id, editing.event);
                         else repository!.delete(editing.event.id);
@@ -2431,15 +2467,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     onChange={(e) => setGestureScope(e.target.value as MutationScope)}
                   >
                     <option value="occurrence">This occurrence</option>
-                    <option
-                      value="following"
-                      disabled={
-                        calendars.find((c) => c.id === gestureEdit?.original.calendarId)
-                          ?.providerId === 'google'
-                      }
-                    >
-                      This and following
-                    </option>
+                    <option value="following">This and following</option>
                     <option
                       value="series"
                       disabled={
@@ -2487,12 +2515,12 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                           expected: gestureEdit.original.occurrence!.expected,
                           resetExceptions:
                             calendars.find((c) => c.id === gestureEdit.original.calendarId)
-                              ?.providerId === 'google'
+                              ?.providerId === 'google' && gestureScope !== 'following'
                               ? false
                               : gestureReset,
                           exceptionPolicy:
                             calendars.find((c) => c.id === gestureEdit.original.calendarId)
-                              ?.providerId === 'google'
+                              ?.providerId === 'google' && gestureScope !== 'following'
                               ? 'preserve'
                               : 'reset',
                         });

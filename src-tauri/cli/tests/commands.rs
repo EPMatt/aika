@@ -1225,10 +1225,7 @@ fn google_recurring_cli_scopes_restore_cancelled_and_reject_unsafe_intent() {
     let actions: serde_json::Value =
         serde_json::from_str(&f.success(&["events", "actions", &master])).unwrap();
     assert!(actions["edit"][0]["disabledReason"].is_null());
-    assert!(actions["edit"][1]["disabledReason"]
-        .as_str()
-        .unwrap()
-        .contains("following"));
+    assert!(actions["edit"][1]["disabledReason"].is_null());
     let selected = format!("{master}@2026-10-02");
     f.success(&["events", "delete", &selected, "--scope", "occurrence"]);
     f.success(&[
@@ -1304,4 +1301,31 @@ fn google_recurring_cli_scopes_restore_cancelled_and_reject_unsafe_intent() {
         .exceptions[0]
         .event
         .is_some());
+    let pivot = format!("{master}@2026-10-03");
+    f.success(&[
+        "events",
+        "update",
+        &pivot,
+        "--scope",
+        "following",
+        "--title",
+        "Following tail",
+        "--reset-exceptions",
+    ]);
+    let repo = Repository::open(&f.0).unwrap();
+    let head = repo.get_series(&master).unwrap();
+    assert_eq!(head.event.recurrence.as_ref().unwrap().count, Some(2));
+    assert_eq!(head.exceptions.len(), 1);
+    drop(repo);
+    // First-occurrence following deletion removes the remaining head after consent.
+    let first = format!("{master}@2026-10-01");
+    f.success(&[
+        "events",
+        "delete",
+        &first,
+        "--scope",
+        "following",
+        "--reset-exceptions",
+    ]);
+    assert!(Repository::open(&f.0).unwrap().get_series(&master).is_err());
 }

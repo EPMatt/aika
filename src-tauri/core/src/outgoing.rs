@@ -43,6 +43,117 @@ pub(crate) fn occurrence_event(
     event.occurrence = None;
     Ok(Some(event))
 }
+/// Apply only persisted dirty fields to a checked current aggregate.
+fn rebase_intent(
+    before: Option<&EventSeries>,
+    after: Option<&EventSeries>,
+    observed: Option<EventSeries>,
+) -> Result<Option<EventSeries>> {
+    let Some(after) = after else {
+        return Ok(None);
+    };
+    let Some(before) = before else {
+        if observed.is_some() {
+            return Err(error("conflict", "The reserved Google identity is occupied. Keep Google or review the resource before recreating it."));
+        }
+        return Ok(Some(after.clone()));
+    };
+    let Some(mut observed) = observed else {
+        return Ok(Some(after.clone()));
+    };
+    let b = &before.event;
+    let a = &after.event;
+    let o = &mut observed.event;
+    if b.time != a.time || b.recurrence != a.recurrence {
+        if (b.recurrence.is_some() || a.recurrence.is_some() || o.recurrence.is_some())
+            && (o.time != b.time || o.recurrence != b.recurrence)
+            && (o.time != a.time || o.recurrence != a.recurrence)
+        {
+            return Err(error("unsupported", "The Google schedule changed. A following split cannot preserve its boundary exactly. Keep Google and split again."));
+        }
+        o.time = a.time.clone();
+        o.recurrence = a.recurrence.clone();
+    }
+    if b.title != a.title {
+        o.title = a.title.clone();
+    }
+    if b.location != a.location {
+        o.location = a.location.clone();
+    }
+    if b.notes != a.notes {
+        o.notes = a.notes.clone();
+    }
+    let keys: std::collections::BTreeSet<_> = before
+        .exceptions
+        .iter()
+        .chain(&after.exceptions)
+        .map(|e| e.original_start.clone())
+        .collect();
+    for key in keys {
+        let b = before.exceptions.iter().find(|e| e.original_start == key);
+        let a = after.exceptions.iter().find(|e| e.original_start == key);
+        if a == b {
+            continue;
+        }
+        let probe = EventSeries {
+            event: observed.event.clone(),
+            exceptions: vec![],
+        };
+        // Dropping an exception outside the new head is part of the trim.
+        if aika_domain::recurrence::get_occurrence(&probe, &key).is_err() {
+            if a.is_some() {
+                return Err(error(
+                    "unsupported",
+                    "The Google occurrence no longer belongs to this schedule.",
+                ));
+            }
+            observed.exceptions.retain(|e| e.original_start != key);
+            continue;
+        }
+        let replacement = if let Some(exception) = a {
+            let mut replacement = exception.clone();
+            if let (Some(old), Some(wanted), Some(mut actual)) = (
+                occurrence_event(before, &key)?,
+                &exception.event,
+                occurrence_event(&observed, &key)?,
+            ) {
+                if old.title != wanted.title {
+                    actual.title = wanted.title.clone();
+                }
+                if old.location != wanted.location {
+                    actual.location = wanted.location.clone();
+                }
+                if old.notes != wanted.notes {
+                    actual.notes = wanted.notes.clone();
+                }
+                if old.time != wanted.time {
+                    actual.time = wanted.time.clone();
+                }
+                replacement.event = Some(actual);
+            }
+            Some(replacement)
+        } else {
+            None
+        };
+        observed.exceptions.retain(|e| e.original_start != key);
+        if let Some(replacement) = replacement {
+            observed.exceptions.push(replacement);
+        }
+    }
+    // Retain remote exceptions preceding a trim, discard only the confirmed range.
+    let probe = EventSeries {
+        event: observed.event.clone(),
+        exceptions: vec![],
+    };
+    observed
+        .exceptions
+        .retain(|e| aika_domain::recurrence::get_occurrence(&probe, &e.original_start).is_ok());
+    observed
+        .exceptions
+        .sort_by(|a, b| a.original_start.cmp(&b.original_start));
+    Ok(Some(observed))
+}
+
 impl CalendarService {
     pub fn claim_outgoing(&mut self, claim: &SyncClaim) -> Result<Option<OutgoingOperation>> {
         let tx = self
@@ -488,10 +599,103 @@ impl CalendarService {
             );
         }
         if multi && keep_local {
-            return Err(error(
-                "groupRecoveryRequired",
-                "This grouped action requires a checked replan before keeping local changes.",
-            ));
+            // Replan the conflicting resource inside its existing ordered group.
+            // Acknowledged siblings and unattempted/uncertain siblings retain their
+            // identities, acknowledgements and ordering. Never recreate a tail
+            // merely because a different resource conflicted.
+            let (group, index): (String, u32) = tx.query_row(
+                "SELECT group_id,step_index FROM outbox WHERE event_id=?1 AND state='blocked' ORDER BY rowid LIMIT 1",
+                [&current.event_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            let mut q = tx.prepare("SELECT id,before_payload,after_payload FROM outbox WHERE group_id=?1 AND event_id=?2 AND state!='acknowledged' ORDER BY step_index")?;
+            let rows = q
+                .query_map(params![group, current.event_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(q);
+            let mut desired = current.remote.clone();
+            for (_, before, after) in &rows {
+                let before = before
+                    .as_deref()
+                    .map(serde_json::from_str::<EventSeries>)
+                    .transpose()?;
+                let after = after
+                    .as_deref()
+                    .map(serde_json::from_str::<EventSeries>)
+                    .transpose()?;
+                desired = rebase_intent(before.as_ref(), after.as_ref(), desired)?;
+            }
+            // Shift later siblings out of the way while the replacement expands
+            // into a master update plus individually checked instance writes.
+            for (id, _, _) in &rows {
+                tx.execute(
+                    "UPDATE outbox SET state='acknowledged',retry_at=NULL,acknowledgement=json_object('superseded',json('true'),'revision',(SELECT revision FROM remote_events WHERE account_id=outbox.account_id AND calendar_id=outbox.calendar_id AND remote_id=outbox.resource_id)) WHERE id=?1",
+                    [id],
+                )?;
+            }
+            let next: u32 = tx.query_row(
+                "SELECT coalesce(max(step_index),0)+1 FROM outbox WHERE group_id=?1",
+                [&group],
+                |r| r.get(0),
+            )?;
+            let previous_max: i64 =
+                tx.query_row("SELECT coalesce(max(rowid),0) FROM outbox", [], |r| {
+                    r.get(0)
+                })?;
+            tx.execute(
+                "DELETE FROM conflicts WHERE event_id=?1",
+                [&current.event_id],
+            )?;
+            if desired != current.remote {
+                crate::repository::Repository::queue_change_with_schedule(
+                    &tx,
+                    &SeriesChange {
+                        id: current.event_id.clone(),
+                        before: current.remote.clone(),
+                        after: desired.clone(),
+                    },
+                    false,
+                    &group,
+                    true,
+                )?;
+                let replacement: String = tx.query_row("SELECT id FROM outbox WHERE group_id=?1 AND event_id=?2 AND rowid>?3 ORDER BY step_index DESC LIMIT 1", params![group,current.event_id,previous_max],|r|r.get(0))?;
+                let master: Option<String> = tx.query_row("SELECT id FROM outbox WHERE group_id=?1 AND event_id=?2 AND rowid>?3 AND original_start IS NULL ORDER BY step_index DESC LIMIT 1", params![group,current.event_id,previous_max],|r|r.get(0)).optional()?;
+                for (old, _, _) in &rows {
+                    tx.execute(
+                        "UPDATE outbox SET depends_on=?2 WHERE depends_on=?1 AND group_id!=?3",
+                        params![old, replacement, group],
+                    )?;
+                    if let Some(master) = &master {
+                        tx.execute("UPDATE outbox SET expected_revision=?2 WHERE expected_revision=?1 AND group_id!=?3",params![format!("aikaPredecessor:{old}"),format!("aikaPredecessor:{master}"),group])?;
+                    }
+                }
+                // New steps were appended; place them before the remaining tail.
+                let added: u32 = tx.query_row(
+                    "SELECT count(*) FROM outbox WHERE group_id=?1 AND rowid>?2",
+                    params![group, previous_max],
+                    |r| r.get(0),
+                )?;
+                let index = index + 1;
+                let offset = next + added + 1;
+                tx.execute("UPDATE outbox SET step_index=step_index+?4 WHERE group_id=?1 AND step_index>=?2 AND rowid<=?3",params![group,index,previous_max,offset])?;
+                tx.execute(
+                    "UPDATE outbox SET step_index=step_index-?2+?3 WHERE group_id=?1 AND rowid>?4",
+                    params![group, next, index, previous_max],
+                )?;
+                tx.execute("UPDATE outbox SET step_index=step_index-?2+?3 WHERE group_id=?1 AND rowid<=?4 AND step_index>=?2",params![group,offset,added,previous_max])?;
+            }
+            // Keep later overlays; publish observations when this action completes.
+            for id in &members {
+                if !crate::sync::pending(&tx, id)? {
+                    crate::recovery::restore_incoming(&tx, id)?;
+                }
+            }
+            tx.commit()?;
+            return Ok(());
         }
         if !keep_local {
             for group in &groups {
@@ -507,152 +711,49 @@ impl CalendarService {
             tx.commit()?;
             return Ok(());
         }
-        let mut local = crate::repository::Repository::read_series(&tx, &current.event_id)?;
-        let remote = current.remote.clone();
-        if let (Some(before), Some(after)) = (&remote, &local) {
-            if before.event.recurrence.is_some()
-                && (before.event.time != after.event.time
-                    || before.event.recurrence != after.event.recurrence)
-            {
-                return Err(error(
-                    "unsupported",
-                    "Keeping this Google schedule cannot prove preservation of exceptions.",
-                ));
-            }
-        }
-        if let (Some(observed), Some(desired)) = (&remote, &local) {
-            if observed.event.recurrence.is_some() {
-                let mut q = tx.prepare("SELECT original_start,before_payload,after_payload FROM outbox WHERE event_id=?1 AND state!='acknowledged' ORDER BY rowid")?;
-                let rows = q
-                    .query_map([&current.event_id], |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let resources: std::collections::BTreeSet<_> = rows
-                    .iter()
-                    .map(|(original, _, _)| original.clone())
-                    .collect();
-                if resources.len() > 1 {
-                    return Err(error("groupRecoveryRequired", "Reconcile combined master and occurrence intent before keeping local changes."));
-                }
-                let mut rebased = observed.clone();
-                if let Some(Some(original)) = resources.iter().next() {
-                    let mut replacement = occurrence_event(desired, original)?;
-                    if let (Some(wanted), Some(mut actual)) =
-                        (&replacement, occurrence_event(observed, original)?)
-                    {
-                        let mut dirty = [false; 4];
-                        for (_, before, after) in &rows {
-                            let b: EventSeries =
-                                serde_json::from_str(before.as_deref().ok_or_else(|| {
-                                    error(
-                                        "groupRecoveryRequired",
-                                        "Missing occurrence before state.",
-                                    )
-                                })?)?;
-                            let a: EventSeries =
-                                serde_json::from_str(after.as_deref().ok_or_else(|| {
-                                    error(
-                                        "groupRecoveryRequired",
-                                        "Missing occurrence after state.",
-                                    )
-                                })?)?;
-                            match (
-                                occurrence_event(&b, original)?,
-                                occurrence_event(&a, original)?,
-                            ) {
-                                (Some(b), Some(a)) => {
-                                    dirty[0] |= b.title != a.title;
-                                    dirty[1] |= b.location != a.location;
-                                    dirty[2] |= b.notes != a.notes;
-                                    dirty[3] |= b.time != a.time;
-                                }
-                                _ => dirty.fill(true),
-                            }
-                        }
-                        if dirty[0] {
-                            actual.title = wanted.title.clone();
-                        }
-                        if dirty[1] {
-                            actual.location = wanted.location.clone();
-                        }
-                        if dirty[2] {
-                            actual.notes = wanted.notes.clone();
-                        }
-                        if dirty[3] {
-                            actual.time = wanted.time.clone();
-                        }
-                        replacement = Some(actual);
-                    }
-                    // Validate correspondence against the current master, even for cancellation.
-                    let mut probe = observed.clone();
-                    probe.exceptions.retain(|e| &e.original_start != original);
-                    aika_domain::recurrence::get_occurrence(&probe, original)?;
-                    rebased.exceptions.retain(|e| &e.original_start != original);
-                    rebased.exceptions.push(EventException {
-                        original_start: original.clone(),
-                        event: replacement,
-                    });
-                    rebased
-                        .exceptions
-                        .sort_by(|a, b| a.original_start.cmp(&b.original_start));
-                } else {
-                    let mut dirty = [false; 3];
-                    for (_, before, after) in rows {
-                        let b: EventSeries =
-                            serde_json::from_str(before.as_deref().ok_or_else(|| {
-                                error(
-                                    "groupRecoveryRequired",
-                                    "Reconcile recreated series before keeping local changes.",
-                                )
-                            })?)?;
-                        let a: EventSeries =
-                            serde_json::from_str(after.as_deref().ok_or_else(|| {
-                                error(
-                                    "groupRecoveryRequired",
-                                    "Reconcile deleted series before keeping local changes.",
-                                )
-                            })?)?;
-                        dirty[0] |= b.event.title != a.event.title;
-                        dirty[1] |= b.event.location != a.event.location;
-                        dirty[2] |= b.event.notes != a.event.notes;
-                    }
-                    if dirty[0] {
-                        rebased.event.title = desired.event.title.clone();
-                    }
-                    if dirty[1] {
-                        rebased.event.location = desired.event.location.clone();
-                    }
-                    if dirty[2] {
-                        rebased.event.notes = desired.event.notes.clone();
-                    }
-                }
-                local = Some(rebased);
-            }
+        let mut local = current.remote.clone();
+        let mut q = tx.prepare("SELECT before_payload,after_payload FROM outbox WHERE event_id=?1 AND state!='acknowledged' ORDER BY rowid")?;
+        let rows = q
+            .query_map([&current.event_id], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(q);
+        for (before, after) in rows {
+            let before = before
+                .as_deref()
+                .map(serde_json::from_str::<EventSeries>)
+                .transpose()?;
+            let after = after
+                .as_deref()
+                .map(serde_json::from_str::<EventSeries>)
+                .transpose()?;
+            local = rebase_intent(before.as_ref(), after.as_ref(), local)?;
         }
         tx.execute("DELETE FROM conflicts WHERE id=?1", [&current.id])?;
         tx.execute(
-            "UPDATE outbox SET state='acknowledged' WHERE event_id=?1 AND state!='acknowledged'",
+            "UPDATE outbox SET state='acknowledged',acknowledgement=json_object('superseded',json('true'),'revision',(SELECT revision FROM remote_events WHERE account_id=outbox.account_id AND calendar_id=outbox.calendar_id AND remote_id=outbox.resource_id)) WHERE event_id=?1 AND state!='acknowledged'",
             [&current.event_id],
         )?;
         if let Some(series) = &local {
             crate::repository::Repository::write_series(&tx, series)?;
+        } else {
+            tx.execute("DELETE FROM events WHERE id=?1", [&current.event_id])?;
         }
-        if remote.is_some() || local.is_some() {
-            let change = SeriesChange {
-                id: current.event_id.clone(),
-                before: remote,
-                after: local,
-            };
-            crate::repository::Repository::queue_change(
+        if current.remote != local {
+            crate::repository::Repository::queue_change_with_schedule(
                 &tx,
-                &change,
+                &SeriesChange {
+                    id: current.event_id.clone(),
+                    before: current.remote,
+                    after: local,
+                },
                 false,
                 &uuid::Uuid::new_v4().to_string(),
+                true,
             )?;
         }
         tx.commit()?;
@@ -700,6 +801,15 @@ fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
                         remote.map(|v| serde_json::from_str(&v)).transpose()?
                     },
                     remote_revision,
+                    recovery_steps: Some({
+                        let groups = crate::recovery::affected_groups(db, &event_id)?;
+                        let mut steps = vec![];
+                        for group in groups {
+                            let mut q = db.prepare("SELECT coalesce(json_extract(after_payload,'$.event.title'),json_extract(before_payload,'$.event.title'),'Deleted event'),operation,state FROM outbox WHERE group_id=?1 AND coalesce(json_extract(acknowledgement,'$.superseded'),0)=0 ORDER BY step_index")?;
+                            steps.extend(q.query_map([group], |r| Ok(GroupRecoveryStep { title: r.get(0)?, operation: r.get(1)?, state: r.get(2)? }))?.collect::<std::result::Result<Vec<_>,_>>()?);
+                        }
+                        steps
+                    }),
                     group_revision: Some(crate::recovery::group_revision(db, &event_id)?),
                 })
             },
@@ -1737,12 +1847,13 @@ mod tests {
         s.apply_outgoing(&c, &second, Ok(OutgoingResult::Conflict(None)))
             .unwrap();
         let reviewed = s.sync_conflicts().unwrap().remove(0);
-        assert_eq!(
-            s.resolve_sync_conflict(reviewed.clone(), true)
-                .unwrap_err()
-                .code,
-            "groupRecoveryRequired"
-        );
+        s.resolve_sync_conflict(reviewed.clone(), true).unwrap();
+        // Replanning retains the successful sibling and queues only the missing tail.
+        let replacement = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(replacement.event_id, b.id);
+        s.apply_outgoing(&c, &replacement, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let reviewed = s.sync_conflicts().unwrap().remove(0);
         // A change to an acknowledged member invalidates the group's review.
         s.providers.repository.db.execute("UPDATE incoming_items SET payload=json_set(payload,'$.revision','changed') WHERE id=?1",[&a.id]).unwrap();
         assert_eq!(
@@ -2159,7 +2270,7 @@ mod tests {
                 .mutate_event(recurring_request(&saved, MutationScope::Following, None))
                 .unwrap_err()
                 .code,
-            "unsupported"
+            "exceptionsResetRequired"
         );
         assert_eq!(
             s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
@@ -2504,6 +2615,424 @@ mod tests {
                 })
             );
             assert!(master.original_start.is_none());
+        }
+    }
+    fn following_request(series: &EventSeries, pivot: &str, edit: bool) -> EventMutation {
+        let mut event = aika_domain::recurrence::get_occurrence(
+            &EventSeries {
+                event: series.event.clone(),
+                exceptions: vec![],
+            },
+            pivot,
+        )
+        .unwrap();
+        event.occurrence = None;
+        event.title = "Following tail".into();
+        EventMutation {
+            target: format!("{}@{pivot}", series.event.id),
+            scope: MutationScope::Following,
+            event: edit.then_some(event),
+            expected: aika_domain::recurrence::expectation(series).unwrap(),
+            reset_exceptions: true,
+            exception_policy: Some(ExceptionPolicy::Reset),
+            count_changed: false,
+        }
+    }
+    #[test]
+    fn following_split_confirmation_exact_count_preceding_exceptions_and_atomic_unsent_undo() {
+        let (mut s, _, _, series, _) = recurring_setup(Path::new(":memory:"));
+        let mut request = following_request(&series, "2026-10-05", true);
+        request.reset_exceptions = false;
+        assert_eq!(
+            s.providers
+                .repository
+                .mutate_event(request.clone())
+                .unwrap_err()
+                .code,
+            "exceptionsResetRequired"
+        );
+        request.reset_exceptions = true;
+        let saved = s.providers.repository.mutate_event(request).unwrap();
+        assert_eq!(saved.len(), 2);
+        let head = s.get_series(&series.event.id).unwrap();
+        assert_eq!(head.event.recurrence.as_ref().unwrap().count, Some(2));
+        assert!(head.event.recurrence.as_ref().unwrap().segment.is_none());
+        assert_eq!(head.exceptions.len(), 1);
+        assert_eq!(head.exceptions[0].original_start, "2026-10-03");
+        let tail = s.get_series(&saved[1].id).unwrap();
+        assert_eq!(
+            tail.event.recurrence.as_ref().unwrap().count,
+            Some(series.event.recurrence.as_ref().unwrap().count.unwrap() - 2)
+        );
+        assert!(tail.exceptions.is_empty());
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            1
+        );
+        s.providers.repository.undo().unwrap();
+        assert_eq!(s.get_series(&series.event.id).unwrap(), series);
+        assert!(s.get_series(&tail.event.id).is_err());
+        assert_eq!(
+            s.providers.repository.sync_status(&range()).unwrap()[0].pending_count,
+            0
+        );
+    }
+    #[test]
+    fn following_first_occurrence_deletes_empty_head_and_deletion_never_creates_tail() {
+        for edit in [false, true] {
+            let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+            let saved = s
+                .providers
+                .repository
+                .mutate_event(following_request(&series, "2026-10-01", edit))
+                .unwrap();
+            assert_eq!(saved.len(), usize::from(edit));
+            assert!(s.get_series(&series.event.id).is_err());
+            let first = s.claim_outgoing(&c).unwrap().unwrap();
+            assert_eq!(first.operation, "delete");
+            assert_eq!(first.event_id, series.event.id);
+            assert!(s
+                .claim_outgoing(&c)
+                .unwrap()
+                .is_some_and(|o| o.id == first.id));
+        }
+    }
+    #[test]
+    fn following_partial_conflict_replan_preserves_tail_identity_and_rejects_stale_review() {
+        let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+        let saved = s
+            .providers
+            .repository
+            .mutate_event(following_request(&series, "2026-10-05", true))
+            .unwrap();
+        let db = &s.providers.repository.db;
+        let reserved: String = db
+            .query_row(
+                "SELECT resource_id FROM outbox WHERE event_id=?1",
+                [&saved[1].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let trim = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut remote = ack(&trim, "external-r2");
+        remote.event.as_mut().unwrap().notes = "Concurrent Google notes".into();
+        // Conditional trim has not happened. Review retains the complete intended overlay.
+        remote.event.as_mut().unwrap().recurrence = series.event.recurrence.clone();
+        s.apply_outgoing(&c, &trim, Ok(OutgoingResult::Conflict(Some(remote))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        assert_eq!(review.recovery_steps.as_ref().unwrap().len(), 2);
+        s.resolve_sync_conflict(review.clone(), true).unwrap();
+        assert_eq!(
+            s.resolve_sync_conflict(review, false).unwrap_err().code,
+            "conflict"
+        );
+        let retry = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(retry.event_id, series.event.id);
+        assert_eq!(retry.revision.as_deref(), Some("external-r2"));
+        assert_eq!(
+            retry.after.as_ref().unwrap().event.notes,
+            "Concurrent Google notes"
+        );
+        s.apply_outgoing(
+            &c,
+            &retry,
+            Ok(OutgoingResult::Applied(Some(ack(&retry, "trim-r3")))),
+        )
+        .unwrap();
+        assert_eq!(
+            s.providers.repository.undo().unwrap_err().code,
+            "groupRecoveryRequired"
+        );
+        let tail = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(tail.remote_id, reserved);
+        assert_eq!(tail.event_id, saved[1].id);
+        s.apply_outgoing(&c, &tail, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(review, false).unwrap();
+        assert_eq!(
+            s.get_series(&series.event.id)
+                .unwrap()
+                .event
+                .recurrence
+                .as_ref()
+                .unwrap()
+                .count,
+            Some(2)
+        );
+        assert!(s.get_series(&saved[1].id).is_err());
+    }
+    #[test]
+    fn following_restart_at_each_claim_ack_boundary_keeps_one_tail_and_complete_overlay() {
+        for boundary in 0..=4 {
+            let path = std::env::temp_dir().join(format!(
+                "aika-following-{boundary}-{}.sqlite3",
+                uuid::Uuid::new_v4()
+            ));
+            let (mut s, c, _, series, _) = recurring_setup(&path);
+            let saved = s
+                .providers
+                .repository
+                .mutate_event(following_request(&series, "2026-10-05", true))
+                .unwrap();
+            let mut attempted = None;
+            for step in 0..boundary {
+                if step % 2 == 0 {
+                    attempted = s.claim_outgoing(&c).unwrap();
+                } else {
+                    let op = attempted.as_ref().unwrap();
+                    s.apply_outgoing(&c, op, Ok(OutgoingResult::Applied(Some(ack(op, "ack")))))
+                        .unwrap();
+                }
+            }
+            assert!(s.get_series(&saved[1].id).is_ok());
+            let account = c.account.id.clone();
+            drop(c);
+            drop(s);
+            let mut s = open(&path);
+            s.providers
+                .repository
+                .db
+                .execute("UPDATE account_leases SET expires_at='2000-01-01'", [])
+                .unwrap();
+            let c = s.begin_sync(&account, range()).unwrap().unwrap();
+            let next = s.claim_outgoing(&c).unwrap();
+            if boundary == 4 {
+                assert!(next.is_none());
+            } else {
+                let op = next.unwrap();
+                if boundary % 2 == 1 {
+                    let old = attempted.as_ref().unwrap();
+                    assert_eq!(op.id, old.id);
+                    assert_eq!(op.remote_id, old.remote_id);
+                    assert!(op.recovering);
+                }
+                s.apply_outgoing(
+                    &c,
+                    &op,
+                    Ok(OutgoingResult::Applied(Some(ack(&op, "recovered")))),
+                )
+                .unwrap();
+                while let Some(op) = s.claim_outgoing(&c).unwrap() {
+                    s.apply_outgoing(&c, &op, Ok(OutgoingResult::Applied(Some(ack(&op, "done")))))
+                        .unwrap();
+                }
+            }
+            let creates: u32 = s
+                .providers
+                .repository
+                .db
+                .query_row(
+                    "SELECT count(*) FROM outbox WHERE operation='create'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(creates, 1);
+            assert_eq!(
+                s.get_series(&saved[1].id).unwrap().event.title,
+                "Following tail"
+            );
+            drop(s);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn completed_following_undo_queues_checked_master_and_tail_compensation() {
+        let (mut s, c, _, mut series, _) = recurring_setup(Path::new(":memory:"));
+        series.exceptions.clear();
+        s.providers
+            .repository
+            .db
+            .execute(
+                "DELETE FROM incoming_items WHERE json_extract(payload,'$.master')='actual-master'",
+                [],
+            )
+            .unwrap();
+        Repository::write_series(&s.providers.repository.db, &series).unwrap();
+        let saved = s
+            .providers
+            .repository
+            .mutate_event(following_request(&series, "2026-10-05", true))
+            .unwrap();
+        let trim = sent(&mut s, &c);
+        assert_eq!(trim.operation, "update");
+        let progress = s.providers.repository.sync_status(&range()).unwrap()[0]
+            .recovery_groups
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (progress[0].completed_steps, progress[0].total_steps),
+            (1, 2)
+        );
+        assert_eq!(
+            s.providers.repository.undo().unwrap_err().code,
+            "groupRecoveryRequired"
+        );
+        let tail = sent(&mut s, &c);
+        s.providers.repository.undo().unwrap();
+        let restore = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(restore.event_id, series.event.id);
+        assert_eq!(restore.revision.as_deref(), Some("revision-1"));
+        assert_eq!(
+            restore.after.as_ref().unwrap().event.recurrence,
+            series.event.recurrence
+        );
+        s.apply_outgoing(
+            &c,
+            &restore,
+            Ok(OutgoingResult::Applied(Some(ack(&restore, "restored")))),
+        )
+        .unwrap();
+        let delete = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(delete.operation, "delete");
+        assert_eq!(delete.remote_id, tail.remote_id);
+        assert_eq!(delete.revision.as_deref(), Some("revision-1"));
+        s.apply_outgoing(&c, &delete, Ok(OutgoingResult::Applied(None)))
+            .unwrap();
+        assert_eq!(s.get_series(&series.event.id).unwrap(), series);
+        assert!(s.get_series(&saved[1].id).is_err());
+    }
+    #[test]
+    fn following_single_trim_conflict_can_rebase_without_creating_a_tail() {
+        let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+        s.providers
+            .repository
+            .mutate_event(following_request(&series, "2026-10-05", false))
+            .unwrap();
+        let trim = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut remote = ack(&trim, "concurrent");
+        remote.event = Some(series.event.clone());
+        remote.event.as_mut().unwrap().notes = "Remote notes".into();
+        s.apply_outgoing(&c, &trim, Ok(OutgoingResult::Conflict(Some(remote))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(review, true).unwrap();
+        let retry = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(retry.after.as_ref().unwrap().event.notes, "Remote notes");
+        assert_eq!(
+            retry
+                .after
+                .as_ref()
+                .unwrap()
+                .event
+                .recurrence
+                .as_ref()
+                .unwrap()
+                .count,
+            Some(2)
+        );
+        assert_eq!(retry.revision.as_deref(), Some("concurrent"));
+        s.apply_outgoing(
+            &c,
+            &retry,
+            Ok(OutgoingResult::Applied(Some(ack(&retry, "done")))),
+        )
+        .unwrap();
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        assert_eq!(s.get_series(&series.event.id).unwrap().exceptions.len(), 1);
+    }
+    #[test]
+    fn combined_replan_preserves_exceptions_during_master_step_and_orders_each_instance() {
+        let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+        let mut desired = series.clone();
+        desired.event.title = "Combined local metadata".into();
+        desired.exceptions[0].event.as_mut().unwrap().location = "Local room".into();
+        desired
+            .exceptions
+            .retain(|e| e.original_start != "2026-10-05");
+        let group = uuid::Uuid::new_v4().to_string();
+        Repository::queue_change_with_schedule(
+            &s.providers.repository.db,
+            &SeriesChange {
+                id: series.event.id.clone(),
+                before: Some(series.clone()),
+                after: Some(desired.clone()),
+            },
+            false,
+            &group,
+            true,
+        )
+        .unwrap();
+        Repository::write_series(&s.providers.repository.db, &desired).unwrap();
+        let master = s.claim_outgoing(&c).unwrap().unwrap();
+        assert!(master.original_start.is_none());
+        assert_eq!(master.after.as_ref().unwrap().exceptions, series.exceptions);
+        let mut remote = ack(&master, "external");
+        remote.event.as_mut().unwrap().title = series.event.title.clone();
+        remote.event.as_mut().unwrap().notes = "Google notes".into();
+        s.apply_outgoing(&c, &master, Ok(OutgoingResult::Conflict(Some(remote))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(review, true).unwrap();
+        let master = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(master.after.as_ref().unwrap().event.notes, "Google notes");
+        assert_eq!(master.after.as_ref().unwrap().exceptions, series.exceptions);
+        let mut q=s.providers.repository.db.prepare("SELECT original_start FROM outbox WHERE group_id=?1 AND state!='acknowledged' ORDER BY step_index").unwrap();
+        let steps = q
+            .query_map([group], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            steps,
+            vec![None, Some("2026-10-03".into()), Some("2026-10-05".into())]
+        );
+    }
+    #[test]
+    fn replanned_split_cannot_depend_on_newer_overlapping_intent() {
+        for already_trimmed in [false, true] {
+            let (mut s, c, _, series, _) = recurring_setup(Path::new(":memory:"));
+            s.providers
+                .repository
+                .mutate_event(following_request(&series, "2026-10-05", true))
+                .unwrap();
+            let trim = s.claim_outgoing(&c).unwrap().unwrap();
+            let mut remote = ack(&trim, "external");
+            if !already_trimmed {
+                remote.event = Some(series.event.clone());
+            }
+            s.apply_outgoing(&c, &trim, Ok(OutgoingResult::Conflict(Some(remote))))
+                .unwrap();
+            let head = s.get_series(&series.event.id).unwrap();
+            let mut later = head.event.clone();
+            later.title = "Later local title".into();
+            s.providers
+                .repository
+                .mutate_event(recurring_request(&head, MutationScope::Series, Some(later)))
+                .unwrap();
+            let review = s.sync_conflicts().unwrap().remove(0);
+            s.resolve_sync_conflict(review, true).unwrap();
+            assert_eq!(
+                s.get_series(&series.event.id).unwrap().event.title,
+                "Later local title"
+            );
+            if !already_trimmed {
+                let retry = s.claim_outgoing(&c).unwrap().unwrap();
+                assert_eq!(retry.event_id, series.event.id);
+                s.apply_outgoing(
+                    &c,
+                    &retry,
+                    Ok(OutgoingResult::Applied(Some(ack(&retry, "trim-r3")))),
+                )
+                .unwrap();
+            }
+            let tail = sent(&mut s, &c);
+            assert_ne!(tail.event_id, series.event.id);
+            let later = s.claim_outgoing(&c).unwrap().unwrap();
+            assert_eq!(
+                later.after.as_ref().unwrap().event.title,
+                "Later local title"
+            );
+            assert_eq!(
+                later.revision.as_deref(),
+                Some(if already_trimmed {
+                    "external"
+                } else {
+                    "trim-r3"
+                })
+            );
         }
     }
 }

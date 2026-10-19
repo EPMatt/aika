@@ -695,13 +695,18 @@ impl Repository {
                 });
             }
             statuses.push(AccountSyncStatus {
-                account_id: a.id,
+                account_id: a.id.clone(),
                 syncing,
                 last_success,
                 failure,
                 pending_count,
                 conflict_count,
                 calendars: calendar_statuses,
+                recovery_groups: Some({
+                    let mut q = self.db.prepare("SELECT g.id,coalesce(json_extract((SELECT coalesce(after_payload,before_payload) FROM outbox WHERE group_id=g.id ORDER BY step_index LIMIT 1),'$.event.title'),'Google action'),sum(o.state='acknowledged'),count(*),max(o.state='blocked') FROM operation_groups g JOIN outbox o ON o.group_id=g.id WHERE g.account_id=?1 AND coalesce(json_extract(o.acknowledgement,'$.superseded'),0)=0 AND EXISTS(SELECT 1 FROM outbox p WHERE p.group_id=g.id AND p.state!='acknowledged') GROUP BY g.id HAVING count(*)>1 ORDER BY g.rowid")?;
+                    let groups = q.query_map([&a.id], |r| Ok(GroupProgress { id:r.get(0)?,title:r.get(1)?,completed_steps:r.get(2)?,total_steps:r.get(3)?,blocked:r.get(4)? }))?.collect::<std::result::Result<Vec<_>,_>>()?;
+                    groups
+                }),
             });
         }
         Ok(statuses)

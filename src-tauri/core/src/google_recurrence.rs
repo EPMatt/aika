@@ -1,4 +1,4 @@
-//! Exact compiler for the domain's unsplit all-day and UTC schedules.
+//! Exact compiler for canonical all-day and UTC schedules.
 use crate::{contracts::*, service::error};
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 
@@ -72,6 +72,42 @@ pub(crate) fn compile(event: &CalendarEvent) -> Result<Option<String>, ServiceEr
         line.push_str(&format!(";UNTIL={boundary}"));
     }
     Ok(Some(line))
+}
+
+/// The domain split retains its source anchor to model phase. For these fixed
+/// date patterns every pivot is itself a scheduled start: daily/monthly/yearly
+/// modulus is unchanged, and weekly phase is the pivot's Monday week. Therefore
+/// reanchoring the tail is exact, including interval>1 and skipped invalid dates.
+/// Head COUNT is computed by the domain before applying exceptions, so it ends
+/// strictly before the pivot. No preview-based equivalence decision is used.
+pub(crate) fn canonicalize_split(changes: &mut [SeriesChange]) -> Result<(), ServiceError> {
+    if let Some(before) = changes.first().and_then(|c| c.before.as_ref()) {
+        compile(&before.event)?;
+    }
+    for change in changes {
+        if let Some(after) = &mut change.after {
+            if let Some(rule) = &mut after.event.recurrence {
+                if let Some(segment) = rule.segment.take() {
+                    if segment.shift_seconds != 0 {
+                        return Err(error(
+                            "unsupported",
+                            "Shifted Google segments cannot be split exactly.",
+                        ));
+                    }
+                    // Only the domain planner constructs these segments. A bounded
+                    // head already has its exact count; a tail starts at its pivot.
+                    if segment.before.is_some() && rule.count.is_none() {
+                        return Err(error(
+                            "unsupported",
+                            "A Google split head requires an exact count.",
+                        ));
+                    }
+                }
+            }
+            compile(&after.event)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -172,5 +208,77 @@ mod tests {
             *start = "2026-10-05T09:00:00.123Z".into();
         }
         assert!(compile(&e).is_err());
+    }
+    #[test]
+    fn split_canonicalization_preserves_phase_counts_endings_and_exclusive_boundary() {
+        for timed in [false, true] {
+            for frequency in [
+                RepeatFrequency::Daily,
+                RepeatFrequency::Weekly,
+                RepeatFrequency::Monthly,
+                RepeatFrequency::Yearly,
+            ] {
+                for ending in [0, 1, 2] {
+                    let mut source = event(timed);
+                    let r = source.recurrence.as_mut().unwrap();
+                    r.frequency = frequency.clone();
+                    if frequency != RepeatFrequency::Weekly {
+                        r.weekdays.clear();
+                    }
+                    if ending != 0 {
+                        r.count = None;
+                    }
+                    if ending == 1 {
+                        r.until = Some("2039-12-31".into());
+                    }
+                    let source = EventSeries {
+                        event: source,
+                        exceptions: vec![],
+                    };
+                    let preview = aika_domain::recurrence::preview(source.event.clone()).unwrap();
+                    for index in [0, 1, 3] {
+                        let pivot = &preview[index];
+                        let mut wanted = pivot.clone();
+                        wanted.occurrence = None;
+                        wanted.title = "Tail".into();
+                        let request = EventMutation {
+                            target: pivot.id.clone(),
+                            scope: MutationScope::Following,
+                            event: Some(wanted),
+                            expected: aika_domain::recurrence::expectation(&source).unwrap(),
+                            reset_exceptions: true,
+                            exception_policy: Some(ExceptionPolicy::Reset),
+                            count_changed: false,
+                        };
+                        let mut changes = aika_domain::recurrence::plan_mutation(
+                            &source,
+                            &request,
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .unwrap();
+                        let domain = changes.clone();
+                        canonicalize_split(&mut changes).unwrap();
+                        for (expected, actual) in domain.iter().zip(&changes) {
+                            match (&expected.after, &actual.after) {
+                                (Some(a), Some(b)) => {
+                                    let times = |s: &EventSeries| {
+                                        aika_domain::recurrence::preview(s.event.clone())
+                                            .unwrap()
+                                            .into_iter()
+                                            .map(|e| e.time)
+                                            .collect::<Vec<_>>()
+                                    };
+                                    assert_eq!(times(a), times(b));
+                                    assert!(b.event.recurrence.as_ref().unwrap().segment.is_none());
+                                    compile(&b.event).unwrap();
+                                }
+                                (None, None) => {}
+                                _ => panic!("split changed head emptiness"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

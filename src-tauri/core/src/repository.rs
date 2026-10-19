@@ -451,6 +451,15 @@ impl Repository {
         undo: bool,
         group: &str,
     ) -> Result<()> {
+        Self::queue_change_with_schedule(db, change, undo, group, false)
+    }
+    pub(crate) fn queue_change_with_schedule(
+        db: &Connection,
+        change: &SeriesChange,
+        undo: bool,
+        group: &str,
+        allow_schedule: bool,
+    ) -> Result<()> {
         let expected = if undo { &change.after } else { &change.before };
         let value = if undo { &change.before } else { &change.after };
         let Some(series) = value.as_ref().or(expected.as_ref()) else {
@@ -464,8 +473,84 @@ impl Repository {
         let Some(account) = account else {
             return Ok(());
         };
+        if let (Some(before), Some(after)) = (expected, value) {
+            if before.event != after.event || before.exceptions != after.exceptions {
+                let keys: std::collections::BTreeSet<_> = before
+                    .exceptions
+                    .iter()
+                    .chain(&after.exceptions)
+                    .map(|e| e.original_start.clone())
+                    .collect();
+                let changed: Vec<_> = keys
+                    .into_iter()
+                    .filter(|k| {
+                        before.exceptions.iter().find(|e| &e.original_start == k)
+                            != after.exceptions.iter().find(|e| &e.original_start == k)
+                    })
+                    .collect();
+                if (before.event == after.event && changed.len() > 1)
+                    || (before.event != after.event
+                        && changed
+                            .iter()
+                            .any(|k| after.exceptions.iter().any(|e| &e.original_start == k)))
+                {
+                    let mut cursor = before.clone();
+                    if before.event != after.event {
+                        let mut next = cursor.clone();
+                        next.event = after.event.clone();
+                        // A trim removes out-of-range exceptions without individual HTTP writes.
+                        let probe = EventSeries {
+                            event: next.event.clone(),
+                            exceptions: vec![],
+                        };
+                        next.exceptions.retain(|e| {
+                            aika_domain::recurrence::get_occurrence(&probe, &e.original_start)
+                                .is_ok()
+                        });
+                        Self::queue_change_with_schedule(
+                            db,
+                            &SeriesChange {
+                                id: change.id.clone(),
+                                before: Some(cursor),
+                                after: Some(next.clone()),
+                            },
+                            false,
+                            group,
+                            allow_schedule,
+                        )?;
+                        cursor = next;
+                    }
+                    for key in changed {
+                        let wanted = after.exceptions.iter().find(|e| e.original_start == key);
+                        if cursor.exceptions.iter().find(|e| e.original_start == key) == wanted {
+                            continue;
+                        }
+                        let mut next = cursor.clone();
+                        next.exceptions.retain(|e| e.original_start != key);
+                        if let Some(e) = wanted {
+                            next.exceptions.push(e.clone());
+                        }
+                        next.exceptions
+                            .sort_by(|a, b| a.original_start.cmp(&b.original_start));
+                        Self::queue_change_with_schedule(
+                            db,
+                            &SeriesChange {
+                                id: change.id.clone(),
+                                before: Some(cursor),
+                                after: Some(next.clone()),
+                            },
+                            false,
+                            group,
+                            allow_schedule,
+                        )?;
+                        cursor = next;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         type PreviousOperation = (String, String, Option<String>, Option<String>, u32);
-        let last: Option<PreviousOperation> = db.query_row("SELECT id,state,before_payload,after_payload,attempts FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1", [&change.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let last: Option<PreviousOperation> = db.query_row("SELECT id,state,before_payload,after_payload,attempts FROM outbox WHERE event_id=?1 AND NOT EXISTS(SELECT 1 FROM operation_groups newer,operation_groups own WHERE newer.id=outbox.group_id AND own.id=?2 AND newer.rowid>own.rowid) ORDER BY rowid DESC LIMIT 1", params![change.id,group], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let before = expected.as_ref().map(serde_json::to_string).transpose()?;
         let after = value.as_ref().map(serde_json::to_string).transpose()?;
         if undo {
@@ -526,7 +611,8 @@ impl Repository {
             _ => None,
         };
         if let (Some(before), Some(after)) = (expected, value) {
-            if (before.event.recurrence.is_some() || after.event.recurrence.is_some())
+            if !allow_schedule
+                && (before.event.recurrence.is_some() || after.event.recurrence.is_some())
                 && (before.event.time != after.event.time
                     || before.event.recurrence != after.event.recurrence)
             {
@@ -535,7 +621,10 @@ impl Repository {
                     "Google schedule edits cannot prove preservation of remote exceptions.",
                 ));
             }
-            if before.event != after.event && before.exceptions != after.exceptions {
+            if !allow_schedule
+                && before.event != after.event
+                && before.exceptions != after.exceptions
+            {
                 return Err(error(
                     "groupRecoveryRequired",
                     "Reconcile master and occurrence changes separately.",
@@ -545,7 +634,7 @@ impl Repository {
         // Aggregate ordering can interleave master and instance resources. Capture
         // a revision dependency on the actual master, not an instance ETag.
         let revision = if original.is_none() && series.event.recurrence.is_some() {
-            let predecessor: Option<String> = db.query_row("SELECT id FROM outbox WHERE event_id=?1 AND original_start IS NULL AND state!='acknowledged' ORDER BY rowid DESC LIMIT 1", [&change.id], |r| r.get(0)).optional()?;
+            let predecessor: Option<String> = db.query_row("SELECT id FROM outbox WHERE event_id=?1 AND original_start IS NULL AND state!='acknowledged' AND NOT EXISTS(SELECT 1 FROM operation_groups newer,operation_groups own WHERE newer.id=outbox.group_id AND own.id=?2 AND newer.rowid>own.rowid) ORDER BY rowid DESC LIMIT 1", params![change.id,group], |r| r.get(0)).optional()?;
             predecessor
                 .map(|id| format!("aikaPredecessor:{id}"))
                 .or(revision)
@@ -553,7 +642,7 @@ impl Repository {
             revision
         };
         let operation_id = uuid::Uuid::new_v4().to_string();
-        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on,group_id,step_index) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT count(*) FROM outbox WHERE group_id=?10))", params![operation_id,account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)}),group])?;
+        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on,group_id,step_index) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT coalesce(max(step_index)+1,0) FROM outbox WHERE group_id=?10))", params![operation_id,account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)}),group])?;
         if let Some(original) = original {
             // Never invent an instance id. Preflight binds it before the first write.
             db.execute("UPDATE outbox SET series_remote_id=coalesce((SELECT resource_id FROM outbox p WHERE p.event_id=?2 AND p.operation='create' AND p.state!='acknowledged' AND p.rowid<(SELECT rowid FROM outbox WHERE id=?1) ORDER BY p.rowid DESC LIMIT 1),(SELECT remote_id FROM remote_events WHERE id=?2)),original_start=?3,resource_id=NULL,expected_revision=NULL WHERE id=?1", params![operation_id,change.id,original])?;
@@ -989,26 +1078,33 @@ impl Repository {
                 }
             }
             if request.scope == MutationScope::Following {
-                return Err(error(
-                    "unsupported",
-                    "Google following changes require the following recovery phase.",
-                ));
-            }
-            if request.reset_exceptions || request.exception_policy == Some(ExceptionPolicy::Reset)
+                // The provider can contain future exceptions outside our cache.
+                // Always require explicit consent before resetting that range.
+                if !request.reset_exceptions {
+                    return Err(error(
+                        "exceptionsResetRequired",
+                        "Following changes reset future Google exceptions. Confirm the reset.",
+                    ));
+                }
+                request.exception_policy = Some(ExceptionPolicy::Reset);
+            } else if request.reset_exceptions
+                || request.exception_policy == Some(ExceptionPolicy::Reset)
             {
                 return Err(error(
                     "unsupported",
                     "Google series edits preserve individual exceptions.",
                 ));
             }
-            request.exception_policy = Some(ExceptionPolicy::Preserve);
+            if request.scope != MutationScope::Following {
+                request.exception_policy = Some(ExceptionPolicy::Preserve);
+            }
         } else if request.exception_policy == Some(ExceptionPolicy::Preserve) {
             return Err(error(
                 "unsupported",
                 "Local series edits use the reset exception policy.",
             ));
         }
-        let changes = aika_domain::recurrence::plan_mutation(
+        let mut changes = aika_domain::recurrence::plan_mutation(
             &series,
             &request,
             &uuid::Uuid::new_v4().to_string(),
@@ -1022,7 +1118,22 @@ impl Repository {
                 }
             }
         }
-        Self::apply_changes(&tx, &changes, false)?;
+        if remote && request.scope == MutationScope::Following {
+            crate::google_recurrence::canonicalize_split(&mut changes)?;
+        }
+        Self::apply_changes_with_schedule(
+            &tx,
+            &changes,
+            false,
+            remote && request.scope == MutationScope::Following,
+        )?;
+        if remote && request.scope == MutationScope::Following {
+            for tail in changes.iter().filter(|c| c.before.is_none()) {
+                // Copy only the opaque source shadow; delivery chooses the safe
+                // provider fields to copy into the newly reserved resource.
+                tx.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) SELECT ?1,r.account_id,r.calendar_id,(SELECT resource_id FROM outbox WHERE event_id=?1 AND operation='create' ORDER BY rowid DESC LIMIT 1),NULL,r.shadow_payload,r.capabilities FROM remote_events r WHERE r.id=?2", params![tail.id,series.event.id])?;
+            }
+        }
         tx.commit()?;
         let saved = changes
             .iter()
@@ -1131,6 +1242,14 @@ impl Repository {
         Ok(())
     }
     fn apply_changes(db: &Connection, changes: &[SeriesChange], undo: bool) -> Result<()> {
+        Self::apply_changes_with_schedule(db, changes, undo, false)
+    }
+    fn apply_changes_with_schedule(
+        db: &Connection,
+        changes: &[SeriesChange],
+        undo: bool,
+        allow_schedule: bool,
+    ) -> Result<()> {
         for change in changes {
             let expected = if undo { &change.after } else { &change.before };
             if &Self::read_series(db, &change.id)? != expected {
@@ -1173,7 +1292,11 @@ impl Repository {
                     if step_count > 1 {
                         let attempted: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE group_id=?1 AND (attempts>0 OR state!='pending'))", [&group], |r| r.get(0))?;
                         if attempted {
-                            return Err(error("groupRecoveryRequired", "Reconcile the complete grouped action before queuing compensation."));
+                            let unresolved: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE group_id=?1 AND state!='acknowledged')", [&group], |r| r.get(0))?;
+                            if unresolved {
+                                return Err(error("groupRecoveryRequired", "Retry to reconcile the complete grouped action before undoing it. Successful steps remain effective."));
+                            }
+                            continue;
                         }
                         for (id, before, after) in members {
                             let change = changes.iter().find(|c| c.id == id).ok_or_else(|| {
@@ -1244,7 +1367,7 @@ impl Repository {
                 Self::require_mutation(db, exception, "edit")?;
             }
             if !cancelled.contains(&change.id) {
-                Self::queue_change(db, change, undo, &group)?;
+                Self::queue_change_with_schedule(db, change, undo, &group, allow_schedule || undo)?;
             }
             match value {
                 Some(series) => {
