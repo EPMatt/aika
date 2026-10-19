@@ -1,3 +1,4 @@
+import type { SyncConflict } from './generated/SyncConflict';
 import { createContext, useContext, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent, KeyboardEvent, MouseEvent } from 'react';
 import * as Popover from '@radix-ui/react-popover';
@@ -1419,6 +1420,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [canUndo, setCanUndo] = useState(false);
   const [ready, setReady] = useState(!desktop);
   const [revision, setRevision] = useState(0);
+  const [syncConflicts, setSyncConflicts] = useState<SyncConflict[]>([]);
   const [mutating, setMutating] = useState(false);
   const requestVersion = useRef(0);
   const syncRange = useCallback(() => {
@@ -1439,6 +1441,23 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       .then(() => setSyncRequestFailure(''))
       .catch((e) => setSyncRequestFailure(errorMessage(e)));
   }, [syncRange]);
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    void calendarClient
+      .conflicts()
+      .then((value) => {
+        if (!disposed) setSyncConflicts(value);
+      })
+      .catch((e) => {
+        if (!disposed) setSyncRequestFailure(errorMessage(e));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [revision]);
+  const writeSyncTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(writeSyncTimer.current), []);
   const connectedSelection = accounts
     .filter((a) => a.connectionState === 'connected')
     .map((a) => `${a.id}:${a.selectedCalendarIds.join(',')}`)
@@ -1596,6 +1615,10 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
       setRevision((value) => value + 1);
     }
     setAnnouncement(message);
+    if (desktop) {
+      clearTimeout(writeSyncTimer.current);
+      writeSyncTimer.current = setTimeout(requestSync, 400);
+    }
   };
   const calendarAction = async (action: () => Promise<void>, message: string) => {
     setCalendarBusy(true);
@@ -1949,7 +1972,87 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                           complete this range.
                         </p>
                       )}
-                      {status.pendingCount > 0 && <p>{status.pendingCount} pending changes</p>}
+                      {status.pendingCount > 0 && (
+                        <>
+                          <p>{status.pendingCount} pending changes</p>
+                          <button
+                            className="text-button"
+                            onClick={() =>
+                              void calendarAction(
+                                () => calendarClient.retryOutgoing(status.accountId),
+                                'Pending changes scheduled for retry.',
+                              )
+                            }
+                          >
+                            Retry pending changes
+                          </button>
+                        </>
+                      )}
+                      {syncConflicts
+                        .filter((c) => c.accountId === status.accountId)
+                        .map((conflict) => (
+                          <section key={conflict.id} aria-label="Event conflict">
+                            <p>
+                              Local:{' '}
+                              {conflict.local?.event.title ||
+                                (conflict.local ? 'Untitled event' : 'Deleted event')}
+                            </p>
+                            <p>
+                              Google:{' '}
+                              {conflict.remote?.event.title ||
+                                (conflict.remote ? 'Untitled event' : 'Deleted event')}
+                            </p>
+                            <details>
+                              <summary>Compare versions</summary>
+                              {[
+                                ['Local', conflict.local],
+                                ['Google', conflict.remote],
+                              ].map(([label, value]) => {
+                                const version = value as SyncConflict['local'];
+                                return (
+                                  <div key={String(label)}>
+                                    <p>{String(label)}</p>
+                                    {version && (
+                                      <>
+                                        <p>{version.event.location}</p>
+                                        <p>{version.event.notes}</p>
+                                        <p>
+                                          {version.event.time.kind === 'timed'
+                                            ? `${version.event.time.start} – ${version.event.time.end}`
+                                            : `${version.event.time.startDate} – ${version.event.time.endDate}`}
+                                        </p>
+                                      </>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </details>
+                            <button
+                              className="text-button"
+                              disabled={calendarBusy}
+                              onClick={() =>
+                                void calendarAction(
+                                  () => calendarClient.resolveConflict(conflict, true),
+                                  'Local version kept. Synchronization scheduled.',
+                                )
+                              }
+                            >
+                              Keep local
+                            </button>
+                            <button
+                              className="text-button"
+                              disabled={calendarBusy}
+                              onClick={() =>
+                                void calendarAction(
+                                  () => calendarClient.resolveConflict(conflict, false),
+                                  'Google version kept.',
+                                )
+                              }
+                            >
+                              Keep Google
+                            </button>
+                          </section>
+                        ))}
                       {status.conflictCount > 0 && (
                         <p>{status.conflictCount} conflicts require attention</p>
                       )}

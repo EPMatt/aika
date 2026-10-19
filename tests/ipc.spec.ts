@@ -13,6 +13,8 @@ test('desktop IPC errors preserve input and saved preferences hydrate on reload'
       value: {
         invoke: async (command: string, args: Record<string, any>) => {
           switch (command) {
+            case 'sync_conflicts':
+              return [];
             case 'get_app_info':
               return { name: 'aika', version: 'test', provider: 'local' };
             case 'get_preferences':
@@ -288,6 +290,8 @@ test('focus refresh preserves an editor draft and sends its original event on co
       value: {
         invoke: async (command: string, args: Record<string, any>) => {
           switch (command) {
+            case 'sync_conflicts':
+              return [];
             case 'get_app_info':
               return { name: 'aika', version: 'test', provider: 'local' };
             case 'get_preferences':

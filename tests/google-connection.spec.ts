@@ -66,6 +66,8 @@ for (const theme of ['light', 'dark']) {
           invoke: async (command: string, args: any) => {
             fixture.commands.push(command);
             switch (command) {
+              case 'sync_conflicts':
+                return [];
               case 'get_app_info':
                 return { name: 'aika', version: 'test', provider: 'local' };
               case 'get_preferences':
@@ -264,6 +266,8 @@ test('closing during connection startup cancels the late session and preserves L
       value: {
         invoke: async (command: string) => {
           switch (command) {
+            case 'sync_conflicts':
+              return [];
             case 'get_app_info':
               return { name: 'aika', version: 'test', provider: 'local' };
             case 'get_preferences':

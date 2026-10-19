@@ -61,7 +61,7 @@ fn stamp() -> String {
 fn lease_end() -> String {
     (Utc::now() + chrono::Duration::seconds(90)).to_rfc3339()
 }
-fn guard(db: &Connection, claim: &SyncClaim) -> Result<()> {
+pub(crate) fn guard(db: &Connection, claim: &SyncClaim) -> Result<()> {
     let current: Option<(i64, String, String, String)> = db.query_row(
         "SELECT a.sync_epoch,a.connection_state,l.owner,l.expires_at FROM accounts a JOIN account_leases l ON l.account_id=a.id WHERE a.id=?1",
         [&claim.account.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -82,7 +82,13 @@ fn guard(db: &Connection, claim: &SyncClaim) -> Result<()> {
 fn pending(db: &Connection, id: &str) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE event_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE event_id=?1)", [id], |r| r.get(0))?)
 }
-fn mapping(db: &Connection, account: &str, calendar: &str, item: &IncomingItem) -> Result<String> {
+pub(crate) fn mapping(
+    db: &Connection,
+    account: &str,
+    calendar: &str,
+    item: &IncomingItem,
+    caps: Capabilities,
+) -> Result<String> {
     let existing: Option<String> = db
         .query_row(
             "SELECT id FROM remote_events WHERE account_id=?1 AND calendar_id=?2 AND remote_id=?3",
@@ -91,7 +97,29 @@ fn mapping(db: &Connection, account: &str, calendar: &str, item: &IncomingItem) 
         )
         .optional()?;
     let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    db.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,shadow_payload=excluded.shadow_payload,capabilities=excluded.capabilities", params![id,account,calendar,item.remote_id,item.revision,item.shadow,serde_json::to_string(&Capabilities::read_only())?])?;
+    db.execute("INSERT INTO remote_events(id,account_id,calendar_id,remote_id,revision,shadow_payload,capabilities) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,shadow_payload=CASE WHEN ?8 THEN remote_events.shadow_payload ELSE excluded.shadow_payload END,capabilities=excluded.capabilities", params![id,account,calendar,item.remote_id,item.revision,item.shadow,serde_json::to_string(&caps)?,item.event.is_none()])?;
+    // Refresh the retained remote side of an existing conflict, without touching local intent.
+    let remote = item.event.as_ref().map(|event| {
+        let mut event = event.clone();
+        event.id = id.clone();
+        event.calendar_id = calendar.into();
+        EventSeries {
+            event,
+            exceptions: vec![],
+        }
+    });
+    db.execute(
+        "UPDATE conflicts SET remote_payload=?2,remote_revision=?3 WHERE event_id=?1",
+        params![
+            id,
+            remote.as_ref().map(serde_json::to_string).transpose()?,
+            if item.event.is_some() {
+                Some(&item.revision)
+            } else {
+                None
+            }
+        ],
+    )?;
     Ok(id)
 }
 impl CalendarService {
@@ -213,11 +241,11 @@ impl CalendarService {
                 continue;
             }
             let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,active,remote_metadata) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET active=excluded.active,writable=0,capabilities=excluded.capabilities,
+            tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,active,remote_metadata) VALUES(?1,?2,?3,?4,?5,?6,?7,?11,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET active=excluded.active,writable=excluded.writable,capabilities=excluded.capabilities,
                 name=CASE WHEN calendars.name=json_extract(calendars.remote_metadata,'$.name') THEN excluded.name ELSE calendars.name END,
                 color=CASE WHEN calendars.color=json_extract(calendars.remote_metadata,'$.color') THEN excluded.color ELSE calendars.color END,
                 description=CASE WHEN calendars.description=json_extract(calendars.remote_metadata,'$.description') THEN excluded.description ELSE calendars.description END,
-                remote_metadata=excluded.remote_metadata",params![id,c.name,c.color,c.description,claim.account.provider_id,claim.account.id,c.remote_id,serde_json::to_string(&Capabilities::read_only())?,c.eligible,serde_json::to_string(&serde_json::json!({"name":c.name,"color":c.color,"description":c.description}))?])?;
+                remote_metadata=excluded.remote_metadata",params![id,c.name,c.color,c.description,claim.account.provider_id,claim.account.id,c.remote_id,serde_json::to_string(&claim.adapter.capabilities())?,c.eligible,serde_json::to_string(&serde_json::json!({"name":c.name,"color":c.color,"description":c.description}))?,c.eligible && matches!(c.access_role.as_str(),"owner"|"writer")])?;
         }
         let existing = {
             let mut q = tx.prepare("SELECT id,remote_id FROM calendars WHERE account_id=?1")?;
@@ -233,6 +261,7 @@ impl CalendarService {
                 tx.execute("UPDATE calendars SET active=0 WHERE id=?1", [id])?;
             }
         }
+        Repository::repair_default(&tx)?;
         claim.epoch = tx.query_row(
             "SELECT sync_epoch FROM accounts WHERE id=?1",
             [&claim.account.id],
@@ -468,7 +497,13 @@ impl Repository {
         let mut normalized = BTreeMap::new();
         for (remote, payload) in &items {
             let i: IncomingItem = serde_json::from_str(payload)?;
-            let id = mapping(&tx, &claim.account.id, &calendar, &i)?;
+            let id = mapping(
+                &tx,
+                &claim.account.id,
+                &calendar,
+                &i,
+                claim.adapter.event_capabilities(&i),
+            )?;
             tx.execute("INSERT INTO incoming_items(id,payload) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![id,payload])?;
             mapped.insert(remote.clone(), id.clone());
             normalized.insert(remote.clone(), i);
@@ -571,7 +606,13 @@ impl Repository {
             {
                 continue;
             }
-            let id = mapping(&tx, &claim.account.id, &calendar, i)?;
+            let id = mapping(
+                &tx,
+                &claim.account.id,
+                &calendar,
+                i,
+                Capabilities::read_only(),
+            )?;
             tx.execute("INSERT INTO incoming_projections(id,master_remote_id) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET master_remote_id=excluded.master_remote_id",params![id,master])?;
             if !pending(&tx, &id)? {
                 if let Some(e) = &i.event {
@@ -602,6 +643,7 @@ impl Repository {
             if !confirmed {
                 continue;
             }
+            let failure = failure.or(self.db.query_row("SELECT acknowledgement FROM outbox WHERE account_id=?1 AND state IN ('pending','blocked') AND acknowledgement IS NOT NULL ORDER BY rowid LIMIT 1",[&a.id],|r|r.get::<_,Option<String>>(0)).optional()?.flatten());
             let failure = failure
                 .map(|f| {
                     let value: serde_json::Value = serde_json::from_str(&f)?;

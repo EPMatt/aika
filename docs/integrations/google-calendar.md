@@ -1,12 +1,12 @@
 # Extensible calendar providers and Google integration
 
-Status: **phases 0–1 delivered; phase 2 connection/selection implemented with live/platform exit evidence pending; phase 3 incoming sync implemented with live/platform evidence pending; phases 4–6 planned.** Accepted decisions were agreed with the user before implementation. This document is the implementation specification for the next increment, not a claim that live Google verification or synchronization is complete.
+Status: **phases 0–1 delivered; phase 2 connection/selection implemented with live/platform exit evidence pending; phase 3 incoming sync implemented with live/platform evidence pending; phase 4 ordinary-event two-way sync implemented with live/platform evidence pending; phases 5–6 planned.** Accepted decisions were agreed with the user before implementation. This document is the implementation specification for the next increment, not a claim that live Google verification or synchronization is complete.
 
-Read the [main plan](../plan.md), [architecture decisions](../architecture.md#connected-calendar-decisions-google-integration), and [phase 3 handoff](../handoffs/google-phase-3.md). Original v0 phase numbers refer to earlier milestones; Google phase numbers below form a separate sequence. Outstanding alpha/platform checks remain tracked in [alpha verification](../alpha/verification.md).
+Read the [main plan](../plan.md), [architecture decisions](../architecture.md#connected-calendar-decisions-google-integration), and [phase 4 handoff](../handoffs/google-phase-4.md). Original v0 phase numbers refer to earlier milestones; Google phase numbers below form a separate sequence. Outstanding alpha/platform checks remain tracked in [alpha verification](../alpha/verification.md).
 
 ## Current implementation and intended behavior
 
-The desktop and CLI share `aika-core`, SQLite schema v5, and checked mutations. Multiple local calendars and common recurring events already exist. `ProviderRegistry` owns the shared `Repository` and registers Local and Google once by provider type. Google now supplies backend OAuth sessions, persistent OS credentials/refresh, every-page calendar discovery, and checked import selection. The sidebar plus button opens a descriptor-driven provider popup; Local reuses its existing form. Account management revises selections, reconnects, and disconnects. The desktop coordinator now imports paginated event feeds and bounded unsupported-recurrence projections through checked shared repository transactions. Imported calendars remain read-only, caches reopen offline, and coverage/status accompany snapshots. Native/mocked automated evidence and unexecuted live/platform gates are distinguished in the phase 3 handoff.
+The desktop and CLI share `aika-core`, SQLite schema v5, and checked mutations. Multiple local calendars and common recurring events already exist. `ProviderRegistry` owns the shared `Repository` and registers Local and Google once by provider type. Google now supplies backend OAuth sessions, persistent OS credentials/refresh, every-page calendar discovery, and checked import selection. The sidebar plus button opens a descriptor-driven provider popup; Local reuses its existing form. Account management revises selections, reconnects, and disconnects. The desktop coordinator now imports paginated event feeds and bounded unsupported-recurrence projections through checked shared repository transactions. Writable imported calendars now support ordinary-event writes through the durable shared outbox, conditional revisions, explicit conflicts, retries, and session undo. Meetings/recurrence/special types remain read-only. Caches reopen offline, and coverage/status accompany snapshots. Automated evidence and pending live/platform gates are distinguished in the phase 4 handoff.
 
 The intended complete integration provides **+ → provider popup → Local or Google**. Local opens the existing calendar form. Google connects an account in the system browser, discovers calendars, and shows an import checklist with every eligible calendar checked. Confirming adds the selected calendars and starts their synchronization. The same generic flows and coordinator serve future providers.
 
@@ -49,7 +49,7 @@ Google event synchronization uses a paginated master/exception feed with `single
 
 ### Public contracts and commands
 
-Phase 1 exports `ProviderDescriptor`, `AccountSummary`, `ConnectionState`, `Capabilities`, and the enriched native `CalendarCollectionSnapshot`. Phase 2 additionally exports `ConnectionSession`, `ConnectionProgress`, `DiscoveredCalendar`, and `CalendarDiscovery`, with native connection/discovery/selection/disconnect IPC. Phase 3 adds generated account/calendar sync status and `request_sync` IPC. Conflict-resolution interfaces remain planned. Define them in Rust and generate TypeScript with the existing exporter; do not hand-edit generated files. Native-only DTOs need not introduce accounts or credentials into the pure event domain.
+Phase 1 exports `ProviderDescriptor`, `AccountSummary`, `ConnectionState`, `Capabilities`, and the enriched native `CalendarCollectionSnapshot`. Phase 2 additionally exports `ConnectionSession`, `ConnectionProgress`, `DiscoveredCalendar`, and `CalendarDiscovery`, with native connection/discovery/selection/disconnect IPC. Phase 3 adds generated account/calendar sync status and `request_sync` IPC. Phase 4 adds generated `SyncConflict` plus list/checked resolution/retry IPC. Define them in Rust and generate TypeScript with the existing exporter; do not hand-edit generated files. Native-only DTOs need not introduce accounts or credentials into the pure event domain.
 
 | Interface                   | Required information or operation                                                                                                                                               |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -80,7 +80,7 @@ Register and configure the adapter in the backend; expose its descriptor through
 | 1            | Delivered                      | Shared repository, account model, generic dispatch/capabilities, and test-adapter proof. |
 | 2            | Implemented; live gate pending | Provider popup, Google authentication, discovery, and import selection.                  |
 | 3            | Implemented; live gate pending | Incoming sync, persisted cache, and offline reading.                                     |
-| 4            | Planned                        | Ordinary-event two-way sync, offline mutations, conflicts, and undo.                     |
+| 4            | Implemented; live gate pending | Ordinary-event two-way sync, offline mutations, conflicts, and undo.                     |
 | 5            | Planned                        | Compatible recurring-event two-way sync and recoverable splits.                          |
 | 6            | Planned                        | Recovery UX, platform evidence, upgrade checks, and release documentation.               |
 
@@ -133,6 +133,8 @@ Use checked remote revisions for edit/delete. A mismatch retains both versions o
 Session undo cancels unsent changes or enqueues checked compensation for acknowledged writes; preserve dependencies for work already in flight. Patch edited supported fields only. Meetings with attendees, unsupported event types, and recurrence remain read-only until a later applicable gate.
 
 **Exit:** offline CRUD, restart/crash recovery, retries without duplicates, permission failures, explicit conflicts, late acknowledgements, CLI writes, and undo converge safely in both directions.
+
+Implementation uses schema v5's existing outbox/conflict/lease tables; no migration or OAuth scope change is needed. The desktop reconciles incoming data before draining ordinary-event work, coalesces debounced writes into the same queue, and persists attempts/deadlines. Stable Google creation IDs and private operation markers recover uncertain writes; updates/deletes use `If-Match`. The [phase 4 handoff](../handoffs/google-phase-4.md) records automated checks and the remaining disposable live-provider/platform gate. Phase 5 remains planned.
 
 ### Phase 5: Compatible recurring-event two-way sync
 

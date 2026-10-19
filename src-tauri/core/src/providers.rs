@@ -8,6 +8,19 @@ type Result<T> = std::result::Result<T, ServiceError>;
 pub trait Provider: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
     fn capabilities(&self) -> Capabilities;
+    fn event_capabilities(&self, _item: &crate::sync::IncomingItem) -> Capabilities {
+        Capabilities::read_only()
+    }
+    fn outgoing(
+        &self,
+        _subject: &str,
+        _operation: &crate::outgoing::OutgoingOperation,
+    ) -> Result<crate::outgoing::OutgoingResult> {
+        Err(error(
+            "unsupported",
+            "Outgoing synchronization unavailable.",
+        ))
+    }
     fn incremental_sync(&self) -> bool {
         true
     }
@@ -148,7 +161,7 @@ impl ProviderRegistry {
         event: Option<&CalendarEvent>,
         operation: &str,
     ) -> Result<()> {
-        let caps = self.capabilities(calendar, event)?;
+        let caps = self.capabilities(calendar, if operation == "create" { None } else { event })?;
         let allowed = match operation {
             "create" => caps.create,
             "edit" => caps.edit,

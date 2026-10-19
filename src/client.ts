@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
+import type { SyncConflict } from './generated/SyncConflict';
 import type { EventSeries } from './generated/EventSeries';
 import type { EventMutation } from './generated/EventMutation';
 import type { CalendarEvent } from './generated/CalendarEvent';
@@ -21,6 +22,10 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
+  conflicts: () => invoke<SyncConflict[]>('sync_conflicts'),
+  resolveConflict: (expected: SyncConflict, keepLocal: boolean) =>
+    mutate<void>('resolve_sync_conflict', { expected, keepLocal }),
+  retryOutgoing: (accountId: string) => mutate<void>('retry_outgoing', { accountId }),
   requestSync: (range: EventRange) => invoke<void>('request_sync', { range }),
   providers: () => invoke<ProviderDescriptor[]>('list_providers'),
   startConnection: (provider: string) =>

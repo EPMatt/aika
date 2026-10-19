@@ -11,11 +11,13 @@ use ts_rs::{Config, TS};
 use cal_desktop_lib::contracts::{
     AccountSummary, AccountSyncStatus, CalendarDiscovery, CalendarSyncStatus, Capabilities,
     ConnectionProgress, ConnectionSession, ConnectionState, DiscoveredCalendar, ProviderDescriptor,
+    SyncConflict,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/generated");
     let config = Config::default().with_out_dir(directory);
+    SyncConflict::export_all(&config)?;
     AccountSyncStatus::export_all(&config)?;
     CalendarSyncStatus::export_all(&config)?;
     ConnectionSession::export_all(&config)?;

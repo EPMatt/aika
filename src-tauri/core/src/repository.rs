@@ -223,6 +223,7 @@ impl Repository {
         calendars: &[DiscoveredCalendar],
         selected: &[String],
         expected: &str,
+        capabilities: &Capabilities,
     ) -> Result<()> {
         let choices: std::collections::BTreeSet<_> = selected.iter().collect();
         if choices.len() != selected.len()
@@ -259,7 +260,7 @@ impl Repository {
             "UPDATE accounts SET selection_confirmed=1,sync_epoch=sync_epoch+1 WHERE id=?1",
             [account],
         )?;
-        let caps = serde_json::to_string(&Capabilities::read_only())?;
+        let caps = serde_json::to_string(capabilities)?;
         for c in calendars {
             let existing: Option<(String, bool)> = tx
                 .query_row(
@@ -284,7 +285,7 @@ impl Repository {
             if !chosen && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged')", [&id], |r| r.get::<_,bool>(0))? {
                 return Err(error("pendingWork", "Pending changes prevent excluding this calendar."));
             }
-            tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,selected,active) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET selected=excluded.selected,active=excluded.active,writable=0,capabilities=excluded.capabilities", params![id,c.name,c.color,c.description,provider,account,c.remote_id,caps,chosen,c.eligible])?;
+            tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,selected,active) VALUES(?1,?2,?3,?4,?5,?6,?7,?11,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET selected=excluded.selected,active=excluded.active,writable=excluded.writable,capabilities=excluded.capabilities", params![id,c.name,c.color,c.description,provider,account,c.remote_id,caps,chosen,c.eligible,c.eligible && matches!(c.access_role.as_str(),"owner"|"writer") && (capabilities.create || capabilities.edit || capabilities.delete)])?;
             if !chosen {
                 tx.execute("DELETE FROM sync_cursors WHERE calendar_id=?1", [&id])?;
                 tx.execute("DELETE FROM coverage WHERE calendar_id=?1", [&id])?;
@@ -292,10 +293,14 @@ impl Repository {
                 tx.execute("DELETE FROM events WHERE calendar_id=?1", [&id])?;
             }
         }
-        tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars WHERE selected=1 AND active=1 AND writable=1 AND (capabilities IS NULL OR json_extract(capabilities,'$.create')=1) ORDER BY account_id IS NOT NULL,rowid LIMIT 1) WHERE default_calendar_id IN (SELECT id FROM calendars WHERE selected=0 OR active=0 OR writable=0)", [])?;
+        Self::repair_default(&tx)?;
         let calendars = Self::read_calendars(&tx)?;
         tx.commit()?;
         self.retain_calendar_history(&calendars);
+        Ok(())
+    }
+    pub(crate) fn repair_default(db: &Connection) -> Result<()> {
+        db.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars WHERE selected=1 AND active=1 AND writable=1 AND (capabilities IS NULL OR json_extract(capabilities,'$.create')=1) ORDER BY account_id IS NOT NULL,rowid LIMIT 1) WHERE default_calendar_id IS NULL OR default_calendar_id IN (SELECT id FROM calendars WHERE selected=0 OR active=0 OR writable=0 OR json_extract(capabilities,'$.create')=0)", [])?;
         Ok(())
     }
     pub(crate) fn set_account_state(
@@ -303,13 +308,31 @@ impl Repository {
         account: &str,
         state: ConnectionState,
     ) -> Result<()> {
-        let changed = self.db.execute(
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if state == ConnectionState::Disconnected {
+            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE account_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE account_id=?1)",[account],|r|r.get(0))?;
+            if pending {
+                return Err(error(
+                    "pendingWork",
+                    "Synchronize or resolve pending changes before disconnecting this account.",
+                ));
+            }
+            tx.execute(
+                "UPDATE calendars SET writable=0 WHERE account_id=?1",
+                [account],
+            )?;
+        }
+        let changed = tx.execute(
             "UPDATE accounts SET connection_state=?2 WHERE id=?1",
             params![account, serde_json::to_string(&state)?],
         )?;
         if changed != 1 {
             return Err(error("notFound", "Unknown connected account."));
         }
+        Self::repair_default(&tx)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn calendar_account(&self, calendar: &str) -> Result<Option<String>> {
@@ -397,12 +420,13 @@ impl Repository {
         let Some(account) = account else {
             return Ok(());
         };
-        let last: Option<(String,String,Option<String>,Option<String>)> = db.query_row("SELECT id,state,before_payload,after_payload FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1", [&change.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        type PreviousOperation = (String, String, Option<String>, Option<String>, u32);
+        let last: Option<PreviousOperation> = db.query_row("SELECT id,state,before_payload,after_payload,attempts FROM outbox WHERE event_id=?1 ORDER BY rowid DESC LIMIT 1", [&change.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let before = expected.as_ref().map(serde_json::to_string).transpose()?;
         let after = value.as_ref().map(serde_json::to_string).transpose()?;
         if undo {
-            if let Some((id, state, previous, next)) = &last {
-                if state == "pending" && previous == &after && next == &before {
+            if let Some((id, state, previous, next, attempts)) = &last {
+                if state == "pending" && *attempts == 0 && previous == &after && next == &before {
                     db.execute("DELETE FROM outbox WHERE id=?1", [id])?;
                     return Ok(());
                 }
@@ -416,7 +440,7 @@ impl Repository {
             )
             .optional()?
             .flatten();
-        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![uuid::Uuid::new_v4().to_string(),account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.map(|(id,_,_,_)|id)])?;
+        db.execute("INSERT INTO outbox(id,account_id,calendar_id,event_id,operation,before_payload,after_payload,expected_revision,depends_on) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![uuid::Uuid::new_v4().to_string(),account,series.event.calendar_id,change.id,if value.is_none() { "delete" } else if expected.is_none() { "create" } else { "update" },before,after,revision,last.and_then(|(id,state,_,_,_)| if state == "acknowledged" {None} else {Some(id)})])?;
         Ok(())
     }
     pub fn undo_requirements(&mut self) -> Result<Vec<(String, Option<CalendarEvent>, String)>> {
@@ -457,7 +481,12 @@ impl Repository {
                         requirements.push((
                             event.calendar_id.clone(),
                             Some(event.clone()),
-                            "edit".into(),
+                            if change.after.is_none() {
+                                "create"
+                            } else {
+                                "edit"
+                            }
+                            .into(),
                         ));
                     }
                 }
@@ -854,6 +883,13 @@ impl Repository {
                 |r| r.get(0),
             )
             .optional()?;
+        // Restoring a deleted ordinary event creates a new remote resource; the old
+        // tombstone's restrictions do not describe the new resource.
+        let event_caps = if operation == "create" {
+            None
+        } else {
+            event_caps
+        };
         let caps = caps.intersect(
             &event_caps
                 .map(|s| serde_json::from_str(&s))

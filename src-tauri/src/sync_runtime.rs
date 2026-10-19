@@ -73,6 +73,41 @@ async fn calendar(state: ServiceState, claim: SyncClaim, job: CalendarJob) -> Re
     let cursor = job.cursor.clone();
     aika_core::sync::receive_calendar(&NativeSyncAccess { state, claim, job }, cursor).await
 }
+async fn outgoing(state: ServiceState, claim: SyncClaim) -> Result<()> {
+    let mut failure = None;
+    for _ in 0..1000 {
+        let c = claim.clone();
+        let op = match with_service(state.clone(), move |s| s.claim_outgoing(&c)).await {
+            Ok(op) => op,
+            Err(f) if f.code == "permission" => {
+                failure = Some(f);
+                continue;
+            }
+            Err(f) => return Err(f),
+        };
+        let Some(op) = op else {
+            break;
+        };
+        let c = claim.clone();
+        let request = op.clone();
+        let response =
+            provider_work(move || c.adapter.outgoing(&c.account.remote_subject, &request)).await;
+        let c = claim.clone();
+        if let Err(f) =
+            with_service(state.clone(), move |s| s.apply_outgoing(&c, &op, response)).await
+        {
+            let stop = matches!(
+                f.code.as_str(),
+                "authenticationRequired" | "credentialUnavailable" | "syncSuperseded" | "storage"
+            );
+            failure = Some(f);
+            if stop {
+                break;
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
 async fn cycle(
     state: ServiceState,
     account: String,
@@ -121,6 +156,16 @@ async fn cycle(
                             if stop {
                                 break;
                             }
+                        }
+                    }
+                    if !failure.as_ref().is_some_and(|f| {
+                        matches!(
+                            f.code.as_str(),
+                            "authenticationRequired" | "credentialUnavailable" | "syncSuperseded"
+                        )
+                    }) {
+                        if let Err(f) = outgoing(state.clone(), claim.clone()).await {
+                            failure = Some(f);
                         }
                     }
                     failure.map_or(Ok(()), Err)

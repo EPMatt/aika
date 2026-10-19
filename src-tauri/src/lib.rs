@@ -40,6 +40,33 @@ async fn provider_work<T: Send + 'static>(
         .map_err(|_| error("service", "The provider operation could not finish."))?
 }
 #[tauri::command]
+async fn sync_conflicts(
+    state: tauri::State<'_, ServiceState>,
+) -> Result<Vec<SyncConflict>, ServiceError> {
+    with_service(state.inner().clone(), |s| s.sync_conflicts()).await
+}
+#[tauri::command]
+async fn resolve_sync_conflict(
+    state: tauri::State<'_, ServiceState>,
+    expected: SyncConflict,
+    keep_local: bool,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.resolve_sync_conflict(expected, keep_local)
+    })
+    .await
+}
+#[tauri::command]
+async fn retry_outgoing(
+    state: tauri::State<'_, ServiceState>,
+    account_id: String,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.retry_outgoing(&account_id)
+    })
+    .await
+}
+#[tauri::command]
 async fn list_providers(
     state: tauri::State<'_, ServiceState>,
 ) -> Result<Vec<ProviderDescriptor>, ServiceError> {
@@ -129,15 +156,13 @@ async fn disconnect_account(
     let (account, adapter) = with_service(state.inner().clone(), move |s| {
         let account = s.account(&account_id)?;
         let adapter = s.connection_adapter(&account.provider_id)?;
+        // Fence workers and concurrent CLI mutations before removing credentials.
+        s.record_disconnect(&account.id)?;
         Ok((account, adapter))
     })
     .await?;
     let subject = account.remote_subject;
-    provider_work(move || adapter.disconnect(&subject)).await?;
-    with_service(state.inner().clone(), move |s| {
-        s.record_disconnect(&account.id)
-    })
-    .await
+    provider_work(move || adapter.disconnect(&subject)).await
 }
 
 #[tauri::command]
@@ -334,7 +359,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

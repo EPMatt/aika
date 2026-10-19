@@ -49,6 +49,8 @@ test.beforeEach(async ({ page }) => {
                   },
                 },
               ];
+            case 'sync_conflicts':
+              return [];
             case 'get_app_info':
               return { name: 'aika', version: 'test', provider: 'local' };
             case 'get_preferences':

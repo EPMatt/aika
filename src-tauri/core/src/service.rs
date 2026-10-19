@@ -106,11 +106,16 @@ impl CalendarService {
             .discoveries
             .get(discovery_id)
             .ok_or_else(|| error("notFound", "Discovery expired. Discover calendars again."))?;
+        let capabilities = self
+            .providers
+            .adapter(&discovery.account.provider_id)?
+            .capabilities();
         self.providers.repository.commit_selection(
             &discovery.account.id,
             &discovery.calendars,
             &selected,
             expected,
+            &capabilities,
         )?;
         self.discoveries.remove(discovery_id);
         Ok(())
@@ -417,6 +422,12 @@ mod connection_tests {
             "pendingWork"
         );
         assert_eq!(s.account(&a.id).unwrap().selected_calendar_ids, ids);
+        assert_eq!(s.record_disconnect(&a.id).unwrap_err().code, "pendingWork");
+        s.providers
+            .repository
+            .db
+            .execute("UPDATE outbox SET state='acknowledged'", [])
+            .unwrap();
         s.record_disconnect(&a.id).unwrap();
         assert_eq!(s.providers.calendars().unwrap().len(), 3);
         assert_eq!(

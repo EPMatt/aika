@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use url::Url;
 #[path = "google_events.rs"]
 mod events;
+#[path = "google_outgoing.rs"]
+mod outgoing;
 type Result<T> = std::result::Result<T, ServiceError>;
 const SCOPES: &str = "openid email https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events";
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -210,6 +212,20 @@ trait GoogleTransport: Send + Sync {
     ) -> Result<events::EventPage> {
         Err(error("unsupported", "Event transport unavailable."))
     }
+    fn event_request(
+        &self,
+        _access: &str,
+        _calendar: &str,
+        _event: &str,
+        _method: &str,
+        _body: Option<&serde_json::Value>,
+        _revision: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        Err(error(
+            "unsupported",
+            "Outgoing event transport unavailable.",
+        ))
+    }
     fn calendar_page(&self, access: &str, page: Option<&str>) -> Result<CalendarPage>;
 }
 struct HttpTransport;
@@ -254,6 +270,77 @@ impl GoogleTransport for HttpTransport {
                 "This calendar is no longer available. Refresh its account selection.",
             )),
             _ => decode(response),
+        }
+    }
+
+    fn event_request(
+        &self,
+        access: &str,
+        calendar: &str,
+        event: &str,
+        method: &str,
+        body: Option<&serde_json::Value>,
+        revision: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        if event.is_empty() || matches!(event, "." | "..") {
+            return Err(error("providerIdentity", "Invalid remote event identity."));
+        }
+        let mut url = event_url(calendar)?;
+        if method != "POST" {
+            url.path_segments_mut().expect("fixed URL").push(event);
+        }
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| error("unsupported", "Invalid event operation."))?;
+        let mut request = client()?.request(method.clone(), url).bearer_auth(access);
+        if let Some(revision) = revision {
+            request = request.header(reqwest::header::IF_MATCH, revision);
+        }
+        if method != reqwest::Method::GET && method != reqwest::Method::DELETE {
+            request = request.query(&[("supportsAttachments", "true")]);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+        }
+        let response = request.send().map_err(network)?;
+        match response.status().as_u16() {
+            204 => Ok(None),
+            404 | 410 if method == reqwest::Method::POST => Err(error(
+                "permission",
+                "This calendar is unavailable. Restore access, then retry pending changes.",
+            )),
+            404 | 410 => Ok(None),
+            409 | 412 => Err(error(
+                "remoteConflict",
+                "The Google event changed. Review both versions.",
+            )),
+            400 | 422 => Err(error(
+                "validation",
+                "Google rejected this event. Review its pending changes.",
+            )),
+            403 => {
+                let value: serde_json::Value =
+                    serde_json::from_reader(response.take(4 * 1024 * 1024)).unwrap_or_default();
+                let rate = value["error"]["errors"].as_array().is_some_and(|errors| {
+                    errors.iter().any(|e| {
+                        matches!(
+                            e["reason"].as_str(),
+                            Some("rateLimitExceeded" | "userRateLimitExceeded" | "quotaExceeded")
+                        )
+                    })
+                });
+                Err(if rate {
+                    error(
+                        "retryable",
+                        "Google request limit reached. A retry is scheduled.",
+                    )
+                } else {
+                    error(
+                        "permission",
+                        "Google denied this write. Check permissions, then retry pending changes.",
+                    )
+                })
+            }
+            _ => decode(response).map(Some),
         }
     }
 
@@ -613,7 +700,7 @@ impl Provider for GoogleProvider {
         }
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities::read_only()
+        Capabilities::ordinary()
     }
     fn start_connection(&self) -> Result<ConnectionSession> {
         if self.0.config.is_none() {
@@ -723,6 +810,20 @@ impl Provider for GoogleProvider {
             checkpoint()?;
             self.0.transport.calendar_page(&access, page)
         })
+    }
+    fn event_capabilities(&self, item: &crate::sync::IncomingItem) -> Capabilities {
+        if outgoing::editable(item) {
+            Capabilities::ordinary()
+        } else {
+            Capabilities::read_only()
+        }
+    }
+    fn outgoing(
+        &self,
+        subject: &str,
+        operation: &crate::outgoing::OutgoingOperation,
+    ) -> Result<crate::outgoing::OutgoingResult> {
+        outgoing::deliver(self.0.transport.as_ref(), &self.access(subject)?, operation)
     }
     fn incoming_page(
         &self,

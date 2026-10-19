@@ -1051,3 +1051,90 @@ fn cached_connected_calendars_are_readable_without_an_adapter_or_worker() {
         "Cached remote event"
     );
 }
+
+#[test]
+fn google_ordinary_offline_crud_queues_durable_intent_without_starting_worker() {
+    use aika_core::{
+        contracts::{CalendarDetails, Capabilities, ConnectionState},
+        repository::Repository,
+    };
+    let f = Fixture::new();
+    let mut repository = Repository::open(&f.0).unwrap();
+    let account = repository
+        .upsert_account(
+            "google",
+            "fictional-offline-subject",
+            "Offline fixture",
+            ConnectionState::Connected,
+        )
+        .unwrap();
+    let calendar = repository
+        .import_calendar(
+            &account,
+            "fictional-calendar",
+            CalendarDetails {
+                name: "Google offline fixture".into(),
+                color: "#718675".into(),
+                description: "".into(),
+            },
+            Capabilities::ordinary(),
+        )
+        .unwrap();
+    drop(repository);
+    f.success(&["calendars", "set-default", &calendar]);
+    let created = f.success(&[
+        "events",
+        "create",
+        "--title",
+        "Offline create",
+        "--start",
+        "2026-10-10T10:00",
+        "--end",
+        "2026-10-10T11:00",
+    ]);
+    let event = id(&created);
+    f.success(&["events", "update", event, "--title", "Offline edit"]);
+    assert_eq!(
+        CalendarService::open(&f.0)
+            .unwrap()
+            .get(event)
+            .unwrap()
+            .title,
+        "Offline edit"
+    );
+    f.success(&["events", "delete", event]);
+    let db = rusqlite::Connection::open(&f.0).unwrap();
+    let mut query=db.prepare("SELECT operation,state,attempts,depends_on IS NOT NULL FROM outbox WHERE account_id=?1 ORDER BY rowid").unwrap();
+    let work = query
+        .query_map([&account], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u32>(2)?,
+                r.get::<_, bool>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        work,
+        vec![
+            ("create".into(), "pending".into(), 0, false),
+            ("update".into(), "pending".into(), 0, true),
+            ("delete".into(), "pending".into(), 0, true)
+        ]
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM account_leases", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM events WHERE id=?1", [event], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}

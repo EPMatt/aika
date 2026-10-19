@@ -8,4 +8,5 @@ pub use aika_domain::recurrence;
 pub mod google;
 pub mod repository;
 
+pub mod outgoing;
 pub mod sync;

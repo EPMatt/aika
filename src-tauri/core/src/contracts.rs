@@ -27,6 +27,13 @@ impl Capabilities {
             move_event: true,
         }
     }
+    pub fn ordinary() -> Self {
+        Self {
+            recurrence: false,
+            move_event: false,
+            ..Self::local()
+        }
+    }
     pub fn read_only() -> Self {
         Self {
             read: true,
@@ -146,4 +153,16 @@ pub struct AccountSyncStatus {
     pub pending_count: u32,
     pub conflict_count: u32,
     pub calendars: Vec<CalendarSyncStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflict {
+    pub id: String,
+    pub account_id: String,
+    pub calendar_id: String,
+    pub event_id: String,
+    pub local: Option<EventSeries>,
+    pub remote: Option<EventSeries>,
+    pub remote_revision: Option<String>,
 }

@@ -29,6 +29,8 @@ test('cached Google events stay read-only and incomplete/offline coverage has re
       value: {
         invoke: async (command: string) => {
           switch (command) {
+            case 'sync_conflicts':
+              return [];
             case 'get_app_info':
               return { name: 'aika', version: 'fixture', provider: 'local' };
             case 'get_preferences':
@@ -143,4 +145,185 @@ test('cached Google events stay read-only and incomplete/offline coverage has re
     page.getByText('Some events in this range have not been cached.', { exact: false }),
   ).toHaveCount(0);
   await expect(page.getByText('Cached remote event').first()).toBeVisible();
+});
+
+test('writable ordinary Google events queue offline edits and offer checked conflict choices', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'isTauri', { value: true });
+    const caps = {
+      read: true,
+      create: true,
+      edit: true,
+      delete: true,
+      recurrence: false,
+      customizeMetadata: true,
+      moveEvent: false,
+    };
+    const day = new Date();
+    const date = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const end = new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1);
+    const original = {
+      id: '9eed7866-4246-4a81-9281-9c5d94c174df',
+      calendarId: 'imported',
+      title: 'Editable Google event',
+      location: 'Room',
+      notes: 'Local notes',
+      time: { kind: 'allDay', startDate: date(day), endDate: date(end) },
+      recurrence: null,
+      occurrence: null,
+    };
+    const fixture = {
+      event: original,
+      pending: 0,
+      requests: 0,
+      conflicts: [] as any[],
+      resolutions: [] as boolean[],
+      retries: 0,
+    };
+    (window as any).outgoingFixture = fixture;
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      value: {
+        invoke: async (command: string, args: any) => {
+          switch (command) {
+            case 'get_app_info':
+              return { name: 'aika', version: 'fixture', provider: 'local' };
+            case 'get_preferences':
+              return { appearance: 'light', view: 'month', sidebar: true };
+            case 'set_preferences':
+              return;
+            case 'list_providers':
+              return [];
+            case 'request_sync':
+              fixture.requests++;
+              return;
+            case 'sync_conflicts':
+              return structuredClone(fixture.conflicts);
+            case 'calendar_snapshot':
+              return {
+                calendars: [
+                  {
+                    id: 'imported',
+                    providerId: 'google',
+                    name: 'Imported',
+                    color: '#718675',
+                    description: '',
+                    writable: true,
+                  },
+                ],
+                events: [fixture.event],
+                defaultCalendarId: 'imported',
+                hiddenCalendarIds: [],
+                canUndo: false,
+                accounts: [
+                  {
+                    id: 'account',
+                    providerId: 'google',
+                    remoteSubject: 'fixture',
+                    displayName: 'fixture@example.invalid',
+                    connectionState: 'connected',
+                    selectedCalendarIds: ['imported'],
+                  },
+                ],
+                calendarCapabilities: { imported: caps },
+                eventCapabilities: { [original.id]: caps },
+                syncStatus: [
+                  {
+                    accountId: 'account',
+                    syncing: false,
+                    lastSuccess: null,
+                    failure: {
+                      code: 'network',
+                      message: 'Offline. Changes remain queued.',
+                      offsets: [],
+                    },
+                    pendingCount: fixture.pending,
+                    conflictCount: fixture.conflicts.length,
+                    calendars: [
+                      {
+                        calendarId: 'imported',
+                        available: true,
+                        rangeComplete: true,
+                        lastSuccess: null,
+                      },
+                    ],
+                  },
+                ],
+              };
+            case 'get_event_series':
+              return { event: fixture.event, exceptions: [] };
+            case 'save_event':
+              fixture.event = structuredClone(args.event);
+              fixture.pending++;
+              return fixture.event;
+            case 'resolve_sync_conflict':
+              if (args.expected.id !== fixture.conflicts[0]?.id)
+                throw { message: 'Conflict changed. Review again.' };
+              fixture.resolutions.push(args.keepLocal);
+              if (!args.keepLocal) fixture.event = fixture.conflicts[0].remote.event;
+              fixture.conflicts = [];
+              fixture.pending = args.keepLocal ? 1 : 0;
+              return;
+            case 'retry_outgoing':
+              fixture.retries++;
+              return;
+            default:
+              throw new Error(`Unexpected fixture command: ${command}`);
+          }
+        },
+      },
+    });
+  });
+  await page.goto('/');
+  await page.getByText('Editable Google event', { exact: true }).first().click();
+  await expect(page.getByLabel('Event title', { exact: true })).toBeEnabled();
+  await page.getByLabel('Event title', { exact: true }).fill('Offline local edit');
+  const before = await page.evaluate(() => (window as any).outgoingFixture.requests);
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await expect(page.getByText('1 pending changes', { exact: true })).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).outgoingFixture.requests))
+    .toBeGreaterThan(before);
+  const showConflict = async () => {
+    await page.evaluate(() => {
+      const fixture = (window as any).outgoingFixture;
+      fixture.conflicts = [
+        {
+          id: 'conflict',
+          accountId: 'account',
+          calendarId: 'imported',
+          eventId: fixture.event.id,
+          local: { event: fixture.event, exceptions: [] },
+          remote: {
+            event: { ...fixture.event, title: 'Google version', notes: 'Remote notes' },
+            exceptions: [],
+          },
+          remoteRevision: 'remote-2',
+        },
+      ];
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(page.getByRole('region', { name: 'Event conflict' })).toBeVisible();
+  };
+  await showConflict();
+  await page.getByText('Compare versions', { exact: true }).click();
+  await expect(page.getByText('Remote notes', { exact: true })).toBeVisible();
+  const audit = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
+    .analyze();
+  expect(audit.violations.filter((v) => ['critical', 'serious'].includes(v.impact ?? ''))).toEqual(
+    [],
+  );
+  await page.getByRole('button', { name: 'Keep local', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Keep local', exact: true })).toHaveCount(0);
+  await expect(page.getByText('Offline local edit', { exact: true }).first()).toBeVisible();
+  await showConflict();
+  await page.getByRole('button', { name: 'Keep Google', exact: true }).click();
+  await expect(page.getByText('Google version', { exact: true }).first()).toBeVisible();
+  expect(await page.evaluate(() => (window as any).outgoingFixture.resolutions)).toEqual([
+    true,
+    false,
+  ]);
 });
