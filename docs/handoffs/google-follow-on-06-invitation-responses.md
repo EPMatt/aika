@@ -2,7 +2,7 @@
 
 Date: 2026-10-20. Status: implemented; live phase 06 acceptance remains outstanding. This belongs to the separate [Google follow-on sequence](../plans/google-integration-follow-on-2026-10-19.md), after [phase 05](google-follow-on-05-meeting-organization.md). Earlier handoffs retain their historical results.
 
-Implementation commit: recorded in the phase closeout after the implementation commit is created (`feat: add Google invitation responses`).
+Implementation commit: `46739610f0e2eac5ca118d03a68065856659195e` (`feat: add Google invitation responses`). This handoff is committed separately as the phase closeout.
 
 ## Implemented behavior and architectural decisions
 
