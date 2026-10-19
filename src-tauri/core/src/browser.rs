@@ -113,11 +113,10 @@ fn launch(command: &mut Command, grace: Duration) -> Result<(), ServiceError> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn launcher_exit_failure_and_missing_executable_are_reported_without_diagnostics() {
         let mut failed = Command::new("/bin/sh");
@@ -130,7 +129,9 @@ mod tests {
             Duration::ZERO
         )
         .is_err());
-        assert!(launch(&mut Command::new("/bin/true"), Duration::from_secs(1)).is_ok());
+        let mut succeeded = Command::new("/bin/sh");
+        succeeded.args(["-c", "exit 0"]);
+        assert!(launch(&mut succeeded, Duration::from_secs(1)).is_ok());
     }
 
     #[cfg(target_os = "linux")]
