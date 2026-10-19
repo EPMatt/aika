@@ -6,7 +6,7 @@ src/generated/
 test-results/
 playwright-report/
 pnpm-lock.yaml
-docs/review/*.png
+docs/images/*.png
 *.tsbuildinfo
 artifacts/
 src/wasm/

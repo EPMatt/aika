@@ -1,10 +1,10 @@
 # aika CLI
 
-`aika-cli` operates on the desktop application's local calendars using the shared Rust service. No running desktop app or GUI is required. Connected calendars, JSON output, search, import/export, and CLI undo are outside this version.
+`aika-cli` operates on the desktop application's shared SQLite repository through the Rust service. No running desktop app or GUI is required. It reads connected-calendar caches and queues supported ordinary-event edits; it does not connect accounts, fetch uncached data, or run a sync worker. Delivery waits for the desktop. JSON output, search, import/export, and CLI undo are outside this version.
 
 ## Build and run
 
-Use the repository's Node/pnpm/Rust versions from the README:
+Use the [development setup](../CONTRIBUTING.md#development-setup) for the pinned Node/pnpm/Rust versions:
 
 ```sh
 pnpm cli --help
@@ -34,7 +34,7 @@ aika-cli calendars delete <calendar-id> --force
 
 Use the exact ID printed by creation or listing. The initial Personal calendar has the ID `local-default`; newly created calendars use UUIDs. IDs are not resolved by name or prefix. Calendar commands do not require dates or a time zone. Names need not be unique.
 
-Creation requires `--name`, defaults to an empty description and sage (`#718675`), and creates a visible calendar. Names are trimmed and must contain 1–100 characters; descriptions allow up to 2000 characters. Updates require at least one field, preserve omitted fields, and accept `--description ''` to clear the description. Colors must exactly match the palette:
+Creation requires `--name`, defaults to an empty description and sage (`#718675`), and creates a visible calendar. Names are trimmed and must contain 1–100 characters; descriptions allow up to 2000 characters. Updates require at least one field, preserve omitted fields, and accept `--description ''` to clear the description. New or changed colors must exactly match the palette; an unchanged imported provider color is retained:
 
 | Color  | Hex       |
 | ------ | --------- |
@@ -51,7 +51,7 @@ List includes hidden calendars in creation order and prints ID, name, color, def
 
 `set-default` controls subsequent event creation. Show and hide persist the desktop's visibility setting; CLI event listings still include hidden calendars. Saving an event reveals its calendar, as in the desktop app.
 
-Deletion permanently removes the calendar and all its events. Empty calendars can be deleted directly; calendars containing events require `--force`. The event-count check and deletion run in one transaction, so a concurrently added event cannot bypass the safeguard. No interactive prompt is used. Deleting the default calendar selects the oldest remaining calendar. Every calendar can be deleted; listing then stays empty across restarts, and the next created calendar becomes default. Fresh databases still initialize with Personal.
+Local calendar deletion permanently removes the calendar and all its events. Imported calendar removal instead excludes it from aika without deleting it in the provider; pending work blocks removal even with `--force`. Empty calendars can be deleted directly; calendars containing events require `--force`. The event-count check and deletion run in one transaction, so a concurrently added event cannot bypass the safeguard. No interactive prompt is used. Deleting the default selects the oldest eligible writable local calendar, then an imported calendar, then none. Every calendar can be deleted; listing then stays empty across restarts, and the next created calendar becomes default. Fresh databases still initialize with Personal.
 
 ## Events
 
@@ -65,9 +65,11 @@ aika-cli events delete <event-uuid>
 
 Listing selects events that overlap `[from, to)`, including events that start before the range. Dates use `YYYY-MM-DD`. `--to` is exclusive, and the range must be positive and at most 366 days. Results are sorted by stored start boundary and then full UUID. Timed boundaries are converted from midnight in the selected IANA zone. An empty result prints nothing. If a boundary midnight falls in a DST gap or repeated time, choose another boundary date or zone.
 
-Creation requires title, start, and end, and uses the default calendar selected through the CLI or desktop UI. If no calendars exist, use `calendars create --name NAME` first. Listings include all local calendars, including calendars hidden in the desktop UI. Get, update, and delete locate single events by their full UUID; updates preserve their calendar. Calendar creation/settings/deletion are available through `calendars`; event assignment and moves between calendars remain managed in the desktop UI. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, notes, and applicable repeat settings; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
+Creation requires title, start, and end, and uses the default calendar selected through the CLI or desktop UI. If no calendars exist, use `calendars create --name NAME` first. Listings include selected active calendars and connected cached events, including calendars hidden in the desktop UI. Missing remote recurrence coverage is not fetched by this command; inspect coverage in the desktop before treating cached results as complete. Get, update, and delete locate single events by their full UUID; updates preserve their calendar. Calendar creation/settings/deletion are available through `calendars`; event assignment and moves between calendars remain managed in the desktop UI. Updates preserve omitted fields; `--location ''` and `--notes ''` clear those fields. Updating a zone alone preserves the event's existing instants. Delete uses an exact UUID and executes without an interactive prompt. Get, create, and update print ID, calendar, title, time, location, notes, and applicable repeat settings; list prints ID, time, and title. Control characters in user text are rendered as spaces to keep output safe for terminals.
 
 ## Recurring events
+
+These write examples apply to local calendars. Imported Google recurrence, meetings, and special event types remain read-only, even in writable calendars.
 
 ```sh
 aika-cli events create --title 'Stand-up' --start 2026-10-05T09:00 --end 2026-10-05T09:15 --time-zone Europe/Zurich --repeat weekly --weekdays mon,wed,fri

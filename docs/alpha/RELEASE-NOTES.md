@@ -1,24 +1,29 @@
 # aika 0.1.0-alpha.1 — private candidate
 
-Acceptance pending. This candidate is for private evaluation, with no public release or automatic updater.
+Private evaluation candidate; acceptance remains pending. No automatic updater.
 
-Multiple local calendars with month/week/day views, timed and all-day events, location and plain-text notes. Create, edit, move, resize, delete, and undo within the current session. Events, calendar names/descriptions/colors, calendar visibility/default selection, and appearance/view/sidebar preferences persist after restart. Create calendars with the sidebar +; use each calendar’s … menu for settings, default selection, or permanent deletion with its events. The editor supports moving events between local calendars. Light, dark, and system appearance; dates and times follow device settings. DST gaps are rejected and repeated times require an offset choice.
+## Included
 
-No connected accounts, sync, recurrence, reminders, search, import/export, backup/restore, analytics, or server. Calendar data is stored in local SQLite under the OS account's filesystem protections; it is not application-encrypted. Undo ends when the application exits.
+- Month/week/day views, multiple local calendars, visibility/default selection, and light/dark/system appearance.
+- Timed and all-day events with location/plain-text notes; drag creation, moves, resizing, deletion, and session undo. Local events, calendar settings, and appearance/view/sidebar preferences persist after restart.
+- Local daily/weekly/monthly/yearly recurrence, preview, and occurrence/series/following edits. DST gap input is rejected; repeated wall times require an offset. All-day ends are exclusive.
+- A standalone CLI using the shared repository. Private-alpha installers require separate CLI installation; numeric tagged-release packages bundle it.
+- **Experimental Google Calendar:** backend account connection/selection, incoming cache and offline reading, ordinary-event two-way edits, durable pending changes/retries, explicit conflicts, and compensating session undo. Google requires a configured Desktop OAuth client and working OS credential store.
 
-## Requirements and installation
+## Current boundaries
 
-- Windows 11 x64: unsigned, current-user NSIS installer. Run the `.exe`; Windows may show an unsigned-publisher warning. WebView2 is required (the installer uses Tauri's default bootstrapper behavior).
-- macOS 14+ Intel or Apple Silicon: use the matching DMG, open it, and drag aika to Applications. The app is ad-hoc signed and not notarized. Gatekeeper may block a downloaded candidate; follow your organization's policy and verify the source and checksum before using the system's explicit Open Anyway option. No blanket quarantine removal is required by these instructions.
-- Linux x64: Ubuntu 24.04+ or Arch. For Debian/Ubuntu, install the `.deb` using `sudo apt install ./<filename>.deb`. For AppImage, `chmod +x <filename>.AppImage` and run it. FUSE availability depends on the host; `--appimage-extract-and-run` is an alternative. Arch does not install `.deb` packages. A desktop session and compatible WebKitGTK runtime are required.
-- Fedora/Fedora-based Linux x64: install the unsigned `.rpm` using `sudo dnf install ./<filename>.rpm`, which resolves the declared GTK 3 and WebKitGTK 4.1 runtime requirements. Launch aika from the application menu or run `cal-desktop`. A desktop session and compatible system libraries are required; Fedora installation and launch verification remain pending. The standalone CLI is installed separately.
+Google meetings, recurring events, special event types, and remote moves remain outside supported editing. Unsupported recurrence uses bounded cached projections; missing offline ranges are marked incomplete. Live Google and installed-platform acceptance is unfinished. Pending work blocks account disconnect/calendar exclusion. Undo history ends when the app exits; remote pending changes/conflicts persist.
 
-Quit aika before replacing/upgrading it. Install the newer candidate using the same method and OS account, then restart. AppImage users replace the file; macOS users replace the app in Applications. Keep the application identifier unchanged to retain data. There is no automatic update or supported downgrade path; do not downgrade a database after a future schema migration.
+Search, reminders, import/export, backup/restore, invitation editing, analytics, and an application server are not included. Calendar data uses local SQLite under OS filesystem protections without application encryption; user Google tokens use the persistent OS store.
 
-## Verify the download
+## Installation and checksums
 
-The candidate directory includes `manifest.json` (version, source revision, target, signing status, sizes, and installer hashes) and `SHA256SUMS` (installers, manifest, and these notes). On Linux run `sha256sum -c SHA256SUMS`; on macOS run `shasum -a 256 -c SHA256SUMS`. On Windows compare `Get-FileHash <installer> -Algorithm SHA256` with its entry. Checksums detect altered bytes; they do not authenticate the publisher. Obtain the candidate and expected hashes through a trusted private channel.
+Use Windows 11 x64 NSIS, the matching macOS 14+ Intel/Apple Silicon DMG, or Linux x64 deb/RPM/AppImage. Linux/Windows packages are unsigned; macOS is ad-hoc signed without notarization. Linux needs a desktop session and compatible GTK 3 / WebKitGTK 4.1. Quit before replacing the app and keep the same OS account/application identifier; downgrades are unsupported.
 
-## Known verification limits
+The candidate includes `manifest.json` with source/target/signing details and `SHA256SUMS` covering installers, manifest, and these notes. On Linux run `sha256sum -c SHA256SUMS`; on macOS run `shasum -a 256 -c SHA256SUMS`; on Windows compare `Get-FileHash <installer> -Algorithm SHA256`. Obtain artifacts and expected hashes through a trusted channel: hashes check bytes, not publisher identity.
 
-Fedora RPM and Windows/macOS installer execution and the complete manual platform/accessibility matrix remain pending. Automated Linux webview CRUD/restart checks establish IPC and persistence, not trusted pointer gestures or screen-reader usability. Packaging, install/update checks, and user acceptance must be recorded separately; the presence of an installer is not acceptance evidence. See `docs/alpha/verification.md` and `docs/handoffs/phase-5.md` in the source checkout.
+Detailed installation commands, bundled CLI paths, packaging, and the acceptance checklist are in the source checkout's `docs/releases.md` (online: [release guide](https://github.com/EPMatt/aika/blob/main/docs/releases.md)). These notes are copied into candidate directories, so repository-relative links are intentionally avoided.
+
+## Verification still required
+
+Current-candidate installed launch/restart/CRUD, true upgrades, trusted native dragging, high DPI, manual keyboard/screen-reader checks, hosted workflow outcomes, and final user acceptance need recorded evidence. Windows/macOS, Ubuntu runtime, and Fedora installation behavior cannot be inferred from Linux debug automation or package inspection. Live Google consent, refresh, sync, failure recovery, and installed browser/store behavior remain incomplete; reaching a sign-in page is only partial evidence.
