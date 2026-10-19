@@ -688,6 +688,7 @@ mod tests {
                 .pending_count,
             0
         );
+        drop(restarted);
         std::fs::remove_file(path).unwrap();
     }
     #[test]
