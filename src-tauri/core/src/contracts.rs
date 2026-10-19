@@ -177,3 +177,15 @@ pub struct DisconnectReview {
     pub attempted_count: u32,
     pub revision: String,
 }
+
+/// Checked removal of one imported calendar; no provider resources are deleted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarRemovalReview {
+    pub calendar_id: String,
+    pub account_id: String,
+    pub pending_count: u32,
+    pub conflict_count: u32,
+    pub attempted_count: u32,
+    pub revision: String,
+}

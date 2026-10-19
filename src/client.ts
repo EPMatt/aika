@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
 import type { SyncConflict } from './generated/SyncConflict';
 import type { DisconnectReview } from './generated/DisconnectReview';
+import type { CalendarRemovalReview } from './generated/CalendarRemovalReview';
 import type { EventSeries } from './generated/EventSeries';
 import type { EventMutation } from './generated/EventMutation';
 import type { CalendarEvent } from './generated/CalendarEvent';
@@ -41,6 +42,10 @@ export const calendarClient = {
     mutate<void>('commit_calendar_selection', { discoveryId, selected }),
   reviewDisconnect: (accountId: string) =>
     invoke<DisconnectReview>('review_disconnect', { accountId }),
+  reviewCalendarRemoval: (calendarId: string) =>
+    invoke<CalendarRemovalReview>('review_calendar_removal', { calendarId }),
+  discardAndRemoveCalendar: (expected: CalendarRemovalReview) =>
+    mutate<void>('discard_and_remove_calendar', { expected }),
   discardAndDisconnect: (expected: DisconnectReview) =>
     mutate<void>('discard_and_disconnect', { expected }),
   disconnectAccount: (accountId: string) => mutate<void>('disconnect_account', { accountId }),

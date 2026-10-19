@@ -282,7 +282,7 @@ impl Repository {
             let id = existing
                 .map(|(id, _)| id)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            if !chosen && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged')", [&id], |r| r.get::<_,bool>(0))? {
+            if !chosen && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE calendar_id=?1)", [&id], |r| r.get::<_,bool>(0))? {
                 return Err(error("pendingWork", "Pending changes prevent excluding this calendar."));
             }
             tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,selected,active) VALUES(?1,?2,?3,?4,?5,?6,?7,?11,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET selected=excluded.selected,active=excluded.active,writable=excluded.writable,capabilities=excluded.capabilities", params![id,c.name,c.color,c.description,provider,account,c.remote_id,caps,chosen,c.eligible,c.eligible && matches!(c.access_role.as_str(),"owner"|"writer") && (capabilities.create || capabilities.edit || capabilities.delete)])?;
@@ -679,7 +679,7 @@ impl Repository {
             tx.query_row("SELECT account_id FROM calendars WHERE id=?1", [id], |r| {
                 r.get(0)
             })?;
-        if account.is_some() && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged')", [id], |r| r.get::<_, bool>(0))? {
+        if account.is_some() && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged') OR EXISTS(SELECT 1 FROM conflicts WHERE calendar_id=?1)", [id], |r| r.get::<_, bool>(0))? {
             return Err(error("pendingWork", "Synchronize or explicitly discard pending work before excluding this calendar."));
         }
         let count: i64 = tx.query_row(

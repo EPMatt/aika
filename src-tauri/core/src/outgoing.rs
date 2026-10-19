@@ -625,6 +625,180 @@ mod tests {
         assert_eq!(s.save(event(&cal), false).unwrap_err().code, "readOnly");
     }
     #[test]
+    fn calendar_discard_is_checked_isolated_and_fences_late_publication() {
+        let path = std::env::temp_dir().join(format!(
+            "aika-calendar-discard-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let (mut s, mut c, cal) = setup(&path);
+        let mut discovered = DiscoveredCalendar {
+            remote_id: "other-calendar".into(),
+            name: "Other".into(),
+            color: "#718675".into(),
+            description: "".into(),
+            access_role: "writer".into(),
+            eligible: true,
+            disabled_reason: None,
+            selected: true,
+        };
+        let other = s
+            .reconcile_sync(
+                &mut c,
+                vec![
+                    discovered.clone(),
+                    DiscoveredCalendar {
+                        remote_id: "remote-calendar".into(),
+                        ..discovered.clone()
+                    },
+                ],
+            )
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id != cal)
+            .unwrap()
+            .id;
+        let original = s.save(event(&cal), false).unwrap();
+        sent(&mut s, &c);
+        s.delete(&original.id).unwrap();
+        let late = s.claim_outgoing(&c).unwrap().unwrap();
+        let created = s.save(event(&cal), false).unwrap();
+        let other_event = s.save(event(&other), false).unwrap();
+        let stale = s.review_calendar_removal(&cal).unwrap();
+        assert_eq!(stale.pending_count, 2);
+        assert_eq!(stale.attempted_count, 1);
+        let mut second = open(&path);
+        let mut edited = created.clone();
+        edited.title = "Newer local intent".into();
+        second
+            .save_checked(edited, true, Some(created.clone()))
+            .unwrap();
+        assert_eq!(
+            s.discard_and_remove_calendar(stale).unwrap_err().code,
+            "conflict"
+        );
+        assert_eq!(s.review_calendar_removal(&cal).unwrap().pending_count, 3);
+        s.providers.set_default_calendar(&cal).unwrap();
+        let review = s.review_calendar_removal(&cal).unwrap();
+        s.discard_and_remove_calendar(review.clone()).unwrap();
+        assert!(s.discard_and_remove_calendar(review).is_err());
+        assert_eq!(
+            s.account(&c.account.id).unwrap().connection_state,
+            ConnectionState::Connected
+        );
+        assert_eq!(
+            s.account(&c.account.id).unwrap().selected_calendar_ids,
+            vec![other.clone()]
+        );
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 1);
+        assert_eq!(s.get_series(&other_event.id).unwrap().event, other_event);
+        assert!(s.providers.repository.get(&created.id).unwrap().is_none());
+        assert_eq!(
+            s.default_calendar_id().unwrap().as_deref(),
+            Some("local-default")
+        );
+        assert_eq!(
+            s.apply_outgoing(&c, &late, Ok(OutgoingResult::Applied(None)))
+                .unwrap_err()
+                .code,
+            "syncSuperseded"
+        );
+        assert_eq!(s.save(event(&cal), false).unwrap_err().code, "notFound");
+        s.undo().unwrap(); // Only the other calendar's create remains in session history.
+        assert!(s
+            .providers
+            .repository
+            .get(&other_event.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.undo().unwrap_err().code, "nothingToUndo");
+        drop(second);
+        drop(s);
+        let mut restarted = open(&path);
+        assert!(!restarted
+            .account(&c.account.id)
+            .unwrap()
+            .selected_calendar_ids
+            .contains(&cal));
+        // Explicit re-inclusion keeps its stable identity and cannot replay discarded work.
+        let account = restarted.account(&c.account.id).unwrap();
+        discovered.remote_id = "remote-calendar".into();
+        let d = restarted
+            .prepare_discovery(&account, vec![discovered])
+            .unwrap();
+        restarted
+            .commit_selection(&d.id, vec!["remote-calendar".into()])
+            .unwrap();
+        assert_eq!(
+            restarted
+                .review_calendar_removal(&cal)
+                .unwrap()
+                .pending_count,
+            0
+        );
+        drop(restarted);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn calendar_discard_clears_conflicts_without_touching_other_intent() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let original = s.save(event(&cal), false).unwrap();
+        sent(&mut s, &c);
+        let mut edited = original.clone();
+        edited.title = "Local".into();
+        s.save_checked(edited, true, Some(original)).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(None)))
+            .unwrap();
+        let local = s.save(event("local-default"), false).unwrap();
+        // A standalone conflict must still block the ordinary exclusion paths.
+        s.providers
+            .repository
+            .db
+            .execute(
+                "UPDATE outbox SET state='acknowledged' WHERE calendar_id=?1",
+                [&cal],
+            )
+            .unwrap();
+        assert_eq!(s.delete_calendar(&cal).unwrap_err().code, "pendingWork");
+        let review = s.review_calendar_removal(&cal).unwrap();
+        assert_eq!(review.pending_count, 0);
+        assert_eq!(review.conflict_count, 1);
+        let mut forged = review.clone();
+        forged.conflict_count = 0;
+        assert_eq!(
+            s.discard_and_remove_calendar(forged).unwrap_err().code,
+            "conflict"
+        );
+        s.providers
+            .repository
+            .set_account_state(&c.account.id, ConnectionState::AuthenticationRequired)
+            .unwrap();
+        s.providers
+            .repository
+            .db
+            .execute(
+                "UPDATE calendars SET writable=0,active=0 WHERE id=?1",
+                [&cal],
+            )
+            .unwrap();
+        assert_eq!(
+            s.discard_and_remove_calendar(review).unwrap_err().code,
+            "conflict"
+        );
+        let review = s.review_calendar_removal(&cal).unwrap();
+        s.discard_and_remove_calendar(review).unwrap();
+        assert_eq!(
+            s.account(&c.account.id).unwrap().connection_state,
+            ConnectionState::AuthenticationRequired
+        );
+        assert!(s.sync_conflicts().unwrap().is_empty());
+        s.undo().unwrap();
+        assert!(s.providers.repository.get(&local.id).unwrap().is_none());
+        assert!(s.review_calendar_removal("local-default").is_err());
+    }
+
+    #[test]
     fn checked_discard_disconnect_restores_cache_and_fences_late_writes() {
         let path =
             std::env::temp_dir().join(format!("aika-discard-{}.sqlite", uuid::Uuid::new_v4()));

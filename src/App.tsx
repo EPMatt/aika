@@ -1,4 +1,5 @@
 import type { SyncConflict } from './generated/SyncConflict';
+import type { CalendarRemovalReview } from './generated/CalendarRemovalReview';
 import { createContext, useContext, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent, KeyboardEvent, MouseEvent } from 'react';
 import * as Popover from '@radix-ui/react-popover';
@@ -1388,7 +1389,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [deletingCalendar, setDeletingCalendar] = useState<{
     calendar: Calendar;
     count: number;
+    review: CalendarRemovalReview | null;
   } | null>(null);
+  const [confirmCalendarDiscard, setConfirmCalendarDiscard] = useState(false);
   const calendarDialogAnchor = useRef<HTMLElement | null>(null);
   const [calendarBusy, setCalendarBusy] = useState(false);
   const [calendarFailure, setCalendarFailure] = useState('');
@@ -1895,9 +1898,14 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                             const count = desktop
                               ? await calendarClient.calendarEventCount(item.id)
                               : repository!.calendarEventCount(item.id);
-                            setCalendarBusy(false);
                             setCalendarFailure('');
-                            setDeletingCalendar({ calendar: item, count });
+                            const review =
+                              desktop && item.providerId !== 'local'
+                                ? await calendarClient.reviewCalendarRemoval(item.id)
+                                : null;
+                            setConfirmCalendarDiscard(false);
+                            setDeletingCalendar({ calendar: item, count, review });
+                            setCalendarBusy(false);
                           } catch (err) {
                             setFailure(errorMessage(err));
                             setCalendarBusy(false);
@@ -2495,6 +2503,38 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     ? `This permanently deletes the calendar and all ${deletingCalendar?.count} of its events. This cannot be undone.`
                     : 'This excludes the calendar from aika and clears its cached events. The calendar remains available with its provider. Include it again through Manage account.'}
                 </Dialog.Description>
+                {deletingCalendar?.review &&
+                  Boolean(
+                    deletingCalendar.review.pendingCount || deletingCalendar.review.conflictCount,
+                  ) && (
+                    <section aria-label="Review calendar changes">
+                      <p>
+                        This calendar has {deletingCalendar.review.pendingCount} pending changes and{' '}
+                        {deletingCalendar.review.conflictCount}{' '}
+                        {deletingCalendar.review.conflictCount === 1 ? 'conflict' : 'conflicts'}.
+                        Removing it discards these local changes and clears its cached events. This
+                        cannot be undone.
+                      </p>
+                      <p>
+                        {deletingCalendar.review.attemptedCount} pending{' '}
+                        {deletingCalendar.review.attemptedCount === 1
+                          ? 'change has'
+                          : 'changes have'}{' '}
+                        already been attempted. Changes already sent to Google may still take
+                        effect. No changes are sent to Google by this removal. Other calendars stay
+                        connected.
+                      </p>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={confirmCalendarDiscard}
+                          disabled={calendarBusy}
+                          onChange={(e) => setConfirmCalendarDiscard(e.target.checked)}
+                        />{' '}
+                        Discard this calendar’s local changes
+                      </label>
+                    </section>
+                  )}
                 {calendarFailure && (
                   <p role="alert" className="editor-error">
                     {calendarFailure}
@@ -2511,19 +2551,47 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                   </button>
                   <button
                     className="primary-button danger-button"
-                    disabled={calendarBusy}
+                    disabled={
+                      calendarBusy ||
+                      Boolean(
+                        deletingCalendar?.review &&
+                          (deletingCalendar.review.pendingCount ||
+                            deletingCalendar.review.conflictCount) &&
+                          !confirmCalendarDiscard,
+                      )
+                    }
                     onClick={async () => {
                       if (!deletingCalendar) return;
                       setCalendarBusy(true);
                       setCalendarFailure('');
                       try {
-                        if (desktop)
+                        if (desktop && deletingCalendar.review)
+                          await calendarClient.discardAndRemoveCalendar(deletingCalendar.review);
+                        else if (desktop)
                           await calendarClient.deleteCalendar(deletingCalendar.calendar.id);
                         else repository!.deleteCalendar(deletingCalendar.calendar.id);
                         setDeletingCalendar(null);
-                        refresh('Calendar deleted.');
+                        refresh(
+                          deletingCalendar.calendar.providerId === 'local'
+                            ? 'Calendar deleted.'
+                            : 'Calendar removed from aika.',
+                        );
                       } catch (err) {
                         setCalendarFailure(errorMessage(err));
+                        // A changed review must be shown again before another confirmation.
+                        if (deletingCalendar.review) {
+                          setConfirmCalendarDiscard(false);
+                          try {
+                            const review = await calendarClient.reviewCalendarRemoval(
+                              deletingCalendar.calendar.id,
+                            );
+                            setDeletingCalendar({ ...deletingCalendar, review });
+                          } catch {
+                            setDeletingCalendar(null);
+                            refresh('Calendar selection changed.');
+                            setFailure(errorMessage(err));
+                          }
+                        }
                       } finally {
                         setCalendarBusy(false);
                       }
@@ -2533,7 +2601,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                       ? 'Removing…'
                       : deletingCalendar?.calendar.providerId === 'local'
                         ? 'Delete calendar'
-                        : 'Remove from aika'}
+                        : deletingCalendar?.review &&
+                            (deletingCalendar.review.pendingCount ||
+                              deletingCalendar.review.conflictCount)
+                          ? 'Discard and remove'
+                          : 'Remove from aika'}
                   </button>
                 </div>
               </Dialog.Content>

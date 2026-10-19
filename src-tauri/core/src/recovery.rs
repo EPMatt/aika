@@ -1,14 +1,59 @@
-//! Explicit, checked retirement of local intent when an account cannot synchronize.
+//! Explicit, checked retirement of local intent for calendar or account recovery.
 use crate::{
     contracts::*,
     repository::Repository,
     service::{error, CalendarService},
     sync::IncomingItem,
 };
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 type Result<T> = std::result::Result<T, ServiceError>;
+
+fn calendar_review(db: &Connection, calendar: &str) -> Result<CalendarRemovalReview> {
+    let account: Option<String> = db.query_row(
+        "SELECT account_id FROM calendars WHERE id=?1 AND selected=1 AND account_id IS NOT NULL",
+        [calendar], |r| r.get(0),
+    ).optional()?;
+    let account = account
+        .ok_or_else(|| error("notFound", "This imported calendar is no longer included."))?;
+    let mut digest = Sha256::new();
+    for sql in [
+        "SELECT c.*,a.sync_epoch,a.connection_state FROM calendars c JOIN accounts a ON a.id=c.account_id WHERE c.id=?1",
+        "SELECT o.*,e.payload,i.payload FROM outbox o LEFT JOIN events e ON e.id=o.event_id LEFT JOIN incoming_items i ON i.id=o.event_id WHERE o.calendar_id=?1 AND o.state!='acknowledged' ORDER BY o.id",
+        "SELECT f.*,e.payload FROM conflicts f LEFT JOIN events e ON e.id=f.event_id WHERE f.calendar_id=?1 ORDER BY f.id",
+        "SELECT i.id,i.payload FROM incoming_items i JOIN remote_events r ON r.id=i.id WHERE r.calendar_id=?1 ORDER BY i.id",
+    ] {
+        let mut statement = db.prepare(sql)?;
+        let columns = statement.column_count();
+        let mut rows = statement.query([calendar])?;
+        digest.update(sql.as_bytes());
+        while let Some(row) = rows.next()? {
+            for index in 0..columns {
+                let value = format!("{:?}", row.get_ref(index)?);
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+        }
+    }
+    let (pending_count, attempted_count) = db.query_row(
+        "SELECT count(*),coalesce(sum(attempts>0 OR state='inFlight'),0) FROM outbox WHERE calendar_id=?1 AND state!='acknowledged'",
+        [calendar], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let conflict_count = db.query_row(
+        "SELECT count(*) FROM conflicts WHERE calendar_id=?1",
+        [calendar],
+        |r| r.get(0),
+    )?;
+    Ok(CalendarRemovalReview {
+        calendar_id: calendar.into(),
+        account_id: account,
+        pending_count,
+        conflict_count,
+        attempted_count,
+        revision: format!("{:x}", digest.finalize()),
+    })
+}
 
 fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
     let mut digest = Sha256::new();
@@ -52,6 +97,58 @@ fn review(db: &Connection, account: &str) -> Result<DisconnectReview> {
 }
 
 impl CalendarService {
+    pub fn review_calendar_removal(&mut self, calendar: &str) -> Result<CalendarRemovalReview> {
+        let tx = self.providers.repository.db.transaction()?;
+        let result = calendar_review(&tx, calendar)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Retire only this calendar's intent and fence the account's current worker.
+    /// Requests already sent may still succeed; this never sends compensating HTTP.
+    pub fn discard_and_remove_calendar(&mut self, expected: CalendarRemovalReview) -> Result<()> {
+        let repo = &mut self.providers.repository;
+        let tx = repo
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if calendar_review(&tx, &expected.calendar_id)? != expected {
+            return Err(error(
+                "conflict",
+                "Pending changes changed. Review the calendar removal again.",
+            ));
+        }
+        let calendar = &expected.calendar_id;
+        let affected = {
+            let mut q = tx.prepare("SELECT id FROM events WHERE calendar_id=?1 UNION SELECT event_id FROM outbox WHERE calendar_id=?1 UNION SELECT event_id FROM conflicts WHERE calendar_id=?1")?;
+            let rows = q
+                .query_map([calendar], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        tx.execute("DELETE FROM conflicts WHERE calendar_id=?1", [calendar])?;
+        // Keep dependency identities so unrelated work retains its durable history.
+        tx.execute("UPDATE outbox SET state='acknowledged',retry_at=NULL,acknowledgement=NULL WHERE calendar_id=?1 AND state!='acknowledged'", [calendar])?;
+        tx.execute(
+            "UPDATE event_exceptions SET payload=NULL,calendar_id=NULL WHERE calendar_id=?1",
+            [calendar],
+        )?;
+        tx.execute("DELETE FROM events WHERE calendar_id=?1", [calendar])?;
+        tx.execute("DELETE FROM sync_cursors WHERE calendar_id=?1", [calendar])?;
+        tx.execute("DELETE FROM coverage WHERE calendar_id=?1", [calendar])?;
+        // The selected change triggers an epoch increment, fencing incoming and outgoing
+        // publication for the old worker, including any already in-flight request.
+        tx.execute(
+            "UPDATE calendars SET selected=0,writable=0 WHERE id=?1",
+            [calendar],
+        )?;
+        Repository::repair_default(&tx)?;
+        tx.commit()?;
+        repo.forget_event_history(&affected);
+        self.discoveries
+            .retain(|_, (d, _)| d.account.id != expected.account_id);
+        Ok(())
+    }
+
     pub fn review_disconnect(&mut self, account: &str) -> Result<DisconnectReview> {
         self.account(account)?;
         let tx = self.providers.repository.db.transaction()?;

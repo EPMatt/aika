@@ -4,7 +4,7 @@
 
 - Validate experimental Google connection, incoming sync, and ordinary-event two-way edits against disposable live accounts and installed platform packages. Automated implementation is present; acceptance remains incomplete.
 - Complete alpha installation/replacement/true-upgrade evidence, trusted native input, high DPI, keyboard and screen-reader checks across Linux, Windows, and both macOS architectures. See the [acceptance checklist](releases.md#acceptance-checklist).
-- Finish recovery UX and evidence for credentials, permissions, unresolved pending work, and account removal. Retry/conflict controls and checked account-wide discard-and-disconnect are implemented. Direct per-calendar discard/removal still needs design; account recovery and reconnection currently unblock ordinary removal. Installed credential cleanup and live uncertain-write acceptance remain unverified.
+- Finish recovery UX and evidence for credentials, permissions, unresolved pending work, and account removal. Retry/conflict controls, checked account-wide discard-and-disconnect, and checked per-calendar discard-and-remove are implemented. Full account removal still needs design. Installed credential cleanup and live uncertain-write acceptance remain unverified.
 
 ## Future plans
 

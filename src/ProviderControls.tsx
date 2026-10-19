@@ -506,7 +506,7 @@ function ConnectionDialog({
             <p>
               Discarding restores the last known Google versions in the cache and removes local
               changes that have not synchronized. This cannot be undone. Reconnect to refresh the
-              cache before removing individual calendars from aika.
+              retained cache. Remove individual calendars through their options menu.
             </p>
             <p>
               {disconnectReview.attemptedCount} pending changes have already been attempted. Changes

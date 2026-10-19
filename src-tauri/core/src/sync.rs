@@ -1309,6 +1309,30 @@ mod tests {
         );
     }
     #[test]
+    fn checked_calendar_removal_fences_staged_incoming_and_preserves_exclusion() {
+        let (mut s, a) = service(Path::new(":memory:"));
+        let (c, j) = begin(&mut s, &a);
+        let g = stage(&mut s, &c, &j, vec![item("a", "Late")], vec![], true);
+        let review = s.review_calendar_removal(&j.id).unwrap();
+        assert_eq!(review.pending_count, 0);
+        s.discard_and_remove_calendar(review).unwrap();
+        assert_eq!(
+            s.publish_generation(&c, &g).unwrap_err().code,
+            "syncSuperseded"
+        );
+        s.end_sync(&c, None).unwrap();
+        let mut next = s.begin_sync(&a, range()).unwrap().unwrap();
+        let jobs = s
+            .reconcile_sync(
+                &mut next,
+                vec![discovered("one", true), discovered("excluded", true)],
+            )
+            .unwrap();
+        assert!(!jobs.iter().any(|job| job.id == j.id));
+        assert!(events(&mut s).is_empty());
+    }
+
+    #[test]
     fn leases_and_selection_fences_work_across_independent_database_connections() {
         let path =
             std::env::temp_dir().join(format!("aika-sync-race-{}.sqlite3", uuid::Uuid::new_v4()));

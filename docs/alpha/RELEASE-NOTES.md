@@ -12,7 +12,7 @@ Private evaluation candidate; acceptance remains pending. No automatic updater.
 
 ## Current boundaries
 
-Google meetings, recurring events, special event types, and remote moves remain outside supported editing. Unsupported recurrence uses bounded cached projections; missing offline ranges are marked incomplete. Live Google and installed-platform acceptance is unfinished. Pending work blocks account disconnect/calendar exclusion. Undo history ends when the app exits; remote pending changes/conflicts persist.
+Google meetings, recurring events, special event types, and remote moves remain outside supported editing. Unsupported recurrence uses bounded cached projections; missing offline ranges are marked incomplete. Live Google and installed-platform acceptance is unfinished. Pending work blocks ordinary account disconnect/calendar exclusion; explicit checked discard-and-disconnect and per-calendar discard-and-remove offer recovery. Already-sent Google requests may still take effect. Undo history ends when the app exits; remote pending changes/conflicts persist.
 
 Search, reminders, import/export, backup/restore, invitation editing, analytics, and an application server are not included. Calendar data uses local SQLite under OS filesystem protections without application encryption; user Google tokens use the persistent OS store.
 
