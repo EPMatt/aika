@@ -206,6 +206,14 @@ for (const theme of ['light', 'dark']) {
                 selected = args.selected;
                 fixture.selections.push(selected);
                 return;
+              case 'review_disconnect':
+                return {
+                  accountId: 'account',
+                  pendingCount: 0,
+                  conflictCount: 0,
+                  attemptedCount: 0,
+                  revision: 'empty',
+                };
               case 'disconnect_account':
                 account.connectionState = 'disconnected';
                 return;

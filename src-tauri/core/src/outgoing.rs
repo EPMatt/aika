@@ -625,6 +625,209 @@ mod tests {
         assert_eq!(s.save(event(&cal), false).unwrap_err().code, "readOnly");
     }
     #[test]
+    fn checked_discard_disconnect_restores_cache_and_fences_late_writes() {
+        let path =
+            std::env::temp_dir().join(format!("aika-discard-{}.sqlite", uuid::Uuid::new_v4()));
+        let (mut s, c, cal) = setup(&path);
+        let original = s.save(event(&cal), false).unwrap();
+        sent(&mut s, &c);
+        let mut edited = original.clone();
+        edited.title = "Local pending".into();
+        s.save_checked(edited.clone(), true, Some(original.clone()))
+            .unwrap();
+        let stale = s.review_disconnect(&c.account.id).unwrap();
+        let mut other = open(&path);
+        let mut newer = edited.clone();
+        newer.title = "Newer pending".into();
+        other
+            .save_checked(newer.clone(), true, Some(edited))
+            .unwrap();
+        assert_eq!(
+            s.discard_and_disconnect(stale).unwrap_err().code,
+            "conflict"
+        );
+        assert_eq!(s.get_series(&original.id).unwrap().event, newer);
+        // Simulate a request that has left the process; its result must not republish.
+        let late = s.claim_outgoing(&c).unwrap().unwrap();
+        let local_create = s.save(event(&cal), false).unwrap();
+        let reviewed = s.review_disconnect(&c.account.id).unwrap();
+        assert_eq!(reviewed.pending_count, 3);
+        assert_eq!(reviewed.attempted_count, 1);
+        s.discard_and_disconnect(reviewed).unwrap();
+        assert_eq!(s.get_series(&original.id).unwrap().event, original);
+        assert!(s
+            .providers
+            .repository
+            .get(&local_create.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            s.account(&c.account.id).unwrap().connection_state,
+            ConnectionState::Disconnected
+        );
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 0);
+        assert_eq!(
+            s.apply_outgoing(
+                &c,
+                &late,
+                Ok(OutgoingResult::Applied(Some(ack(&late, "late"))))
+            )
+            .unwrap_err()
+            .code,
+            "syncSuperseded"
+        );
+        assert_eq!(s.save(event(&cal), false).unwrap_err().code, "readOnly");
+        drop(other);
+        drop(s);
+        let mut restarted = open(&path);
+        assert_eq!(restarted.get_series(&original.id).unwrap().event, original);
+        assert_eq!(
+            restarted
+                .review_disconnect(&c.account.id)
+                .unwrap()
+                .pending_count,
+            0
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn discard_disconnect_restores_conflict_remote_and_retains_unrelated_undo() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let original = s.save(event(&cal), false).unwrap();
+        sent(&mut s, &c);
+        let mut edited = original.clone();
+        edited.title = "Local".into();
+        s.save_checked(edited, true, Some(original.clone()))
+            .unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut remote = ack(&op, "remote-2");
+        remote.event.as_mut().unwrap().title = "Google".into();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(remote))))
+            .unwrap();
+        let local = s.save(event("local-default"), false).unwrap();
+        let review = s.review_disconnect(&c.account.id).unwrap();
+        assert_eq!(review.conflict_count, 1);
+        s.discard_and_disconnect(review).unwrap();
+        assert_eq!(s.get_series(&original.id).unwrap().event.title, "Google");
+        assert!(s.sync_conflicts().unwrap().is_empty());
+        s.undo().unwrap();
+        assert!(s.providers.repository.get(&local.id).unwrap().is_none());
+        assert_eq!(s.undo().unwrap_err().code, "nothingToUndo");
+    }
+    #[test]
+    fn discard_disconnect_restores_pending_delete_and_accepts_remote_deletion() {
+        for remote_deleted in [false, true] {
+            let (mut s, c, cal) = setup(Path::new(":memory:"));
+            let original = s.save(event(&cal), false).unwrap();
+            sent(&mut s, &c);
+            s.delete(&original.id).unwrap();
+            if remote_deleted {
+                let op = s.claim_outgoing(&c).unwrap().unwrap();
+                s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(None)))
+                    .unwrap();
+            }
+            let review = s.review_disconnect(&c.account.id).unwrap();
+            s.discard_and_disconnect(review).unwrap();
+            assert_eq!(
+                s.providers.repository.get(&original.id).unwrap().is_none(),
+                remote_deleted
+            );
+            assert!(s.sync_conflicts().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn discard_restores_exceptions_when_google_converts_a_pending_event_to_a_series() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let original = s.save(event(&cal), false).unwrap();
+        let created = sent(&mut s, &c);
+        let mut local = original.clone();
+        local.title = "Local edit".into();
+        s.save_checked(local, true, Some(original.clone())).unwrap();
+        let mut master = ack(&created, "series-revision");
+        master.event.as_mut().unwrap().recurrence = Some(Recurrence {
+            frequency: RepeatFrequency::Daily,
+            interval: 1,
+            weekdays: vec![],
+            monthly_on: MonthlyOn::Date,
+            until: None,
+            count: Some(3),
+            segment: None,
+        });
+        let mut moved = master.clone();
+        moved.remote_id = "moved".into();
+        moved.master = Some(master.remote_id.clone());
+        moved.original_start = Some("2026-10-02".into());
+        moved.event.as_mut().unwrap().recurrence = None;
+        moved.event.as_mut().unwrap().title = "Moved in Google".into();
+        let mut cancelled = moved.clone();
+        cancelled.remote_id = "cancelled".into();
+        cancelled.original_start = Some("2026-10-03".into());
+        cancelled.event = None;
+        import(&mut s, &c, &cal, vec![cancelled, moved, master]);
+        let review = s.review_disconnect(&c.account.id).unwrap();
+        s.discard_and_disconnect(review).unwrap();
+        let series = s.get_series(&original.id).unwrap();
+        assert!(series.event.recurrence.is_some());
+        assert_eq!(series.exceptions.len(), 2);
+        assert_eq!(
+            series.exceptions[0].event.as_ref().unwrap().title,
+            "Moved in Google"
+        );
+        assert!(series.exceptions[1].event.is_none());
+    }
+    #[test]
+    fn discard_disconnect_isolates_accounts_and_never_replays_on_reconnect() {
+        let (mut s, c, cal) = setup(Path::new(":memory:"));
+        let other_account = s
+            .providers
+            .repository
+            .upsert_account(
+                "fixture",
+                "other-subject",
+                "Other",
+                ConnectionState::Connected,
+            )
+            .unwrap();
+        let other = s.account(&other_account).unwrap();
+        let d = s
+            .prepare_discovery(
+                &other,
+                vec![DiscoveredCalendar {
+                    remote_id: "remote-calendar".into(),
+                    name: "Other".into(),
+                    color: "#718675".into(),
+                    description: "".into(),
+                    access_role: "writer".into(),
+                    eligible: true,
+                    disabled_reason: None,
+                    selected: true,
+                }],
+            )
+            .unwrap();
+        s.commit_selection(&d.id, vec!["remote-calendar".into()])
+            .unwrap();
+        let other_cal = s.account(&other_account).unwrap().selected_calendar_ids[0].clone();
+        let other_event = s.save(event(&other_cal), false).unwrap();
+        s.save(event(&cal), false).unwrap();
+        let review = s.review_disconnect(&c.account.id).unwrap();
+        s.discard_and_disconnect(review).unwrap();
+        assert_eq!(
+            s.review_disconnect(&other_account).unwrap().pending_count,
+            1
+        );
+        assert_eq!(s.get_series(&other_event.id).unwrap().event, other_event);
+        assert_eq!(
+            s.account(&other_account).unwrap().connection_state,
+            ConnectionState::Connected
+        );
+        s.providers
+            .repository
+            .upsert_account("fixture", "subject", "Fixture", ConnectionState::Connected)
+            .unwrap();
+        // Reconnection restores the account, but retired operations stay retired.
+        assert_eq!(s.review_disconnect(&c.account.id).unwrap().pending_count, 0);
+    }
+    #[test]
     fn disconnect_requires_empty_outbox_and_disables_cached_calendar_writes() {
         let (mut s, c, cal) = setup(Path::new(":memory:"));
         let e = s.save(event(&cal), false).unwrap();

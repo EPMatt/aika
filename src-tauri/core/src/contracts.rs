@@ -166,3 +166,14 @@ pub struct SyncConflict {
     pub remote: Option<EventSeries>,
     pub remote_revision: Option<String>,
 }
+
+/// Checked review of account-wide local intent. The revision is opaque to clients.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectReview {
+    pub account_id: String,
+    pub pending_count: u32,
+    pub conflict_count: u32,
+    pub attempted_count: u32,
+    pub revision: String,
+}

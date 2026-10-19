@@ -57,7 +57,7 @@ fn filter_appimage_environment(
             )
         ) {
             let paths: Vec<_> = std::env::split_paths(value)
-                .filter(|path| !path.starts_with(&appdir))
+                .filter(|path| !path.starts_with(appdir))
                 .collect();
             if paths.is_empty() {
                 command.env_remove(key);

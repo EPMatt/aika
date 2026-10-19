@@ -995,6 +995,10 @@ impl Repository {
         self.retain_calendar_history(&calendars);
         Ok(())
     }
+    pub(crate) fn forget_event_history(&mut self, ids: &[String]) {
+        self.history
+            .retain(|entry| !entry.changes.iter().any(|c| ids.contains(&c.id)));
+    }
     fn retain_calendar_history(&mut self, calendars: &[Calendar]) {
         let ids: Vec<_> = calendars.iter().map(|c| &c.id).collect();
         let removed: Vec<_> = self

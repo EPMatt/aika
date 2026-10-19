@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
 import type { SyncConflict } from './generated/SyncConflict';
+import type { DisconnectReview } from './generated/DisconnectReview';
 import type { EventSeries } from './generated/EventSeries';
 import type { EventMutation } from './generated/EventMutation';
 import type { CalendarEvent } from './generated/CalendarEvent';
@@ -38,7 +39,11 @@ export const calendarClient = {
     invoke<CalendarDiscovery>('discover_calendars', { accountId }),
   commitSelection: (discoveryId: string, selected: string[]) =>
     mutate<void>('commit_calendar_selection', { discoveryId, selected }),
-  disconnectAccount: (accountId: string) => invoke<void>('disconnect_account', { accountId }),
+  reviewDisconnect: (accountId: string) =>
+    invoke<DisconnectReview>('review_disconnect', { accountId }),
+  discardAndDisconnect: (expected: DisconnectReview) =>
+    mutate<void>('discard_and_disconnect', { expected }),
+  disconnectAccount: (accountId: string) => mutate<void>('disconnect_account', { accountId }),
   getSeries: (target: string) => invoke<EventSeries>('get_event_series', { target }),
   mutateEvent: (request: EventMutation) =>
     mutate<CalendarEvent[]>('mutate_recurring_event', { request }),

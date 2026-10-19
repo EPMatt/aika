@@ -10,4 +10,5 @@ pub mod google;
 pub mod repository;
 
 pub mod outgoing;
+mod recovery;
 pub mod sync;

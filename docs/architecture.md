@@ -52,7 +52,7 @@ UI/CLI reads use SQLite. Supported remote mutations commit effective local state
 
 ### ADR G04: Explicit conflicts and compensating undo
 
-Keep both versions or deletion states, pause only the conflicting event, and offer **Keep local** / **Keep Google**. Checked remote revisions prevent silent replacement. Undo cancels never-attempted pending work or queues compensation with dependencies for attempted/in-flight/acknowledged work. Pending intent/conflicts survive restart. Disconnect and exclusion currently refuse unresolved work; a general explicit-discard recovery flow is future work.
+Keep both versions or deletion states, pause only the conflicting event, and offer **Keep local** / **Keep Google**. Checked remote revisions prevent silent replacement. Undo cancels never-attempted pending work or queues compensation with dependencies for attempted/in-flight/acknowledged work. Pending intent/conflicts survive restart. Disconnect and exclusion refuse unresolved work by default. Account management offers a checked, explicit discard-and-disconnect recovery: it restores the last known incoming versions, retires pending intent, and fences workers atomically before credential deletion. Already sent requests may still take effect remotely. Calendar exclusion still requires resolving work or using account recovery first.
 
 ### ADR G05: Backend authentication and credentials
 

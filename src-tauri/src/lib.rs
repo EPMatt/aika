@@ -149,6 +149,30 @@ async fn commit_calendar_selection(
     .await
 }
 #[tauri::command]
+async fn review_disconnect(
+    state: tauri::State<'_, ServiceState>,
+    account_id: String,
+) -> Result<DisconnectReview, ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.review_disconnect(&account_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn discard_and_disconnect(
+    state: tauri::State<'_, ServiceState>,
+    expected: DisconnectReview,
+) -> Result<(), ServiceError> {
+    let (account, adapter) = with_service(state.inner().clone(), move |s| {
+        let account = s.account(&expected.account_id)?;
+        let adapter = s.connection_adapter(&account.provider_id)?;
+        s.discard_and_disconnect(expected)?;
+        Ok((account, adapter))
+    })
+    .await?;
+    provider_work(move || adapter.disconnect(&account.remote_subject)).await
+}
+#[tauri::command]
 async fn disconnect_account(
     state: tauri::State<'_, ServiceState>,
     account_id: String,
@@ -359,7 +383,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, sync_conflicts, resolve_sync_conflict, retry_outgoing, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, review_disconnect, discard_and_disconnect, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }
