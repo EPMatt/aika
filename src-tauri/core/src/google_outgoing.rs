@@ -21,14 +21,14 @@ pub(super) fn editable_fields(item: &IncomingItem) -> bool {
             .event
             .as_ref()
             .is_none_or(|e| crate::google_recurrence::compile(e).is_ok())
-        && v.get("attendees").is_none()
         && v.get("attendeesOmitted").and_then(Value::as_bool) != Some(true)
         && v.get("locked").and_then(Value::as_bool) != Some(true)
         && v.get("eventType")
             .and_then(Value::as_str)
             .unwrap_or("default")
             == "default"
-        && v.get("conferenceData").is_none()
+        && ((v.get("attendees").is_none() && !crate::meetings::has_conference(&v))
+            || v["organizer"]["self"].as_bool() == Some(true))
         && v.get("organizer")
             .and_then(|o| o.get("self"))
             .and_then(Value::as_bool)
@@ -91,6 +91,36 @@ fn patch(op: &OutgoingOperation) -> Value {
     }
     Value::Object(patch)
 }
+/// Fetches use no maxAttendees. Refuse incomplete arrays rather than replace hidden guests.
+fn apply_guests(body: &mut Value, current: &Value, intent: Option<&MeetingIntent>) -> Result<()> {
+    let Some(guests) = intent.and_then(|m| m.guests.as_ref()) else {
+        return Ok(());
+    };
+    if current["attendeesOmitted"].as_bool() == Some(true) {
+        return Err(error("readOnly", "Google returned an incomplete guest list. Retry after complete attendee details are available."));
+    }
+    body["attendees"] = Value::Array(
+        guests
+            .iter()
+            .map(|g| {
+                let mut value = current["attendees"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|a| {
+                        a["email"]
+                            .as_str()
+                            .is_some_and(|e| e.eq_ignore_ascii_case(&g.email))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| json!({"email":g.email,"responseStatus":"needsAction"}));
+                value["optional"] = json!(g.optional);
+                value
+            })
+            .collect(),
+    );
+    Ok(())
+}
 fn normalize(value: Value) -> Result<Option<IncomingItem>> {
     if value["status"] == "cancelled" {
         return Ok(None);
@@ -119,6 +149,20 @@ fn achieved(op: &OutgoingOperation, item: &IncomingItem) -> bool {
         && (before.is_some_and(|b| b.time == after.time) || remote.time == after.time)
         && (before.is_some_and(|b| b.recurrence == after.recurrence)
             || remote.recurrence == after.recurrence)
+        && op
+            .meeting
+            .as_ref()
+            .and_then(|m| m.guests.as_ref())
+            .is_none_or(|desired| {
+                let value: Value = serde_json::from_str(&item.shadow).unwrap_or_default();
+                let actual = crate::meetings::guests(&value);
+                desired.len() == actual.len()
+                    && desired.iter().all(|g| {
+                        actual.iter().any(|a| {
+                            a.email.eq_ignore_ascii_case(&g.email) && a.optional == g.optional
+                        })
+                    })
+            })
 }
 pub(super) fn deliver(
     transport: &dyn GoogleTransport,
@@ -238,7 +282,23 @@ pub(super) fn deliver(
         // Recreating a deleted resource retains its last live provider-only fields.
         // Raw tombstones live in incoming_items; the mapping keeps the last live shadow.
         let shadow: Value = serde_json::from_str(&op.shadow).unwrap_or_default();
+        if crate::meetings::has_conference(&shadow) {
+            return Err(error(
+                "unsupported",
+                "Creating a resource would copy existing conference data.",
+            ));
+        }
+        if shadow["attendeesOmitted"].as_bool() == Some(true) {
+            return Err(error(
+                "readOnly",
+                "Complete attendee details are required before recreating a meeting.",
+            ));
+        }
         let mut body = patch(op);
+        if let Some(attendees) = shadow.get("attendees") {
+            body["attendees"] = attendees.clone();
+        }
+        apply_guests(&mut body, &shadow, op.meeting.as_ref())?;
         for key in [
             "reminders",
             "colorId",
@@ -264,13 +324,17 @@ pub(super) fn deliver(
         }
         body["extendedProperties"]["private"]["aikaOperation"] = json!(op.id);
         body["id"] = Value::String(op.remote_id.clone());
-        return match transport.event_request(
+        return match transport.event_request_notifying(
             access,
             &op.remote_calendar,
             &op.remote_id,
             "POST",
             Some(&body),
             None,
+            &op.meeting
+                .as_ref()
+                .map(|m| m.notifications.clone())
+                .unwrap_or_default(),
         ) {
             Ok(Some(v)) => Ok(OutgoingResult::Applied(normalize(v)?)),
             Ok(None) => Err(error(
@@ -297,13 +361,14 @@ pub(super) fn deliver(
         .as_ref()
         .and_then(|i| serde_json::from_str(&i.shadow).ok())
         .unwrap_or_default();
+    apply_guests(&mut body, &shadow, op.meeting.as_ref())?;
     let mut private = shadow["extendedProperties"]["private"]
         .as_object()
         .cloned()
         .unwrap_or_default();
     private.insert("aikaOperation".into(), Value::String(op.id.clone()));
     body["extendedProperties"] = json!({"private":private});
-    match transport.event_request(
+    match transport.event_request_notifying(
         access,
         &op.remote_calendar,
         &op.remote_id,
@@ -314,6 +379,10 @@ pub(super) fn deliver(
         },
         Some(&body),
         op.revision.as_deref(),
+        &op.meeting
+            .as_ref()
+            .map(|m| m.notifications.clone())
+            .unwrap_or_default(),
     ) {
         Ok(value) => {
             if op.operation != "delete" && value.is_none() {
@@ -330,7 +399,7 @@ pub(super) fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    type RecordedRequest = (String, Option<String>, Option<Value>, String);
+    type RecordedRequest = (String, Option<String>, Option<Value>, String, String);
     struct Transport {
         responses: Mutex<std::collections::VecDeque<Result<Option<Value>>>>,
         requests: Mutex<Vec<RecordedRequest>>,
@@ -356,6 +425,20 @@ mod tests {
         fn calendar_page(&self, _: &str, _: Option<&str>) -> Result<CalendarPage> {
             unreachable!()
         }
+        fn event_request_notifying(
+            &self,
+            access: &str,
+            calendar: &str,
+            event: &str,
+            method: &str,
+            body: Option<&Value>,
+            revision: Option<&str>,
+            policy: &NotificationPolicy,
+        ) -> Result<Option<Value>> {
+            let result = self.event_request(access, calendar, event, method, body, revision);
+            self.requests.lock().unwrap().last_mut().unwrap().4 = policy.as_str().into();
+            result
+        }
         fn event_request(
             &self,
             _: &str,
@@ -370,6 +453,7 @@ mod tests {
                 revision.map(str::to_owned),
                 body.cloned(),
                 resource.into(),
+                String::new(),
             ));
             self.responses
                 .lock()
@@ -420,6 +504,7 @@ mod tests {
                 Some("r1".into())
             },
             recovering,
+            meeting: None,
             shadow: "{}".into(),
             original_start: None,
             series_remote_id: None,
@@ -549,7 +634,7 @@ mod tests {
         ));
     }
     #[test]
-    fn meetings_special_types_and_unsupported_recurrence_never_reach_write_transport() {
+    fn unverified_meetings_special_types_and_unsupported_recurrence_never_reach_write_transport() {
         for (key, value) in [
             ("attendees", json!([{ "email":"fixture@example.invalid" }])),
             ("eventType", json!("outOfOffice")),
@@ -604,6 +689,7 @@ mod tests {
             }),
             revision: Some("etag".into()),
             recovering: false,
+            meeting: None,
             shadow: "{}".into(),
             original_start: None,
             series_remote_id: None,
@@ -809,5 +895,119 @@ mod tests {
             OutgoingResult::Applied(Some(_))
         ));
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn meeting_guest_changes_preserve_responses_unknown_fields_and_conferences() {
+        let mut op = operation("update", false);
+        op.meeting = Some(MeetingIntent {
+            original_start: None,
+            before_guests: None,
+            guests: Some(vec![
+                MeetingGuest {
+                    email: "kept@example.invalid".into(),
+                    optional: true,
+                },
+                MeetingGuest {
+                    email: "new@example.invalid".into(),
+                    optional: false,
+                },
+            ]),
+            notifications: NotificationPolicy::ExternalOnly,
+        });
+        let mut remote = resource("Before", "r1");
+        remote["organizer"] = json!({"self":true});
+        remote["conferenceData"] = json!({"conferenceId":"existing"});
+        remote["attendees"] = json!([{"email":"kept@example.invalid","responseStatus":"accepted","comment":"preserve","unknown":{"nested":true}},{"email":"removed@example.invalid"}]);
+        let t = Transport::new(vec![Ok(Some(remote)), Ok(Some(resource("After", "r2")))]);
+        deliver(&t, "access", &op).unwrap();
+        let requests = t.requests.lock().unwrap();
+        let body = requests[1].2.as_ref().unwrap();
+        assert_eq!(body["attendees"][0]["responseStatus"], "accepted");
+        assert_eq!(body["attendees"][0]["comment"], "preserve");
+        assert_eq!(body["attendees"][0]["unknown"]["nested"], true);
+        assert_eq!(body["attendees"][0]["optional"], true);
+        assert_eq!(body["attendees"][1]["responseStatus"], "needsAction");
+        assert_eq!(body["attendees"].as_array().unwrap().len(), 2);
+        assert!(body.get("conferenceData").is_none());
+        assert_eq!(requests[1].4, "externalOnly");
+    }
+    #[test]
+    fn meeting_recovery_requires_guest_intent_and_organizer_identity() {
+        let mut op = operation("update", true);
+        op.meeting = Some(MeetingIntent {
+            original_start: None,
+            before_guests: None,
+            guests: Some(vec![MeetingGuest {
+                email: "wanted@example.invalid".into(),
+                optional: false,
+            }]),
+            notifications: NotificationPolicy::None,
+        });
+        for (owned, omitted, achieved_guests) in [
+            (true, false, true),
+            (true, false, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut remote = resource("After", "r2");
+            remote["organizer"] = json!({"self":owned});
+            remote["attendeesOmitted"] = json!(omitted);
+            remote["attendees"] = json!([{"email":if achieved_guests {"wanted@example.invalid"} else {"other@example.invalid"}}]);
+            remote["extendedProperties"]["private"]["aikaOperation"] = json!(op.id);
+            let t = Transport::new(vec![Ok(Some(remote))]);
+            let result = deliver(&t, "access", &op);
+            if !owned || omitted {
+                assert_eq!(result.err().unwrap().code, "readOnly");
+            } else {
+                assert_eq!(
+                    matches!(result.unwrap(), OutgoingResult::Applied(_)),
+                    achieved_guests
+                );
+            }
+            assert_eq!(t.requests.lock().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn meeting_creation_cancellation_and_recreation_keep_notification_policy() {
+        for kind in ["create", "delete"] {
+            let mut op = operation(kind, false);
+            op.meeting = Some(MeetingIntent {
+                original_start: None,
+                before_guests: None,
+                guests: if kind == "create" {
+                    Some(vec![MeetingGuest {
+                        email: "guest@example.invalid".into(),
+                        optional: false,
+                    }])
+                } else {
+                    None
+                },
+                notifications: NotificationPolicy::None,
+            });
+            let t = Transport::new(if kind == "create" {
+                vec![Ok(None), Ok(Some(resource("After", "r2")))]
+            } else {
+                vec![Ok(Some(resource("Before", "r1"))), Ok(None)]
+            });
+            deliver(&t, "access", &op).unwrap();
+            let requests = t.requests.lock().unwrap();
+            assert_eq!(requests[1].4, "none");
+            if kind == "create" {
+                assert_eq!(
+                    requests[1].2.as_ref().unwrap()["attendees"][0]["email"],
+                    "guest@example.invalid"
+                );
+            }
+        }
+        let mut op = operation("create", false);
+        op.shadow =
+            json!({"conferenceData":{"conferenceId":"do-not-copy"},"organizer":{"self":true}})
+                .to_string();
+        let t = Transport::new(vec![Ok(None)]);
+        assert_eq!(
+            deliver(&t, "access", &op).err().unwrap().code,
+            "unsupported"
+        );
+        assert_eq!(t.requests.lock().unwrap().len(), 1);
     }
 }

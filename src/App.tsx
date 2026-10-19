@@ -1,3 +1,6 @@
+import type { MeetingDetails } from './generated/MeetingDetails';
+import type { MeetingMutation } from './generated/MeetingMutation';
+import type { NotificationPolicy } from './generated/NotificationPolicy';
 import type { EventActions } from './generated/EventActions';
 import type { SyncConflict } from './generated/SyncConflict';
 import type { CalendarRemovalReview } from './generated/CalendarRemovalReview';
@@ -933,15 +936,22 @@ function EventEditor({
   onScope,
   resetAffected = false,
   onPreview,
+  expectedSeries,
 }: {
+  expectedSeries?: EventSeries;
   scope?: MutationScope;
   onScope?: (scope: MutationScope) => void;
   resetAffected?: boolean;
   onPreview: (event: CalendarEvent, countChanged: boolean) => Promise<CalendarEvent[]>;
   event: CalendarEvent;
   existing: boolean;
-  onSave: (event: CalendarEvent, resetExceptions: boolean, countChanged: boolean) => Promise<void>;
-  onDelete: (resetExceptions: boolean) => Promise<void>;
+  onSave: (
+    event: CalendarEvent,
+    resetExceptions: boolean,
+    countChanged: boolean,
+    meeting?: MeetingMutation,
+  ) => Promise<void>;
+  onDelete: (resetExceptions: boolean, meeting?: MeetingMutation) => Promise<void>;
   onClose: () => void;
 }) {
   const calendars = useContext(CalendarsContext);
@@ -992,6 +1002,66 @@ function EventEditor({
   const [notes, setNotes] = useState(event.notes);
   const [details, setDetails] = useState(Boolean(location || notes));
   const [error, setError] = useState('');
+  const [meeting, setMeeting] = useState<MeetingDetails | null>(null);
+  const [meetingExpected, setMeetingExpected] = useState<EventSeries | null>(null);
+  const [guestText, setGuestText] = useState('');
+  const [guestsChanged, setGuestsChanged] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationPolicy>('all');
+  const [silentAcknowledged, setSilentAcknowledged] = useState(false);
+  useEffect(() => {
+    if (!google || !desktop) return;
+    let active = true;
+    setMeeting(null);
+    Promise.all([
+      calendarClient.meetingDetails(event.id),
+      existing
+        ? expectedSeries
+          ? Promise.resolve(expectedSeries)
+          : calendarClient.getSeries(event.id)
+        : Promise.resolve(null),
+    ])
+      .then(([details, expected]) => {
+        if (!active) return;
+        setMeeting(details);
+        setMeetingExpected(expected && !event.occurrence ? { ...expected, event } : expected);
+        setGuestText(
+          details.attendees.map((a) => `${a.email}${a.optional ? ' optional' : ''}`).join('\n'),
+        );
+      })
+      .catch(() => {
+        /* Calendar edits remain available through checked narrow writes. */
+      });
+    return () => {
+      active = false;
+    };
+  }, [google, event.id, existing, expectedSeries]);
+  const meetingRequest = (draft: CalendarEvent | null): MeetingMutation | undefined => {
+    if (!google || !desktop || (!guestsChanged && notifications === 'all')) return undefined;
+    if (!meeting) throw new Error('Wait for meeting details to load.');
+    if (notifications === 'none' && !silentAcknowledged)
+      throw new Error('Acknowledge the silent update warning.');
+    return {
+      event: draft,
+      expected: meetingExpected,
+      target: event.id,
+      scope,
+      resetExceptions,
+      countChanged,
+      expectedRevision: meeting.revision,
+      notifications,
+      acknowledgeSilent: silentAcknowledged,
+      guests: guestsChanged
+        ? guestText
+            .split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((s) => ({
+              email: s.replace(/ optional$/, ''),
+              optional: s.endsWith(' optional'),
+            }))
+        : null,
+    };
+  };
 
   const [busy, setBusy] = useState(false);
   const [offsets, setOffsets] = useState<{ start?: number[]; end?: number[] }>({});
@@ -1045,7 +1115,8 @@ function EventEditor({
     setBusy(true);
     setError('');
     try {
-      await onSave(await buildDraft(), resetExceptions, countChanged);
+      const draft = await buildDraft();
+      await onSave(draft, resetExceptions, countChanged, meetingRequest(draft));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -1067,6 +1138,69 @@ function EventEditor({
 
   return (
     <form className="editor" onSubmit={submit}>
+      {google && desktop && (
+        <fieldset className="meeting-details">
+          <legend>Meeting</legend>
+          {meeting?.organizer && <p>Organizer: {meeting.organizer}</p>}
+          {meeting?.attendees.map((a) => (
+            <p key={a.email}>
+              {a.email}
+              {a.optional ? ' (optional)' : ''}: {a.response}
+            </p>
+          ))}
+          {meeting?.conferenceLinks.map((link) => (
+            <a key={link} href={link} target="_blank" rel="noreferrer">
+              Join meeting
+            </a>
+          ))}
+          {writable && (
+            <>
+              <label>
+                Guests (one email per line; append “ optional” for optional guests)
+                <textarea
+                  aria-label="Meeting guests"
+                  value={guestText}
+                  disabled={busy || !meeting || !meeting.attendeesComplete}
+                  onChange={(e) => {
+                    setGuestText(e.target.value);
+                    setGuestsChanged(true);
+                  }}
+                />
+              </label>
+              <label>
+                Notify guests
+                <select
+                  aria-label="Notify guests"
+                  value={notifications}
+                  disabled={busy}
+                  onChange={(e) => {
+                    setNotifications(e.target.value as NotificationPolicy);
+                    setSilentAcknowledged(false);
+                  }}
+                >
+                  <option value="all">Everyone</option>
+                  <option value="externalOnly">External guests only</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+              {notifications === 'none' && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={silentAcknowledged}
+                    onChange={(e) => setSilentAcknowledged(e.target.checked)}
+                  />
+                  I understand silent updates may prevent synchronization or lose invitations.
+                </label>
+              )}
+              <p>
+                Delivered invitations cannot be recalled by undo or local discard. Retrying an
+                uncertain write may deliver notifications again.
+              </p>
+            </>
+          )}
+        </fieldset>
+      )}
       <IconButton
         className="editor-close"
         label="Close event editor"
@@ -1385,7 +1519,7 @@ function EventEditor({
                     setError('Confirm reset of future Google exceptions before deleting.');
                     return;
                   }
-                  await onDelete(resetExceptions);
+                  await onDelete(resetExceptions, meetingRequest(null));
                 } catch (err) {
                   setError(errorMessage(err));
                 } finally {
@@ -2135,6 +2269,29 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                                   </div>
                                 );
                               })}
+                              {Boolean(conflict.meetingIntents?.length) && (
+                                <div>
+                                  <p>
+                                    Google guests:{' '}
+                                    {conflict.remoteAttendees?.map((g) => g.email).join(', ') ||
+                                      'None'}
+                                  </p>
+                                  {conflict.meetingIntents?.map((intent, index) => (
+                                    <p key={index}>
+                                      {intent.originalStart
+                                        ? `Occurrence ${intent.originalStart}`
+                                        : 'Series'}{' '}
+                                      · Notify: {intent.notifications}.{' '}
+                                      {intent.guests &&
+                                        `Local guests: ${intent.guests.map((g) => `${g.email}${g.optional ? ' (optional)' : ''}`).join(', ') || 'None'}`}
+                                    </p>
+                                  ))}
+                                  <p>
+                                    Delivered invitations cannot be recalled by undo or local
+                                    discard.
+                                  </p>
+                                </div>
+                              )}
                             </details>
                             <button
                               className="text-button"
@@ -2367,6 +2524,7 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                     key={`${editing.event.id}:${editing.scope ?? 'single'}`}
                     event={editing.event}
                     existing={editing.existing}
+                    expectedSeries={editing.series}
                     scope={editing.scope ?? 'series'}
                     onScope={
                       editing.selected
@@ -2404,10 +2562,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                       return previewRecurrence(event);
                     }}
                     onClose={() => setEditing(null)}
-                    onSave={async (event, resetExceptions, countChanged) => {
+                    onSave={async (event, resetExceptions, countChanged, meeting) => {
                       setMutating(true);
                       try {
-                        if (editing.selected)
+                        if (meeting) await calendarClient.mutateMeeting(meeting);
+                        else if (editing.selected)
                           await performRecurring(
                             requestForEdit(event, resetExceptions, countChanged),
                           );
@@ -2424,10 +2583,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                         setMutating(false);
                       }
                     }}
-                    onDelete={async (resetExceptions) => {
+                    onDelete={async (resetExceptions, meeting) => {
                       setMutating(true);
                       try {
-                        if (editing.selected)
+                        if (meeting) await calendarClient.mutateMeeting(meeting);
+                        else if (editing.selected)
                           await performRecurring(requestForEdit(null, resetExceptions));
                         else if (desktop)
                           await calendarClient.delete(editing.event.id, editing.event);

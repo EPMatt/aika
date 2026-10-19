@@ -1602,7 +1602,7 @@ mod migration_tests {
     fn v4_upgrade_is_transactional_and_preserves_local_data() {
         let path = std::env::temp_dir().join(format!("aika-v5-{}.sqlite3", uuid::Uuid::new_v4()));
         let repo = Repository::open(&path).unwrap();
-        repo.db.execute_batch("DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; DROP TRIGGER invalidate_new_calendar_sync; DROP TRIGGER invalidate_selection_sync; DROP TRIGGER invalidate_account_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE calendars DROP COLUMN remote_metadata; ALTER TABLE accounts DROP COLUMN selection_confirmed; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; PRAGMA user_version=4; CREATE TABLE incoming_items(marker TEXT); INSERT INTO incoming_items VALUES('preserve');").unwrap();
+        repo.db.execute_batch("ALTER TABLE outbox DROP COLUMN meeting_intent; DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; DROP TRIGGER invalidate_new_calendar_sync; DROP TRIGGER invalidate_selection_sync; DROP TRIGGER invalidate_account_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE calendars DROP COLUMN remote_metadata; ALTER TABLE accounts DROP COLUMN selection_confirmed; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; PRAGMA user_version=4; CREATE TABLE incoming_items(marker TEXT); INSERT INTO incoming_items VALUES('preserve');").unwrap();
         drop(repo);
         assert!(Repository::open(&path).is_err());
         let db = Connection::open(&path).unwrap();
@@ -1625,7 +1625,7 @@ mod migration_tests {
             repo.db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            7
+            8
         );
         drop(repo);
         std::fs::remove_file(path).unwrap();

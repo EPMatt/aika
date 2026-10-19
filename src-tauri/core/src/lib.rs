@@ -16,3 +16,5 @@ pub mod sync;
 
 pub mod account_removal;
 pub(crate) mod lifecycle;
+
+pub mod meetings;

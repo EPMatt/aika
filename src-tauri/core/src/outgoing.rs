@@ -20,6 +20,7 @@ pub struct OutgoingOperation {
     pub revision: Option<String>,
     pub recovering: bool,
     pub shadow: String,
+    pub meeting: Option<MeetingIntent>,
     pub original_start: Option<String>,
     pub series_remote_id: Option<String>,
 }
@@ -321,7 +322,7 @@ impl CalendarService {
                                 error("validation", "Occurrence intent requires a before state.")
                             })?)?;
                         let expected = occurrence_event(&before, original)?;
-                        let same = match (&expected, &item.event) {
+                        let mut same = match (&expected, &item.event) {
                             (Some(a), Some(b)) => {
                                 a.title == b.title
                                     && a.time == b.time
@@ -331,6 +332,30 @@ impl CalendarService {
                             (None, None) => true,
                             _ => false,
                         };
+                        let raw: Option<String> = tx.query_row(
+                            "SELECT meeting_intent FROM outbox WHERE id=?1",
+                            [&id],
+                            |r| r.get(0),
+                        )?;
+                        if let Some(intent) = raw
+                            .map(|v| serde_json::from_str::<MeetingIntent>(&v))
+                            .transpose()?
+                        {
+                            if intent.guests.is_some() {
+                                if let Some(expected) = intent.before_guests {
+                                    let observed: serde_json::Value =
+                                        serde_json::from_str(&item.shadow)?;
+                                    let actual = crate::meetings::guests(&observed);
+                                    same &= actual.len() == expected.len()
+                                        && expected.iter().all(|g| {
+                                            actual.iter().any(|a| {
+                                                a.email.eq_ignore_ascii_case(&g.email)
+                                                    && a.optional == g.optional
+                                            })
+                                        });
+                                }
+                            }
+                        }
                         tx.execute("UPDATE outbox SET resource_id=?2,series_remote_id=?3,expected_revision=?4 WHERE id=?1", params![id,item.remote_id,master,if same {item.revision.as_str()} else {"unobserved-conflict"}])?;
                         let mapped = mapping(
                             &tx,
@@ -399,6 +424,12 @@ impl CalendarService {
             }
         };
         tx.execute("UPDATE outbox SET state='inFlight',attempts=attempts+1,expected_revision=?2,resource_id=?3 WHERE id=?1",params![id,revision,remote_id])?;
+        let meeting: Option<String> = tx.query_row(
+            "SELECT meeting_intent FROM outbox WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
+        let meeting = meeting.map(|v| serde_json::from_str(&v)).transpose()?;
         tx.commit()?;
         Ok(Some(OutgoingOperation {
             id,
@@ -412,6 +443,7 @@ impl CalendarService {
             revision,
             recovering: attempts > 0,
             shadow,
+            meeting,
             original_start,
             series_remote_id,
         }))
@@ -598,6 +630,8 @@ impl CalendarService {
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             );
         }
+        let meeting_intents = crate::meetings::pending_intents(&tx, &current.event_id)?;
+        let has_guest_intent = meeting_intents.iter().any(|m| m.guests.is_some());
         if multi && keep_local {
             // Replan the conflicting resource inside its existing ordered group.
             // Acknowledged siblings and unattempted/uncertain siblings retain their
@@ -650,7 +684,7 @@ impl CalendarService {
                 "DELETE FROM conflicts WHERE event_id=?1",
                 [&current.event_id],
             )?;
-            if desired != current.remote {
+            if desired != current.remote || has_guest_intent {
                 crate::repository::Repository::queue_change_with_schedule(
                     &tx,
                     &SeriesChange {
@@ -661,6 +695,12 @@ impl CalendarService {
                     false,
                     &group,
                     true,
+                )?;
+                crate::meetings::replan_intents(
+                    &tx,
+                    &current.event_id,
+                    previous_max,
+                    &meeting_intents,
                 )?;
                 let replacement: String = tx.query_row("SELECT id FROM outbox WHERE group_id=?1 AND event_id=?2 AND rowid>?3 ORDER BY step_index DESC LIMIT 1", params![group,current.event_id,previous_max],|r|r.get(0))?;
                 let master: Option<String> = tx.query_row("SELECT id FROM outbox WHERE group_id=?1 AND event_id=?2 AND rowid>?3 AND original_start IS NULL ORDER BY step_index DESC LIMIT 1", params![group,current.event_id,previous_max],|r|r.get(0)).optional()?;
@@ -743,7 +783,11 @@ impl CalendarService {
         } else {
             tx.execute("DELETE FROM events WHERE id=?1", [&current.event_id])?;
         }
-        if current.remote != local {
+        let previous_max: i64 =
+            tx.query_row("SELECT coalesce(max(rowid),0) FROM outbox", [], |r| {
+                r.get(0)
+            })?;
+        if current.remote != local || has_guest_intent {
             crate::repository::Repository::queue_change_with_schedule(
                 &tx,
                 &SeriesChange {
@@ -756,6 +800,7 @@ impl CalendarService {
                 true,
             )?;
         }
+        crate::meetings::replan_intents(&tx, &current.event_id, previous_max, &meeting_intents)?;
         tx.commit()?;
         Ok(())
     }
@@ -811,6 +856,12 @@ fn read_conflicts(db: &rusqlite::Connection) -> Result<Vec<SyncConflict>> {
                         steps
                     }),
                     group_revision: Some(crate::recovery::group_revision(db, &event_id)?),
+                    meeting_intents: Some({
+                        let mut q = db.prepare("SELECT meeting_intent FROM outbox WHERE event_id=?1 AND state!='acknowledged' AND meeting_intent IS NOT NULL ORDER BY rowid")?;
+                        let raw = q.query_map([&event_id], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+                        raw.into_iter().map(|s| serde_json::from_str(&s).map_err(Into::into)).collect::<Result<Vec<MeetingIntent>>>()?
+                    }),
+                    remote_attendees: Some(crate::meetings::guests(&crate::meetings::shadow(db, &event_id)?)),
                 })
             },
         )
@@ -1938,7 +1989,7 @@ mod tests {
         let a = s.save(event(&cal), false).unwrap();
         let attempted = s.claim_outgoing(&c).unwrap().unwrap();
         s.save(event(&cal), false).unwrap();
-        s.providers.repository.db.execute_batch("DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; PRAGMA user_version=5; CREATE TABLE operation_groups(marker TEXT); INSERT INTO operation_groups VALUES('preserve');").unwrap();
+        s.providers.repository.db.execute_batch("ALTER TABLE outbox DROP COLUMN meeting_intent; DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; DROP VIEW active_group_series; DROP TRIGGER outbox_group_scope; DROP TRIGGER outbox_group_scope_update; DROP TRIGGER outbox_group_member; DROP INDEX outbox_group_order; ALTER TABLE outbox DROP COLUMN group_id; ALTER TABLE outbox DROP COLUMN step_index; ALTER TABLE outbox DROP COLUMN resource_id; ALTER TABLE outbox DROP COLUMN series_remote_id; ALTER TABLE outbox DROP COLUMN original_start; DROP TABLE operation_group_series; DROP TABLE operation_groups; PRAGMA user_version=5; CREATE TABLE operation_groups(marker TEXT); INSERT INTO operation_groups VALUES('preserve');").unwrap();
         drop(s);
         assert!(Repository::open(&path).is_err());
         let db = rusqlite::Connection::open(&path).unwrap();
@@ -3035,5 +3086,330 @@ mod tests {
                 })
             );
         }
+    }
+    fn meeting_fixture(path: &Path) -> (CalendarService, SyncClaim, String) {
+        let (s, claim, calendar) = setup(path);
+        s.providers
+            .repository
+            .db
+            .execute(
+                "UPDATE calendars SET provider_id='google' WHERE id=?1",
+                [&calendar],
+            )
+            .unwrap();
+        (s, claim, calendar)
+    }
+    fn meeting_request(
+        s: &CalendarService,
+        event: CalendarEvent,
+        existing: bool,
+        policy: NotificationPolicy,
+    ) -> MeetingMutation {
+        MeetingMutation {
+            expected: if existing {
+                Some(s.get_series(&event.id).unwrap())
+            } else {
+                None
+            },
+            expected_revision: s.meeting_details(&event.id).unwrap().revision,
+            target: event.id.clone(),
+            event: Some(event),
+            scope: MutationScope::Series,
+            reset_exceptions: false,
+            count_changed: false,
+            guests: Some(vec![MeetingGuest {
+                email: "guest@example.invalid".into(),
+                optional: true,
+            }]),
+            notifications: policy,
+            acknowledge_silent: true,
+        }
+    }
+    #[test]
+    fn meeting_policy_restart_stale_review_guest_overlay_and_unsent_undo() {
+        let path =
+            std::env::temp_dir().join(format!("aika-meeting-{}.sqlite3", uuid::Uuid::new_v4()));
+        let (mut s, c, calendar) = meeting_fixture(&path);
+        let e = event(&calendar);
+        let mut request = meeting_request(&s, e.clone(), false, NotificationPolicy::None);
+        request.acknowledge_silent = false;
+        assert_eq!(
+            s.mutate_meeting(request.clone()).unwrap_err().code,
+            "notificationWarning"
+        );
+        request.acknowledge_silent = true;
+        s.mutate_meeting(request.clone()).unwrap();
+        assert_eq!(
+            s.meeting_details(&e.id).unwrap().attendees[0].email,
+            "guest@example.invalid"
+        );
+        assert_eq!(s.mutate_meeting(request).unwrap_err().code, "conflict");
+        // Another connection observes the exact durable policy and effective guest intent.
+        let mut other = open(&path);
+        assert_eq!(other.meeting_details(&e.id).unwrap().attendees.len(), 1);
+        let stale = meeting_request(&s, e.clone(), true, NotificationPolicy::All);
+        let mut concurrent = stale.clone();
+        concurrent.guests = Some(vec![MeetingGuest {
+            email: "another@example.invalid".into(),
+            optional: false,
+        }]);
+        other.mutate_meeting(concurrent).unwrap();
+        assert_eq!(s.mutate_meeting(stale).unwrap_err().code, "conflict");
+        other.providers.repository.undo().unwrap();
+        s.providers.repository.undo().unwrap();
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        let request = meeting_request(&s, e.clone(), false, NotificationPolicy::ExternalOnly);
+        s.mutate_meeting(request).unwrap();
+        drop(s);
+        let mut reopened = open(&path);
+        let op = reopened.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(
+            op.meeting.as_ref().unwrap().notifications,
+            NotificationPolicy::ExternalOnly
+        );
+        assert!(op.meeting.unwrap().guests.unwrap()[0].optional);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn guest_only_conflict_keeps_durable_intent_and_checked_compensation_policy() {
+        let (mut s, c, calendar) = meeting_fixture(Path::new(":memory:"));
+        let e = event(&calendar);
+        s.mutate_meeting(meeting_request(
+            &s,
+            e.clone(),
+            false,
+            NotificationPolicy::ExternalOnly,
+        ))
+        .unwrap();
+        let first = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut original = ack(&first, "r1");
+        original.shadow = serde_json::json!({"id":first.remote_id,"etag":"r1","summary":"Original","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"},"organizer":{"self":true,"email":"owner@example.invalid"},"attendees":[{"email":"guest@example.invalid","optional":true,"responseStatus":"accepted","comment":"preserve"}]}).to_string();
+        s.apply_outgoing(
+            &c,
+            &first,
+            Ok(OutgoingResult::Applied(Some(original.clone()))),
+        )
+        .unwrap();
+        let mut change = meeting_request(&s, e.clone(), true, NotificationPolicy::None);
+        change.guests = Some(vec![MeetingGuest {
+            email: "new@example.invalid".into(),
+            optional: false,
+        }]);
+        s.mutate_meeting(change).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        let mut remote = original;
+        remote.revision = "r2".into();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(remote))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        assert_eq!(
+            review.meeting_intents.as_ref().unwrap()[0].notifications,
+            NotificationPolicy::None
+        );
+        assert_eq!(
+            review.remote_attendees.as_ref().unwrap()[0].email,
+            "guest@example.invalid"
+        );
+        s.resolve_sync_conflict(review, true).unwrap();
+        let replacement = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(
+            replacement.meeting.as_ref().unwrap().notifications,
+            NotificationPolicy::None
+        );
+        assert_eq!(
+            replacement
+                .meeting
+                .as_ref()
+                .unwrap()
+                .guests
+                .as_ref()
+                .unwrap()[0]
+                .email,
+            "new@example.invalid"
+        );
+        let mut applied = ack(&replacement, "r3");
+        applied.shadow=serde_json::json!({"id":replacement.remote_id,"etag":"r3","summary":"Original","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"},"organizer":{"self":true},"attendees":[{"email":"new@example.invalid"}]}).to_string();
+        s.apply_outgoing(&c, &replacement, Ok(OutgoingResult::Applied(Some(applied))))
+            .unwrap();
+        s.providers.repository.undo().unwrap();
+        let compensation = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(
+            compensation.meeting.as_ref().unwrap().notifications,
+            NotificationPolicy::None
+        );
+        assert_eq!(
+            compensation.meeting.unwrap().guests.unwrap()[0].email,
+            "guest@example.invalid"
+        );
+    }
+    fn recurring_meeting_fixture() -> (
+        CalendarService,
+        SyncClaim,
+        String,
+        EventSeries,
+        InstanceState,
+    ) {
+        let (s, c, cal, series, state) = recurring_setup(Path::new(":memory:"));
+        let db = &s.providers.repository.db;
+        db.execute(
+            "UPDATE calendars SET provider_id='google' WHERE id=?1",
+            [&cal],
+        )
+        .unwrap();
+        let master = serde_json::json!({"id":"actual-master","etag":"master-r1","summary":"Original","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"},"recurrence":["RRULE:FREQ=DAILY;INTERVAL=2;COUNT=6"],"organizer":{"self":true},"attendees":[{"email":"original@example.invalid"}]});
+        let mut instance = master.clone();
+        instance["id"] = serde_json::json!("provider-moved-id");
+        instance["etag"] = serde_json::json!("instance-r1");
+        instance["recurringEventId"] = serde_json::json!("actual-master");
+        instance["originalStartTime"] = serde_json::json!({"date":"2026-10-03"});
+        instance["start"] = serde_json::json!({"date":"2026-10-07"});
+        instance["end"] = serde_json::json!({"date":"2026-10-08"});
+        instance.as_object_mut().unwrap().remove("recurrence");
+        for (remote, raw) in [
+            ("actual-master", master.to_string()),
+            ("provider-moved-id", instance.to_string()),
+        ] {
+            db.execute(
+                "UPDATE remote_events SET shadow_payload=?2 WHERE remote_id=?1",
+                params![remote, raw],
+            )
+            .unwrap();
+            db.execute("UPDATE incoming_items SET payload=json_set(payload,'$.shadow',?2) WHERE id IN (SELECT id FROM remote_events WHERE remote_id=?1)",params![remote,raw]).unwrap();
+        }
+        state.lock().unwrap().0.shadow = instance.to_string();
+        (s, c, cal, series, state)
+    }
+    #[test]
+    fn meeting_guest_only_existing_occurrence_conflict_replan_and_undo_keep_instance_scope() {
+        let (mut s, c, _, series, state) = recurring_meeting_fixture();
+        let target = format!("{}@2026-10-03", series.event.id);
+        let selected = aika_domain::recurrence::get_occurrence(&series, "2026-10-03").unwrap();
+        let mut request = meeting_request(&s, selected, true, NotificationPolicy::ExternalOnly);
+        request.target = target.clone();
+        request.scope = MutationScope::Occurrence;
+        request.expected_revision = s.meeting_details(&target).unwrap().revision;
+        s.mutate_meeting(request).unwrap();
+        assert_eq!(
+            s.meeting_details(&series.event.id).unwrap().attendees[0].email,
+            "original@example.invalid"
+        );
+        assert_eq!(
+            s.meeting_details(&target).unwrap().attendees[0].email,
+            "guest@example.invalid"
+        );
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(op.original_start.as_deref(), Some("2026-10-03"));
+        assert_eq!(op.remote_id, "provider-moved-id");
+        let mut changed = state.lock().unwrap().0.clone();
+        changed.revision = "instance-r2".into();
+        s.apply_outgoing(&c, &op, Ok(OutgoingResult::Conflict(Some(changed))))
+            .unwrap();
+        let review = s.sync_conflicts().unwrap().remove(0);
+        s.resolve_sync_conflict(review, true).unwrap();
+        let replacement = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(replacement.original_start.as_deref(), Some("2026-10-03"));
+        assert_eq!(
+            replacement.meeting.as_ref().unwrap().notifications,
+            NotificationPolicy::ExternalOnly
+        );
+        let mut applied = state.lock().unwrap().0.clone();
+        applied.revision = "instance-r3".into();
+        let mut instance: serde_json::Value = serde_json::from_str(&applied.shadow).unwrap();
+        instance["attendees"] =
+            serde_json::json!([{"email":"guest@example.invalid","optional":true}]);
+        applied.shadow = instance.to_string();
+        state.lock().unwrap().0 = applied.clone();
+        s.apply_outgoing(&c, &replacement, Ok(OutgoingResult::Applied(Some(applied))))
+            .unwrap();
+        s.providers.repository.undo().unwrap();
+        let compensation = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(compensation.original_start.as_deref(), Some("2026-10-03"));
+        assert_eq!(
+            compensation.meeting.unwrap().guests.unwrap()[0].email,
+            "original@example.invalid"
+        );
+    }
+    #[test]
+    fn v7_meeting_migration_preserves_pending_groups_and_attempts() {
+        let path = std::env::temp_dir().join(format!(
+            "aika-meeting-migration-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let (mut s, c, cal) = setup(&path);
+        s.save(event(&cal), false).unwrap();
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        s.providers
+            .repository
+            .db
+            .execute_batch("ALTER TABLE outbox DROP COLUMN meeting_intent; PRAGMA user_version=7;")
+            .unwrap();
+        drop(s);
+        let mut restarted = open(&path);
+        let resumed = restarted.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(resumed.id, op.id);
+        assert_eq!(resumed.remote_id, op.remote_id);
+        assert!(resumed.recovering);
+        assert_eq!(
+            resumed.meeting.unwrap().notifications,
+            NotificationPolicy::All
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn meeting_following_guests_apply_only_to_tail_and_conference_cancellation_stays_available() {
+        let (mut s, c, _, series, _) = recurring_meeting_fixture();
+        let domain = following_request(&series, "2026-10-03", true);
+        let request = MeetingMutation {
+            expected_revision: s.meeting_details(&domain.target).unwrap().revision,
+            target: domain.target,
+            scope: domain.scope,
+            event: domain.event,
+            expected: Some(series.clone()),
+            reset_exceptions: true,
+            count_changed: false,
+            guests: Some(vec![MeetingGuest {
+                email: "tail@example.invalid".into(),
+                optional: false,
+            }]),
+            notifications: NotificationPolicy::ExternalOnly,
+            acknowledge_silent: false,
+        };
+        let saved = s.mutate_meeting(request.clone()).unwrap();
+        let tail = saved.iter().find(|e| e.id != series.event.id).unwrap();
+        assert_eq!(
+            s.meeting_details(&series.event.id).unwrap().attendees[0].email,
+            "original@example.invalid"
+        );
+        assert_eq!(
+            s.meeting_details(&tail.id).unwrap().attendees[0].email,
+            "tail@example.invalid"
+        );
+        let op = s.claim_outgoing(&c).unwrap().unwrap();
+        assert_eq!(
+            op.meeting.as_ref().unwrap().notifications,
+            NotificationPolicy::ExternalOnly
+        );
+        assert!(op.meeting.as_ref().unwrap().guests.is_none());
+        let (mut s, _, _, series, _) = recurring_meeting_fixture();
+        s.providers.repository.db.execute("UPDATE remote_events SET shadow_payload=json_set(shadow_payload,'$.conferenceData',json(?2)) WHERE id=?1",params![series.event.id,serde_json::json!({"conferenceId":"existing"}).to_string()]).unwrap();
+        let mut request = request;
+        request.target = format!("{}@2026-10-03", series.event.id);
+        request.expected = Some(series.clone());
+        request.expected_revision = s.meeting_details(&request.target).unwrap().revision;
+        request.event = following_request(&series, "2026-10-03", true).event;
+        assert_eq!(
+            s.mutate_meeting(request.clone()).unwrap_err().code,
+            "unsupported"
+        );
+        request.event = None;
+        request.guests = None;
+        s.mutate_meeting(request).unwrap();
+        let count: u32 = s
+            .providers
+            .repository
+            .db
+            .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

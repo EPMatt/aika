@@ -490,7 +490,7 @@ mod tests {
         let mut s = open(&path, fail.clone(), deletes.clone());
         let (_, cal) = calendar(&mut s, "one");
         let event = s.providers.save(event(&cal), false).unwrap();
-        s.providers.repository.db.execute_batch("UPDATE outbox SET attempts=1,state='inFlight'; DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; PRAGMA user_version=6; CREATE TABLE identity_lifecycles(marker TEXT); INSERT INTO identity_lifecycles VALUES('preserve');").unwrap();
+        s.providers.repository.db.execute_batch("UPDATE outbox SET attempts=1,state='inFlight'; ALTER TABLE outbox DROP COLUMN meeting_intent; DROP TRIGGER fence_removing_account; ALTER TABLE accounts DROP COLUMN removal_in_progress; DROP TABLE identity_lifecycles; DROP TABLE lifecycle_clock; PRAGMA user_version=6; CREATE TABLE identity_lifecycles(marker TEXT); INSERT INTO identity_lifecycles VALUES('preserve');").unwrap();
         drop(s);
         assert!(Repository::open(&path).is_err());
         let db = Connection::open(&path).unwrap();

@@ -1575,3 +1575,24 @@ input {
 .sync-summary p {
   margin: 6px 0;
 }
+
+.meeting-details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 0 0 12px;
+  padding: 10px;
+  min-width: 0;
+}
+.meeting-details label {
+  display: block;
+  margin-top: 8px;
+}
+.meeting-details textarea,
+.meeting-details select {
+  display: block;
+  width: 100%;
+}
+.meeting-details p {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

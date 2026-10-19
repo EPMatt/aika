@@ -236,6 +236,19 @@ trait GoogleTransport: Send + Sync {
             "Outgoing event transport unavailable.",
         ))
     }
+    #[allow(clippy::too_many_arguments)]
+    fn event_request_notifying(
+        &self,
+        access: &str,
+        calendar: &str,
+        event: &str,
+        method: &str,
+        body: Option<&serde_json::Value>,
+        revision: Option<&str>,
+        _policy: &NotificationPolicy,
+    ) -> Result<Option<serde_json::Value>> {
+        self.event_request(access, calendar, event, method, body, revision)
+    }
     fn instance_page(
         &self,
         _access: &str,
@@ -336,6 +349,27 @@ impl GoogleTransport for HttpTransport {
         body: Option<&serde_json::Value>,
         revision: Option<&str>,
     ) -> Result<Option<serde_json::Value>> {
+        self.event_request_notifying(
+            access,
+            calendar,
+            event,
+            method,
+            body,
+            revision,
+            &NotificationPolicy::All,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn event_request_notifying(
+        &self,
+        access: &str,
+        calendar: &str,
+        event: &str,
+        method: &str,
+        body: Option<&serde_json::Value>,
+        revision: Option<&str>,
+        policy: &NotificationPolicy,
+    ) -> Result<Option<serde_json::Value>> {
         if event.is_empty() || matches!(event, "." | "..") {
             return Err(error("providerIdentity", "Invalid remote event identity."));
         }
@@ -346,11 +380,17 @@ impl GoogleTransport for HttpTransport {
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| error("unsupported", "Invalid event operation."))?;
         let mut request = client()?.request(method.clone(), url).bearer_auth(access);
+        if method != reqwest::Method::GET {
+            request = request.query(&[("sendUpdates", policy.as_str())]);
+        }
         if let Some(revision) = revision {
             request = request.header(reqwest::header::IF_MATCH, revision);
         }
         if method != reqwest::Method::GET && method != reqwest::Method::DELETE {
-            request = request.query(&[("supportsAttachments", "true")]);
+            request = request.query(&[
+                ("supportsAttachments", "true"),
+                ("conferenceDataVersion", "1"),
+            ]);
             if let Some(body) = body {
                 request = request.json(body);
             }

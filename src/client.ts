@@ -1,3 +1,5 @@
+import type { MeetingDetails } from './generated/MeetingDetails';
+import type { MeetingMutation } from './generated/MeetingMutation';
 import type { AccountRemovalReview } from './generated/AccountRemovalReview';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { DateTime } from 'luxon';
@@ -25,6 +27,9 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
+  meetingDetails: (target: string) => invoke<MeetingDetails>('meeting_details', { target }),
+  mutateMeeting: (request: MeetingMutation) =>
+    mutate<CalendarEvent[]>('mutate_meeting', { request }),
   conflicts: () => invoke<SyncConflict[]>('sync_conflicts'),
   resolveConflict: (expected: SyncConflict, keepLocal: boolean) =>
     mutate<void>('resolve_sync_conflict', { expected, keepLocal }),

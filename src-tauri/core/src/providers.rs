@@ -222,13 +222,14 @@ impl ProviderRegistry {
             let caps = self
                 .capabilities(&event.calendar_id, Some(event))
                 .unwrap_or_else(|_| Capabilities::read_only());
-            let actions = EventActions::for_event(
+            let mut actions = EventActions::for_event(
                 &caps,
                 event.recurrence.is_some() || event.occurrence.is_some(),
                 self.repository
                     .calendar_account(&event.calendar_id)?
                     .is_some(),
             );
+            self.restrict_meeting_actions(&event.id, &mut actions)?;
             snapshot
                 .event_actions
                 .insert(event.id.clone(), actions.clone());
@@ -295,14 +296,33 @@ impl ProviderRegistry {
                     .event_capabilities(target)
                     .unwrap_or_else(|_| Capabilities::read_only()),
             );
-        Ok(EventActions::for_event(
+        let mut actions = EventActions::for_event(
             &caps,
             series.event.recurrence.is_some(),
             self.repository
                 .calendar_account(&series.event.calendar_id)?
                 .is_some(),
-        ))
+        );
+        self.restrict_meeting_actions(target, &mut actions)?;
+        Ok(actions)
     }
+    fn restrict_meeting_actions(&self, target: &str, actions: &mut EventActions) -> Result<()> {
+        let master = target.split_once('@').map_or(target, |(id, _)| id);
+        if crate::meetings::has_conference(&crate::meetings::shadow(&self.repository.db, master)?)
+            || crate::meetings::has_conference(&crate::meetings::shadow(
+                &self.repository.db,
+                target,
+            )?)
+        {
+            for action in &mut actions.edit {
+                if action.scope == MutationScope::Following {
+                    action.disabled_reason = Some("Following edits would copy existing conference data. Create a separate event without a conference.".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn mutate_event(&mut self, request: EventMutation) -> Result<Vec<CalendarEvent>> {
         let series = self.get_series(&request.target)?;
         let actions = self.event_actions(&request.target)?;

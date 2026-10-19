@@ -236,6 +236,12 @@ pub struct SyncConflict {
     #[serde(default)]
     #[ts(optional)]
     pub recovery_steps: Option<Vec<GroupRecoveryStep>>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub meeting_intents: Option<Vec<MeetingIntent>>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub remote_attendees: Option<Vec<MeetingGuest>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -305,4 +311,73 @@ pub struct AccountRemovalReview {
     pub attempted_count: u32,
     pub removal_in_progress: bool,
     pub revision: String,
+}
+
+/// Native meeting data deliberately stays outside the recurrence domain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingGuest {
+    pub email: String,
+    pub optional: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAttendee {
+    pub email: String,
+    pub optional: bool,
+    pub response: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TS)]
+pub enum NotificationPolicy {
+    #[default]
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "externalOnly")]
+    ExternalOnly,
+    #[serde(rename = "none")]
+    None,
+}
+impl NotificationPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ExternalOnly => "externalOnly",
+            Self::None => "none",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetails {
+    pub organizer: Option<String>,
+    pub organizer_owned: bool,
+    pub attendees: Vec<MeetingAttendee>,
+    pub attendees_complete: bool,
+    pub conference_links: Vec<String>,
+    pub revision: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingMutation {
+    pub event: Option<CalendarEvent>,
+    pub expected: Option<EventSeries>,
+    pub target: String,
+    pub scope: MutationScope,
+    pub reset_exceptions: bool,
+    pub count_changed: bool,
+    // None preserves guests; Some replaces the guest list, never their responses.
+    pub guests: Option<Vec<MeetingGuest>>,
+    pub expected_revision: String,
+    pub notifications: NotificationPolicy,
+    pub acknowledge_silent: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingIntent {
+    #[serde(default)]
+    #[ts(optional)]
+    pub original_start: Option<String>,
+    pub before_guests: Option<Vec<MeetingGuest>>,
+    pub guests: Option<Vec<MeetingGuest>>,
+    pub notifications: NotificationPolicy,
 }

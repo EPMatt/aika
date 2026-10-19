@@ -9,6 +9,7 @@ use aika_domain::{instant, iso};
 
 struct HistoryEntry {
     changes: Vec<SeriesChange>,
+    meeting: Option<(String, MutationScope, MeetingIntent)>,
 }
 
 /// Calendar metadata and settings read together, without querying events.
@@ -29,7 +30,7 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 7 {
+        if version > 8 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -77,6 +78,9 @@ impl Repository {
         }
         if version < 7 {
             tx.execute_batch(include_str!("schema_v7.sql"))?;
+        }
+        if version < 8 {
+            tx.execute_batch(include_str!("schema_v8.sql"))?;
         }
         tx.commit()?;
         Ok(Self {
@@ -411,7 +415,11 @@ impl Repository {
             .transpose()?
             .unwrap_or_else(Capabilities::local))
     }
-    fn require_cached_occurrence(db: &Connection, master: &str, original: &str) -> Result<()> {
+    pub(crate) fn require_cached_occurrence(
+        db: &Connection,
+        master: &str,
+        original: &str,
+    ) -> Result<()> {
         let shadow: Option<String> = db.query_row("SELECT child.shadow_payload FROM remote_events parent JOIN calendars c ON c.id=parent.calendar_id JOIN remote_events child ON child.calendar_id=parent.calendar_id AND child.account_id=parent.account_id JOIN incoming_items i ON i.id=child.id WHERE parent.id=?1 AND c.provider_id='google' AND json_extract(i.payload,'$.master')=parent.remote_id AND json_extract(i.payload,'$.original_start')=?2", params![master,original], |r| r.get(0)).optional()?;
         if shadow
             .as_ref()
@@ -494,6 +502,15 @@ impl Repository {
         let Some(account) = account else {
             return Ok(());
         };
+        if expected.is_none()
+            && value.is_some()
+            && crate::meetings::has_conference(&crate::meetings::shadow(db, &change.id)?)
+        {
+            return Err(error(
+                "unsupported",
+                "Recreating this event would copy existing conference data.",
+            ));
+        }
         if let (Some(before), Some(after)) = (expected, value) {
             if before.event != after.event || before.exceptions != after.exceptions {
                 let keys: std::collections::BTreeSet<_> = before
@@ -1093,6 +1110,15 @@ impl Repository {
             .ok_or_else(|| error("notFound", "This event no longer exists."))?;
         let remote = Self::calendar_account_db(&tx, &series.event.calendar_id)?;
         if remote {
+            if request.scope == MutationScope::Following
+                && request.event.is_some()
+                && crate::meetings::has_conference(&crate::meetings::shadow(&tx, id)?)
+            {
+                return Err(error(
+                    "unsupported",
+                    "Following edits would copy existing conference data.",
+                ));
+            }
             if request.scope == MutationScope::Occurrence {
                 if let Some((_, original)) = request.target.split_once('@') {
                     Self::require_cached_occurrence(&tx, id, original)?;
@@ -1161,7 +1187,10 @@ impl Repository {
             .filter_map(|c| c.after.as_ref())
             .map(|s| s.event.clone())
             .collect();
-        self.history.push(HistoryEntry { changes });
+        self.history.push(HistoryEntry {
+            changes,
+            meeting: None,
+        });
         Ok(saved)
     }
     pub(crate) fn write_series(db: &Connection, series: &EventSeries) -> Result<()> {
@@ -1265,7 +1294,7 @@ impl Repository {
     fn apply_changes(db: &Connection, changes: &[SeriesChange], undo: bool) -> Result<()> {
         Self::apply_changes_with_schedule(db, changes, undo, false)
     }
-    fn apply_changes_with_schedule(
+    pub(crate) fn apply_changes_with_schedule(
         db: &Connection,
         changes: &[SeriesChange],
         undo: bool,
@@ -1572,7 +1601,10 @@ impl Repository {
         }];
         Self::apply_changes(&tx, &changes, false)?;
         tx.commit()?;
-        self.history.push(HistoryEntry { changes });
+        self.history.push(HistoryEntry {
+            changes,
+            meeting: None,
+        });
         Ok(event)
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
@@ -1609,8 +1641,23 @@ impl Repository {
         }];
         Self::apply_changes(&tx, &changes, false)?;
         tx.commit()?;
-        self.history.push(HistoryEntry { changes });
+        self.history.push(HistoryEntry {
+            changes,
+            meeting: None,
+        });
         Ok(())
+    }
+    pub(crate) fn remember_meeting(
+        &mut self,
+        changes: Vec<SeriesChange>,
+        target: String,
+        scope: MutationScope,
+        meeting: MeetingIntent,
+    ) {
+        self.history.push(HistoryEntry {
+            changes,
+            meeting: Some((target, scope, meeting)),
+        });
     }
     pub fn undo(&mut self) -> Result<()> {
         self.prune_history()?;
@@ -1620,7 +1667,65 @@ impl Repository {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let watermark: i64 =
+            tx.query_row("SELECT coalesce(max(rowid),0) FROM outbox", [], |r| {
+                r.get(0)
+            })?;
+        if let Some((target, scope, intent)) = &entry.meeting {
+            if let Some(desired) = &intent.guests {
+                for change in entry.changes.iter().filter(|c| {
+                    c.after.is_some() && (*scope != MutationScope::Following || c.before.is_none())
+                }) {
+                    let selector = if *scope == MutationScope::Occurrence {
+                        target.as_str()
+                    } else {
+                        &change.id
+                    };
+                    let current = crate::meetings::details(&tx, selector)?;
+                    if current.attendees.len() != desired.len()
+                        || !desired.iter().all(|g| {
+                            current.attendees.iter().any(|a| {
+                                a.email.eq_ignore_ascii_case(&g.email) && a.optional == g.optional
+                            })
+                        })
+                    {
+                        return Err(error(
+                            "conflict",
+                            "The meeting guests changed. Undo cannot overwrite them.",
+                        ));
+                    }
+                }
+            }
+        }
         Self::apply_changes(&tx, &entry.changes, true)?;
+        if let Some((_, scope, intent)) = &entry.meeting {
+            let reverse = MeetingIntent {
+                original_start: intent.original_start.clone(),
+                before_guests: intent.guests.clone(),
+                guests: if intent.guests.is_some() && *scope != MutationScope::Following {
+                    intent.before_guests.clone()
+                } else {
+                    None
+                },
+                notifications: intent.notifications.clone(),
+            };
+            for change in &entry.changes {
+                if let Some(original) = &reverse.original_start {
+                    let mut q =
+                        tx.prepare("SELECT id FROM outbox WHERE event_id=?1 AND rowid>?2")?;
+                    let operations = q
+                        .query_map(params![change.id, watermark], |r| r.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    for operation in operations {
+                        crate::meetings::bind_occurrence(&tx, &operation, &change.id, original)?;
+                    }
+                }
+                tx.execute(
+                    "UPDATE outbox SET meeting_intent=?2 WHERE event_id=?1 AND rowid>?3",
+                    params![change.id, serde_json::to_string(&reverse)?, watermark],
+                )?;
+            }
+        }
         tx.commit()?;
         self.history.pop();
         Ok(())
@@ -2185,7 +2290,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                7
+                8
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -2525,7 +2630,7 @@ mod recurrence_tests {
                 .db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            7
+            8
         );
         drop(provider);
         std::fs::remove_file(path).unwrap();
@@ -2617,7 +2722,7 @@ mod migration_v4_tests {
                 repo.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                7
+                8
             );
         }
         std::fs::remove_file(path).unwrap();
