@@ -1,0 +1,1378 @@
+//! Google protocol boundary. Credentials and OAuth material never cross IPC or SQLite.
+use crate::contracts::*;
+use crate::credentials::CredentialService;
+use crate::providers::{ConnectedIdentity, Provider};
+use crate::service::error;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use url::Url;
+#[path = "google_events.rs"]
+mod events;
+type Result<T> = std::result::Result<T, ServiceError>;
+const SCOPES: &str = "openid email https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events";
+const TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Clone)]
+struct ClientConfig {
+    id: String,
+    secret: Option<String>,
+}
+impl ClientConfig {
+    fn resolve(
+        runtime_id: Option<&str>,
+        runtime_secret: Option<&str>,
+        embedded_id: Option<&str>,
+        embedded_secret: Option<&str>,
+    ) -> Option<Self> {
+        let value = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let runtime_id = value(runtime_id);
+        let (id, secret) = if let Some(id) = runtime_id {
+            (id, value(runtime_secret))
+        } else {
+            (value(embedded_id)?, value(embedded_secret))
+        };
+        Some(Self { id, secret })
+    }
+    fn environment() -> Option<Self> {
+        Self::resolve(
+            std::env::var("AIKA_GOOGLE_CLIENT_ID").ok().as_deref(),
+            std::env::var("AIKA_GOOGLE_CLIENT_SECRET").ok().as_deref(),
+            option_env!("AIKA_GOOGLE_CLIENT_ID"),
+            option_env!("AIKA_GOOGLE_CLIENT_SECRET"),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Tokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: i64,
+}
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+    token_type: String,
+    scope: Option<String>,
+}
+impl TokenResponse {
+    fn merge(self, previous: Option<Tokens>) -> Result<Tokens> {
+        if !self.token_type.eq_ignore_ascii_case("Bearer")
+            || self.access_token.is_empty()
+            || self.expires_in <= 0
+        {
+            return Err(error(
+                "authenticationRequired",
+                "Google returned invalid credentials. Reconnect the account.",
+            ));
+        }
+        if let Some(scope) = self.scope.as_ref() {
+            let granted: BTreeSet<_> = scope.split_whitespace().collect();
+            if !SCOPES.split_whitespace().all(|s| {
+                granted.contains(s)
+                    || (s == "email"
+                        && granted.contains("https://www.googleapis.com/auth/userinfo.email"))
+            }) {
+                return Err(error(
+                    "permission",
+                    "Grant all requested permissions to connect Google Calendar.",
+                ));
+            }
+        }
+        let refresh_token = self
+            .refresh_token
+            .or_else(|| previous.and_then(|p| p.refresh_token));
+        if refresh_token.as_ref().is_none_or(|v| v.is_empty()) {
+            return Err(error(
+                "authenticationRequired",
+                "Google did not grant offline access. Reconnect and approve access.",
+            ));
+        }
+        Ok(Tokens {
+            access_token: self.access_token,
+            refresh_token,
+            expires_at: chrono::Utc::now()
+                .timestamp()
+                .saturating_add(self.expires_in),
+        })
+    }
+}
+struct Session {
+    public: ConnectionSession,
+    identity: Option<ConnectedIdentity>,
+    started: Instant,
+}
+struct Inner {
+    config: Option<ClientConfig>,
+    sessions: Mutex<BTreeMap<String, Session>>,
+    credentials: CredentialService,
+    // Serializes refresh/credential replacement for this provider without locking the repository.
+    credential_work: Mutex<()>,
+    transport: Arc<dyn GoogleTransport>,
+}
+pub struct GoogleProvider(Arc<Inner>);
+impl Default for GoogleProvider {
+    fn default() -> Self {
+        Self(Arc::new(Inner {
+            config: ClientConfig::environment(),
+            sessions: Mutex::new(BTreeMap::new()),
+            credentials: CredentialService::default(),
+            credential_work: Mutex::new(()),
+            transport: Arc::new(HttpTransport),
+        }))
+    }
+}
+fn client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            error(
+                "network",
+                "Could not initialize a secure Google connection.",
+            )
+        })
+}
+fn decode<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(match status.as_u16() {
+            400 | 401 => error(
+                "authenticationRequired",
+                "Google authorization expired or was rejected. Reconnect the account.",
+            ),
+            410 => error(
+                "cursorExpired",
+                "Google synchronization cursor expired. A full refresh is required.",
+            ),
+            403 => error(
+                "permission",
+                "Google denied access. Check the account permissions.",
+            ),
+            429 | 500..=599 => error("retryable", "Google is temporarily unavailable. Try again."),
+            _ => error("google", "Google could not complete this request."),
+        });
+    }
+    // Limit provider response size; never return parser/network diagnostics containing secrets.
+    serde_json::from_reader(response.take(4 * 1024 * 1024))
+        .map_err(|_| error("google", "Google returned an invalid response."))
+}
+fn network(_: reqwest::Error) -> ServiceError {
+    error(
+        "network",
+        "Could not reach Google. Check your connection and try again.",
+    )
+}
+fn token_request(config: &ClientConfig, mut form: Vec<(&str, String)>) -> Result<TokenResponse> {
+    form.push(("client_id", config.id.clone()));
+    if let Some(secret) = &config.secret {
+        form.push(("client_secret", secret.clone()));
+    }
+    decode(
+        client()?
+            .post("https://oauth2.googleapis.com/token")
+            .form(&form)
+            .send()
+            .map_err(network)?,
+    )
+}
+#[derive(Deserialize)]
+struct Identity {
+    sub: String,
+    email: String,
+    email_verified: bool,
+}
+trait GoogleTransport: Send + Sync {
+    fn browser(&self, url: &Url) -> Result<()>;
+    fn token(&self, config: &ClientConfig, form: Vec<(&str, String)>) -> Result<TokenResponse>;
+    fn identity(&self, access: &str) -> Result<Identity>;
+    fn event_page(
+        &self,
+        _access: &str,
+        _calendar: &str,
+        _cursor: Option<&str>,
+        _page: Option<&str>,
+        _projection: Option<&EventRange>,
+    ) -> Result<events::EventPage> {
+        Err(error("unsupported", "Event transport unavailable."))
+    }
+    fn calendar_page(&self, access: &str, page: Option<&str>) -> Result<CalendarPage>;
+}
+struct HttpTransport;
+impl GoogleTransport for HttpTransport {
+    fn browser(&self, url: &Url) -> Result<()> {
+        open_browser(url)
+    }
+    fn token(&self, config: &ClientConfig, form: Vec<(&str, String)>) -> Result<TokenResponse> {
+        token_request(config, form)
+    }
+    fn identity(&self, access: &str) -> Result<Identity> {
+        decode(
+            client()?
+                .get("https://openidconnect.googleapis.com/v1/userinfo")
+                .bearer_auth(access)
+                .send()
+                .map_err(network)?,
+        )
+    }
+    fn event_page(
+        &self,
+        access: &str,
+        calendar: &str,
+        cursor: Option<&str>,
+        page: Option<&str>,
+        projection: Option<&EventRange>,
+    ) -> Result<events::EventPage> {
+        let url = event_url(calendar)?;
+        let response = client()?
+            .get(url)
+            .bearer_auth(access)
+            .query(&event_query(cursor, page, projection))
+            .send()
+            .map_err(network)?;
+        match response.status().as_u16() {
+            400 => Err(error(
+                "google",
+                "Google rejected the event synchronization request.",
+            )),
+            404 => Err(error(
+                "permission",
+                "This calendar is no longer available. Refresh its account selection.",
+            )),
+            _ => decode(response),
+        }
+    }
+
+    fn calendar_page(&self, access: &str, page: Option<&str>) -> Result<CalendarPage> {
+        let mut request = client()?
+            .get("https://www.googleapis.com/calendar/v3/users/me/calendarList")
+            .bearer_auth(access)
+            .query(&[("showHidden", "true"), ("maxResults", "250")]);
+        if let Some(page) = page {
+            request = request.query(&[("pageToken", page)]);
+        }
+        decode(request.send().map_err(network)?)
+    }
+}
+fn read_tokens(inner: &Inner, subject: &str) -> Result<Option<Tokens>> {
+    inner
+        .credentials
+        .get("google", subject)?
+        .map(|v| {
+            serde_json::from_str(&v).map_err(|_| {
+                error(
+                    "authenticationRequired",
+                    "Stored Google credentials are invalid. Reconnect the account.",
+                )
+            })
+        })
+        .transpose()
+}
+fn store_tokens(inner: &Inner, subject: &str, tokens: &Tokens) -> Result<()> {
+    let value = serde_json::to_string(tokens).map_err(|_| {
+        error(
+            "credentialUnavailable",
+            "Could not save Google credentials.",
+        )
+    })?;
+    inner.credentials.set("google", subject, &value)
+}
+fn random() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+fn authorization(config: &ClientConfig, redirect: &str, state: &str, verifier: &str) -> Url {
+    let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth").expect("fixed URL");
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", config.id.as_str()),
+        ("redirect_uri", redirect),
+        ("response_type", "code"),
+        ("scope", SCOPES),
+        ("state", state),
+        ("code_challenge_method", "S256"),
+        (
+            "code_challenge",
+            &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+        ),
+        ("access_type", "offline"),
+        ("prompt", "consent"),
+    ]);
+    url
+}
+fn open_browser(url: &Url) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    let mut child = cmd
+        .arg(url.as_str())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            error(
+                "browser",
+                "Could not open the system browser. Check the default browser and try again.",
+            )
+        })?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+// Only a complete, matching callback consumes the listener. Malformed/wrong-state probes do not.
+fn callback(request: &str, state: &str, port: u16) -> Result<Option<String>> {
+    let mut line = request.lines().next().unwrap_or("").split_whitespace();
+    if line.next() != Some("GET") {
+        return Ok(None);
+    }
+    let Some(target) = line.next() else {
+        return Ok(None);
+    };
+    if !target.starts_with("/oauth2callback?") {
+        return Ok(None);
+    }
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1:{port}{target}")) else {
+        return Ok(None);
+    };
+    let pairs: Vec<_> = url.query_pairs().collect();
+    if pairs.iter().filter(|(k, _)| k == "state").count() != 1
+        || !pairs.iter().any(|(k, v)| k == "state" && v == state)
+    {
+        return Ok(None);
+    }
+    if pairs.iter().any(|(k, _)| k == "error") {
+        return Err(error(
+            "authorizationDenied",
+            "Google authorization was denied. You can try again.",
+        ));
+    }
+    if pairs.iter().filter(|(k, _)| k == "code").count() != 1 {
+        return Ok(None);
+    }
+    Ok(pairs
+        .iter()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.to_string())
+        .filter(|v| !v.is_empty()))
+}
+fn waiting(inner: &Inner, id: &str) -> bool {
+    let mut sessions = inner.sessions.lock().unwrap();
+    let Some(s) = sessions.get_mut(id) else {
+        return false;
+    };
+    if s.public.progress == ConnectionProgress::WaitingForBrowser && s.started.elapsed() >= TIMEOUT
+    {
+        s.public.progress = ConnectionProgress::TimedOut;
+        s.public.failure = Some(error("timeout", "Google connection timed out. Try again."));
+    }
+    s.public.progress == ConnectionProgress::WaitingForBrowser
+}
+fn run_connection(
+    inner: &Inner,
+    id: &str,
+    listener: TcpListener,
+    state: String,
+    verifier: String,
+) -> Result<ConnectedIdentity> {
+    let config = inner
+        .config
+        .as_ref()
+        .ok_or_else(|| error("configuration", "Google client configuration is missing."))?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| error("callback", "Could not initialize the callback."))?
+        .port();
+    let redirect = format!("http://127.0.0.1:{port}/oauth2callback");
+    inner
+        .transport
+        .browser(&authorization(config, &redirect, &state, &verifier))?;
+    let code = loop {
+        if !waiting(inner, id) {
+            return Err(error("cancelled", "Google connection stopped."));
+        }
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(Duration::from_millis(250)))
+                    .ok();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while request.len() < 8192 && !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    continue;
+                }
+                let result = callback(&String::from_utf8_lossy(&request), &state, port);
+                let message = if matches!(result, Ok(Some(_)) | Err(_)) {
+                    "Authorization received. Return to aika."
+                } else {
+                    "Invalid callback. Return to your authorization browser tab."
+                };
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", message.len(), message);
+                let _ = stream.write_all(reply.as_bytes());
+                if let Some(code) = result? {
+                    break code;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(40))
+            }
+            Err(_) => return Err(error("callback", "Could not receive Google authorization.")),
+        }
+    };
+    drop(listener); // one use, closed before exchanging the code
+    let response = inner.transport.token(
+        config,
+        vec![
+            ("grant_type", "authorization_code".into()),
+            ("code", code),
+            ("redirect_uri", redirect),
+            ("code_verifier", verifier),
+        ],
+    )?;
+    // Authenticated Google UserInfo over verified TLS, rather than trusting decoded JWT claims.
+    if response.scope.is_none() {
+        return Err(error(
+            "permission",
+            "Google did not confirm the requested permissions. Reconnect the account.",
+        ));
+    }
+    let identity = inner.transport.identity(&response.access_token)?;
+    if identity.sub.is_empty()
+        || identity.sub.len() > 256
+        || identity.email.is_empty()
+        || !identity.email_verified
+    {
+        return Err(error(
+            "identity",
+            "Google did not provide a verified account identity.",
+        ));
+    }
+    if !waiting(inner, id) {
+        return Err(error("cancelled", "Google connection stopped."));
+    }
+    let _credentials = inner.credential_work.lock().unwrap();
+    let tokens = response.merge(read_tokens(inner, &identity.sub)?)?;
+    let mut sessions = inner.sessions.lock().unwrap();
+    let session = sessions
+        .get_mut(id)
+        .ok_or_else(|| error("cancelled", "Google connection stopped."))?;
+    if session.public.progress != ConnectionProgress::WaitingForBrowser
+        || session.started.elapsed() >= TIMEOUT
+    {
+        return Err(error("cancelled", "Google connection stopped."));
+    }
+    store_tokens(inner, &identity.sub, &tokens)?;
+    let identity = ConnectedIdentity {
+        subject: identity.sub,
+        display_name: identity.email,
+    };
+    session.identity = Some(identity.clone());
+    session.public.progress = ConnectionProgress::Connected;
+    Ok(identity)
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarPage {
+    #[serde(default)]
+    items: Vec<CalendarEntry>,
+    next_page_token: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarEntry {
+    id: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    description: String,
+    background_color: Option<String>,
+    #[serde(default)]
+    access_role: String,
+    #[serde(default)]
+    deleted: bool,
+}
+impl CalendarEntry {
+    fn normalized(self) -> Result<DiscoveredCalendar> {
+        if self.id.is_empty() {
+            return Err(error(
+                "google",
+                "Google returned a calendar without an identity.",
+            ));
+        }
+        let eligible = !self.deleted
+            && matches!(
+                self.access_role.as_str(),
+                "reader" | "writer" | "writerWithoutPrivateAccess" | "owner"
+            );
+        let disabled_reason = if self.deleted {
+            Some("This calendar is no longer available.".into())
+        } else if self.access_role == "freeBusyReader" {
+            Some("Only free/busy access is available; event details cannot be imported.".into())
+        } else if !eligible {
+            Some("Event read access is unavailable.".into())
+        } else {
+            None
+        };
+        let color = self
+            .background_color
+            .filter(|c| {
+                c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .unwrap_or("#718675".into());
+        Ok(DiscoveredCalendar {
+            name: if self.summary.is_empty() {
+                self.id.clone()
+            } else {
+                self.summary
+            },
+            remote_id: self.id,
+            color,
+            description: self.description,
+            access_role: self.access_role,
+            eligible,
+            disabled_reason,
+            selected: eligible,
+        })
+    }
+}
+fn pages(
+    mut fetch: impl FnMut(Option<&str>) -> Result<CalendarPage>,
+) -> Result<Vec<DiscoveredCalendar>> {
+    let mut token: Option<String> = None;
+    let mut seen = BTreeSet::new();
+    let mut calendars = BTreeMap::new();
+    loop {
+        let page = fetch(token.as_deref())?;
+        for entry in page.items {
+            let entry = entry.normalized()?;
+            if calendars.insert(entry.remote_id.clone(), entry).is_some() {
+                return Err(error(
+                    "google",
+                    "Google returned duplicate calendar identities. Retry discovery.",
+                ));
+            }
+        }
+        match page.next_page_token.filter(|t| !t.is_empty()) {
+            None => return Ok(calendars.into_values().collect()),
+            Some(next) if seen.insert(next.clone()) && seen.len() <= 1000 => token = Some(next),
+            Some(_) => {
+                return Err(error(
+                    "google",
+                    "Google returned invalid discovery pagination. Retry discovery.",
+                ))
+            }
+        }
+    }
+}
+impl Provider for GoogleProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "google".into(),
+            name: "Google Calendar".into(),
+            connection_available: self.0.config.is_some(),
+            unavailable_reason: self.0.config.is_none().then(|| {
+                "Google connection requires AIKA_GOOGLE_CLIENT_ID desktop client configuration at build time or when launching aika."
+                    .into()
+            }),
+            capabilities: self.capabilities(),
+        }
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::read_only()
+    }
+    fn start_connection(&self) -> Result<ConnectionSession> {
+        if self.0.config.is_none() {
+            return Err(error(
+                "configuration",
+                "Google desktop client configuration is missing.",
+            ));
+        }
+        // Probe the store before launching; an unavailable store cannot fall back to memory/SQLite.
+        self.0.credentials.get("google", "connection-store-probe")?;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|_| error("callback", "Could not create a loopback callback listener."))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| error("callback", "Could not initialize the callback listener."))?;
+        let public = ConnectionSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            progress: ConnectionProgress::WaitingForBrowser,
+            account_id: None,
+            failure: None,
+        };
+        let mut sessions = self.0.sessions.lock().unwrap();
+        sessions.retain(|_, s| s.started.elapsed() < Duration::from_secs(600));
+        if sessions.len() >= 32 {
+            return Err(error(
+                "connectionBusy",
+                "Too many recent connection attempts. Wait a few minutes before retrying.",
+            ));
+        }
+        if sessions
+            .values()
+            .any(|s| s.public.progress == ConnectionProgress::WaitingForBrowser)
+        {
+            return Err(error(
+                "connectionBusy",
+                "Finish or cancel the current Google connection first.",
+            ));
+        }
+        sessions.insert(
+            public.id.clone(),
+            Session {
+                public: public.clone(),
+                identity: None,
+                started: Instant::now(),
+            },
+        );
+        drop(sessions);
+        let inner = self.0.clone();
+        let id = public.id.clone();
+        std::thread::spawn(move || {
+            let result = run_connection(&inner, &id, listener, random(), random());
+            waiting(&inner, &id);
+            let mut sessions = inner.sessions.lock().unwrap();
+            if let Some(session) = sessions.get_mut(&id) {
+                if session.public.progress == ConnectionProgress::WaitingForBrowser {
+                    match result {
+                        Ok(identity) => {
+                            session.identity = Some(identity);
+                            session.public.progress = ConnectionProgress::Connected;
+                        }
+                        Err(e) => {
+                            session.public.failure = Some(e);
+                            session.public.progress = ConnectionProgress::Failed;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(public)
+    }
+    fn connection(&self, id: &str) -> Result<(ConnectionSession, Option<ConnectedIdentity>)> {
+        waiting(&self.0, id);
+        let sessions = self.0.sessions.lock().unwrap();
+        let s = sessions
+            .get(id)
+            .ok_or_else(|| error("notFound", "Connection session expired. Start again."))?;
+        if s.started.elapsed() >= Duration::from_secs(600) {
+            return Err(error(
+                "notFound",
+                "Connection session expired. Start again.",
+            ));
+        }
+        Ok((s.public.clone(), s.identity.clone()))
+    }
+    fn cancel_connection(&self, id: &str) -> Result<()> {
+        let mut sessions = self.0.sessions.lock().unwrap();
+        let s = sessions
+            .get_mut(id)
+            .ok_or_else(|| error("notFound", "Connection session expired."))?;
+        if s.public.progress == ConnectionProgress::WaitingForBrowser {
+            s.public.progress = ConnectionProgress::Cancelled;
+        }
+        Ok(())
+    }
+    fn discover(&self, subject: &str) -> Result<Vec<DiscoveredCalendar>> {
+        let access = self.access(subject)?;
+        pages(|page| self.0.transport.calendar_page(&access, page))
+    }
+    fn discover_for_sync(
+        &self,
+        subject: &str,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<DiscoveredCalendar>> {
+        checkpoint()?;
+        let access = self.access(subject)?;
+        pages(|page| {
+            checkpoint()?;
+            self.0.transport.calendar_page(&access, page)
+        })
+    }
+    fn incoming_page(
+        &self,
+        subject: &str,
+        calendar: &str,
+        cursor: Option<&str>,
+        page: Option<&str>,
+        projection: Option<&EventRange>,
+    ) -> Result<crate::sync::IncomingPage> {
+        let access = self.access(subject)?;
+        events::normalized(
+            self.0
+                .transport
+                .event_page(&access, calendar, cursor, page, projection)?,
+        )
+    }
+    fn disconnect(&self, subject: &str) -> Result<()> {
+        let _guard = self.0.credential_work.lock().unwrap();
+        self.0.credentials.delete("google", subject)
+    }
+}
+
+fn event_query(
+    cursor: Option<&str>,
+    page: Option<&str>,
+    projection: Option<&EventRange>,
+) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("showDeleted".into(), "true".into()),
+        ("showHiddenInvitations".into(), "true".into()),
+        ("maxResults".into(), "2500".into()),
+        (
+            "singleEvents".into(),
+            if projection.is_some() {
+                "true"
+            } else {
+                "false"
+            }
+            .into(),
+        ),
+    ];
+    if let Some(range) = projection {
+        query.push(("timeMin".into(), range.start.clone()));
+        query.push(("timeMax".into(), range.end.clone()));
+    } else if let Some(cursor) = cursor {
+        query.push(("syncToken".into(), cursor.into()));
+    }
+    if let Some(page) = page {
+        query.push(("pageToken".into(), page.into()));
+    }
+    query
+}
+
+fn event_url(calendar: &str) -> Result<Url> {
+    if calendar.is_empty() || matches!(calendar, "." | "..") {
+        return Err(error(
+            "providerIdentity",
+            "Missing remote calendar identity.",
+        ));
+    }
+    let mut url =
+        Url::parse("https://www.googleapis.com/calendar/v3/calendars/").expect("fixed URL");
+    url.path_segments_mut()
+        .expect("fixed URL")
+        .pop_if_empty()
+        .push(calendar)
+        .push("events");
+    Ok(url)
+}
+impl GoogleProvider {
+    fn access(&self, subject: &str) -> Result<String> {
+        let _guard = self.0.credential_work.lock().unwrap();
+        let config = self.0.config.as_ref().ok_or_else(|| {
+            error(
+                "configuration",
+                "Google desktop client configuration is missing.",
+            )
+        })?;
+        let mut tokens = read_tokens(&self.0, subject)?
+            .ok_or_else(|| error("authenticationRequired", "Reconnect this Google account."))?;
+        if tokens.expires_at <= chrono::Utc::now().timestamp() + 60 {
+            let response = self.0.transport.token(
+                config,
+                vec![
+                    ("grant_type", "refresh_token".into()),
+                    (
+                        "refresh_token",
+                        tokens.refresh_token.clone().ok_or_else(|| {
+                            error("authenticationRequired", "Reconnect this Google account.")
+                        })?,
+                    ),
+                ],
+            )?;
+            tokens = response.merge(Some(tokens))?;
+            store_tokens(&self.0, subject, &tokens)?;
+        }
+        Ok(tokens.access_token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::CredentialStore;
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[test]
+    fn client_configuration_resolves_complete_pairs_without_mixing_sources() {
+        type Pair<'a> = (Option<&'a str>, Option<&'a str>);
+        let cases: [(Pair<'_>, Pair<'_>, Option<Pair<'_>>); 9] = [
+            ((None, None), (None, None), None),
+            (
+                (None, None),
+                (Some("embedded"), Some("embedded-secret")),
+                Some((Some("embedded"), Some("embedded-secret"))),
+            ),
+            (
+                (Some("runtime"), Some("runtime-secret")),
+                (None, None),
+                Some((Some("runtime"), Some("runtime-secret"))),
+            ),
+            (
+                (Some("runtime"), Some("runtime-secret")),
+                (Some("embedded"), Some("embedded-secret")),
+                Some((Some("runtime"), Some("runtime-secret"))),
+            ),
+            (
+                (Some("runtime"), None),
+                (Some("embedded"), Some("embedded-secret")),
+                Some((Some("runtime"), None)),
+            ),
+            (
+                (None, Some("orphan")),
+                (Some("embedded"), Some("embedded-secret")),
+                Some((Some("embedded"), Some("embedded-secret"))),
+            ),
+            (
+                (Some("  "), Some("orphan")),
+                (Some(" embedded "), Some("  ")),
+                Some((Some("embedded"), None)),
+            ),
+            ((None, None), (Some("  "), Some("orphan")), None),
+            (
+                (Some(" runtime "), Some("  ")),
+                (Some("embedded"), Some("embedded-secret")),
+                Some((Some("runtime"), None)),
+            ),
+        ];
+        for ((runtime_id, runtime_secret), (embedded_id, embedded_secret), expected) in cases {
+            let actual =
+                ClientConfig::resolve(runtime_id, runtime_secret, embedded_id, embedded_secret);
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|c| (Some(c.id.as_str()), c.secret.as_deref())),
+                expected
+            );
+        }
+    }
+    #[test]
+    #[ignore = "run via pnpm test:google-config with fictional build settings"]
+    fn embedded_google_configuration_smoke() {
+        let expected_id =
+            std::env::var("AIKA_TEST_EXPECT_GOOGLE_ID").expect("smoke runner required");
+        let expected_secret =
+            std::env::var("AIKA_TEST_EXPECT_GOOGLE_SECRET").expect("smoke runner required");
+        let provider = GoogleProvider::default();
+        assert_eq!(
+            provider.descriptor().connection_available,
+            !expected_id.is_empty()
+        );
+        match &provider.0.config {
+            Some(config) => {
+                assert_eq!(config.id, expected_id);
+                assert_eq!(config.secret.as_deref().unwrap_or(""), expected_secret);
+            }
+            None => assert!(expected_id.is_empty()),
+        }
+    }
+    #[derive(Default)]
+    struct Store {
+        values: Mutex<BTreeMap<String, String>>,
+        locked: AtomicBool,
+        fail_write: AtomicBool,
+    }
+    impl CredentialStore for Arc<Store> {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            if self.locked.load(Ordering::SeqCst) {
+                return Err(error(
+                    "credentialUnavailable",
+                    "Unlock the credential store.",
+                ));
+            }
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+        fn set(&self, key: &str, value: &str) -> Result<()> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Err(error(
+                    "credentialUnavailable",
+                    "Unlock the credential store.",
+                ));
+            }
+            self.values.lock().unwrap().insert(key.into(), value.into());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    struct Transport {
+        url: Mutex<Option<Url>>,
+        exchanges: AtomicUsize,
+        refreshes: AtomicUsize,
+        fail_refresh: AtomicBool,
+        fail_page: AtomicBool,
+    }
+    impl GoogleTransport for Transport {
+        fn browser(&self, url: &Url) -> Result<()> {
+            *self.url.lock().unwrap() = Some(url.clone());
+            Ok(())
+        }
+        fn token(&self, _: &ClientConfig, form: Vec<(&str, String)>) -> Result<TokenResponse> {
+            if form
+                .iter()
+                .any(|(k, v)| *k == "grant_type" && v == "refresh_token")
+            {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
+                if self.fail_refresh.load(Ordering::SeqCst) {
+                    return Err(error("authenticationRequired", "Reconnect the account."));
+                }
+                return Ok(TokenResponse {
+                    access_token: "renewed-disposable-access".into(),
+                    refresh_token: None,
+                    expires_in: 3600,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                });
+            }
+            self.exchanges.fetch_add(1, Ordering::SeqCst);
+            let url = self.url.lock().unwrap().clone().unwrap();
+            let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+            let verifier = &form.iter().find(|(k, _)| *k == "code_verifier").unwrap().1;
+            assert_eq!(
+                query["code_challenge"],
+                URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+            );
+            assert_eq!(
+                query["redirect_uri"],
+                form.iter().find(|(k, _)| *k == "redirect_uri").unwrap().1
+            );
+            assert_eq!(query["code_challenge_method"], "S256");
+            assert_eq!(query["access_type"], "offline");
+            assert_eq!(query["scope"], SCOPES);
+            Ok(TokenResponse {
+                access_token: "disposable-access".into(),
+                refresh_token: Some("disposable-refresh".into()),
+                expires_in: 3600,
+                token_type: "Bearer".into(),
+                scope: Some(SCOPES.into()),
+            })
+        }
+        fn identity(&self, _: &str) -> Result<Identity> {
+            Ok(Identity {
+                sub: "fictional-subject".into(),
+                email: "test@example.invalid".into(),
+                email_verified: true,
+            })
+        }
+        fn calendar_page(&self, _: &str, page: Option<&str>) -> Result<CalendarPage> {
+            if self.fail_page.load(Ordering::SeqCst) {
+                return Err(error("network", "Try discovery again."));
+            }
+            Ok(CalendarPage {
+                items: vec![entry(if page.is_none() { "one" } else { "two" }, "reader")],
+                next_page_token: page.is_none().then(|| "next".into()),
+            })
+        }
+    }
+    fn entry(id: &str, role: &str) -> CalendarEntry {
+        CalendarEntry {
+            id: id.into(),
+            summary: id.into(),
+            description: "".into(),
+            background_color: Some("#123456".into()),
+            access_role: role.into(),
+            deleted: false,
+        }
+    }
+    #[test]
+    fn calendar_reconciliation_checkpoints_each_page_and_stops_superseded_work() {
+        let (p, _, _) = fixture();
+        store_tokens(
+            &p.0,
+            "fictional-subject",
+            &Tokens {
+                access_token: "disposable".into(),
+                refresh_token: Some("disposable".into()),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+            },
+        )
+        .unwrap();
+        let mut checkpoints = 0;
+        assert_eq!(
+            p.discover_for_sync("fictional-subject", &mut || {
+                checkpoints += 1;
+                Ok(())
+            })
+            .unwrap()
+            .len(),
+            2
+        );
+        assert_eq!(checkpoints, 3);
+        let mut checkpoints = 0;
+        assert_eq!(
+            p.discover_for_sync("fictional-subject", &mut || {
+                checkpoints += 1;
+                if checkpoints == 3 {
+                    Err(error("syncSuperseded", "Selection changed."))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err()
+            .code,
+            "syncSuperseded"
+        );
+    }
+    #[test]
+    fn event_feed_parameters_stay_stable_and_projection_has_no_cursor() {
+        let initial = event_query(None, None, None)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut incremental = event_query(Some("cursor"), Some("page"), None)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(incremental.remove("syncToken").as_deref(), Some("cursor"));
+        assert_eq!(incremental.remove("pageToken").as_deref(), Some("page"));
+        assert_eq!(initial, incremental);
+        assert_eq!(initial["singleEvents"], "false");
+        assert_eq!(initial["showDeleted"], "true");
+        assert!(!initial.contains_key("timeMin"));
+        let range = EventRange {
+            start: "2026-01-01T00:00:00Z".into(),
+            end: "2029-01-01T00:00:00Z".into(),
+            start_date: "2026-01-01".into(),
+            end_date: "2029-01-01".into(),
+        };
+        let projection = event_query(Some("cursor"), None, Some(&range))
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert!(!projection.contains_key("syncToken"));
+        assert_eq!(projection["singleEvents"], "true");
+        assert_eq!(projection["timeMin"], range.start);
+        let url = event_url("account/#?@example.invalid").unwrap();
+        assert_eq!(url.host_str(), Some("www.googleapis.com"));
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+        assert_eq!(
+            url.path(),
+            "/calendar/v3/calendars/account%2F%23%3F@example.invalid/events"
+        );
+        assert!(event_url("..").is_err());
+    }
+    fn fixture() -> (GoogleProvider, Arc<Transport>, Arc<Store>) {
+        let transport = Arc::<Transport>::default();
+        let store = Arc::<Store>::default();
+        let provider = GoogleProvider(Arc::new(Inner {
+            config: Some(ClientConfig {
+                id: "fictional-client".into(),
+                secret: None,
+            }),
+            sessions: Mutex::new(BTreeMap::new()),
+            credentials: CredentialService::testing(Box::new(store.clone())),
+            credential_work: Mutex::new(()),
+            transport: transport.clone(),
+        }));
+        (provider, transport, store)
+    }
+    fn browser_url(t: &Transport) -> Url {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(url) = t.url.lock().unwrap().clone() {
+                return url;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn send(t: &Transport, query: &str) -> u16 {
+        let url = browser_url(t);
+        let pairs: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        let redirect = Url::parse(&pairs["redirect_uri"]).unwrap();
+        let port = redirect.port().unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let request = format!(
+            "GET {}?state={}&{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            redirect.path(),
+            pairs["state"],
+            query,
+            port
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(!response.contains("disposable"));
+        port
+    }
+    fn finished(p: &GoogleProvider, id: &str) -> (ConnectionSession, Option<ConnectedIdentity>) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let value = p.connection(id).unwrap();
+            if value.0.progress != ConnectionProgress::WaitingForBrowser {
+                return value;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn closed(port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn native_loopback_pkce_identity_secure_store_discovery_and_refresh() {
+        let (p, t, store) = fixture();
+        let s = p.start_connection().unwrap();
+        assert!(p.start_connection().is_err());
+        let port = send(&t, "code=disposable-code");
+        let (session, identity) = finished(&p, &s.id);
+        closed(port);
+        assert_eq!(session.progress, ConnectionProgress::Connected);
+        assert_eq!(identity.unwrap().subject, "fictional-subject");
+        assert_eq!(p.discover("fictional-subject").unwrap().len(), 2);
+        let mut tokens = read_tokens(&p.0, "fictional-subject").unwrap().unwrap();
+        tokens.expires_at = 0;
+        store_tokens(&p.0, "fictional-subject", &tokens).unwrap();
+        assert_eq!(p.discover("fictional-subject").unwrap().len(), 2);
+        assert_eq!(
+            read_tokens(&p.0, "fictional-subject")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("disposable-refresh")
+        );
+        assert_eq!(t.refreshes.load(Ordering::SeqCst), 1);
+        t.fail_page.store(true, Ordering::SeqCst);
+        assert_eq!(p.discover("fictional-subject").unwrap_err().code, "network");
+        t.fail_page.store(false, Ordering::SeqCst);
+        let mut tokens = read_tokens(&p.0, "fictional-subject").unwrap().unwrap();
+        tokens.expires_at = 0;
+        store_tokens(&p.0, "fictional-subject", &tokens).unwrap();
+        t.fail_refresh.store(true, Ordering::SeqCst);
+        assert_eq!(
+            p.discover("fictional-subject").unwrap_err().code,
+            "authenticationRequired"
+        );
+        assert!(read_tokens(&p.0, "fictional-subject").unwrap().is_some());
+        p.disconnect("fictional-subject").unwrap();
+        assert!(store.values.lock().unwrap().is_empty());
+        let serialized = serde_json::to_string(&session).unwrap();
+        for secret in [
+            "disposable-access",
+            "disposable-refresh",
+            "disposable-code",
+            "code_verifier",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+    #[test]
+    fn denial_cancellation_timeout_and_store_failures_close_listener_without_identity() {
+        for outcome in ["denied", "cancelled", "timeout", "store"] {
+            let (p, t, store) = fixture();
+            let s = p.start_connection().unwrap();
+            let url = browser_url(&t);
+            let pairs: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+            let port = Url::parse(&pairs["redirect_uri"]).unwrap().port().unwrap();
+            match outcome {
+                "denied" => {
+                    send(&t, "error=access_denied");
+                }
+                "cancelled" => p.cancel_connection(&s.id).unwrap(),
+                "timeout" => {
+                    p.0.sessions.lock().unwrap().get_mut(&s.id).unwrap().started =
+                        Instant::now() - TIMEOUT;
+                }
+                "store" => {
+                    store.fail_write.store(true, Ordering::SeqCst);
+                    send(&t, "code=disposable-code");
+                }
+                _ => unreachable!(),
+            }
+            let (session, identity) = finished(&p, &s.id);
+            closed(port);
+            assert!(identity.is_none());
+            assert!(store.values.lock().unwrap().is_empty());
+            assert_eq!(
+                session.progress,
+                match outcome {
+                    "cancelled" => ConnectionProgress::Cancelled,
+                    "timeout" => ConnectionProgress::TimedOut,
+                    _ => ConnectionProgress::Failed,
+                }
+            );
+        }
+        let (p, t, store) = fixture();
+        store.locked.store(true, Ordering::SeqCst);
+        assert_eq!(
+            p.start_connection().unwrap_err().code,
+            "credentialUnavailable"
+        );
+        assert!(t.url.lock().unwrap().is_none());
+        store.locked.store(false, Ordering::SeqCst);
+        let retry = p.start_connection().unwrap();
+        let port = send(&t, "code=disposable-code");
+        assert_eq!(
+            finished(&p, &retry.id).0.progress,
+            ConnectionProgress::Connected
+        );
+        closed(port);
+        assert!(read_tokens(&p.0, "fictional-subject").unwrap().is_some());
+        p.0.sessions
+            .lock()
+            .unwrap()
+            .get_mut(&retry.id)
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(601);
+        assert!(p.connection(&retry.id).is_err());
+    }
+    #[test]
+    fn invalid_state_does_not_consume_callback_and_fresh_sessions_have_fresh_pkce() {
+        let (p, t, _) = fixture();
+        let s = p.start_connection().unwrap();
+        let first = browser_url(&t);
+        let query: BTreeMap<_, _> = first.query_pairs().into_owned().collect();
+        let redirect = Url::parse(&query["redirect_uri"]).unwrap();
+        let mut socket = TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
+        socket
+            .write_all(
+                b"GET /oauth2callback?state=invalid&code=bad HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .unwrap();
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply).unwrap();
+        assert_eq!(
+            p.connection(&s.id).unwrap().0.progress,
+            ConnectionProgress::WaitingForBrowser
+        );
+        assert_eq!(t.exchanges.load(Ordering::SeqCst), 0);
+        let port = send(&t, "code=disposable-code");
+        finished(&p, &s.id);
+        closed(port);
+        *t.url.lock().unwrap() = None;
+        let next = p.start_connection().unwrap();
+        let next_url = browser_url(&t);
+        let next_query: BTreeMap<_, _> = next_url.query_pairs().into_owned().collect();
+        assert_ne!(query["state"], next_query["state"]);
+        assert_ne!(query["code_challenge"], next_query["code_challenge"]);
+        p.cancel_connection(&next.id).unwrap();
+    }
+    #[test]
+    fn grant_validation_accepts_email_alias_and_rejects_missing_calendar_permission() {
+        let response = |scope: String| TokenResponse {
+            access_token: "disposable".into(),
+            refresh_token: Some("disposable".into()),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            scope: Some(scope),
+        };
+        assert!(response(SCOPES.replace(
+            "openid email",
+            "openid https://www.googleapis.com/auth/userinfo.email"
+        ))
+        .merge(None)
+        .is_ok());
+        assert_eq!(
+            response("openid email".into())
+                .merge(None)
+                .err()
+                .unwrap()
+                .code,
+            "permission"
+        );
+    }
+    #[test]
+    fn pagination_hidden_ineligible_entries_repeated_pages_and_partial_failure() {
+        let mut calls = 0;
+        let result = pages(|token| {
+            calls += 1;
+            if token.is_none() {
+                Ok(CalendarPage {
+                    items: vec![entry("hidden", "owner"), entry("busy", "freeBusyReader")],
+                    next_page_token: Some("page2".into()),
+                })
+            } else {
+                Ok(CalendarPage {
+                    items: vec![entry("no-access", "none")],
+                    next_page_token: None,
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result.len(), 3);
+        assert!(
+            result
+                .iter()
+                .find(|c| c.remote_id == "hidden")
+                .unwrap()
+                .selected
+        );
+        assert!(result
+            .iter()
+            .filter(|c| !c.eligible)
+            .all(|c| !c.selected && c.disabled_reason.is_some()));
+        assert!(pages(|_| Ok(CalendarPage {
+            items: vec![],
+            next_page_token: Some("same".into())
+        }))
+        .is_err());
+        assert!(pages(|page| if page.is_some() {
+            Err(error("network", "Try again."))
+        } else {
+            Ok(CalendarPage {
+                items: vec![entry("one", "reader")],
+                next_page_token: Some("next".into()),
+            })
+        })
+        .is_err());
+        assert!(callback(
+            "GET /oauth2callback?state=s&state=s&code=c HTTP/1.1\r\n",
+            "s",
+            1
+        )
+        .unwrap()
+        .is_none());
+        assert!(callback("GET /wrong?state=s&code=c HTTP/1.1\r\n", "s", 1)
+            .unwrap()
+            .is_none());
+    }
+}

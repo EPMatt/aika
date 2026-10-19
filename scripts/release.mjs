@@ -15,13 +15,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installerArtifacts, targets } from './alpha.mjs';
+import { projectEnvironment } from './environment.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-function run(command, args, cwd = root, capture = false) {
+function run(command, args, cwd = root, capture = false, env = process.env) {
   const result = spawnSync(command, args, {
     cwd,
+    env,
     encoding: 'utf8',
     stdio: capture ? 'pipe' : 'inherit',
   });
@@ -30,7 +32,8 @@ function run(command, args, cwd = root, capture = false) {
   return result.stdout?.trim();
 }
 const git = (args, cwd = root) => run('git', args, cwd, true);
-const tool = (...args) => run(process.execPath, [join(root, 'scripts/tool.mjs'), ...args]);
+const tool = (env, ...args) =>
+  run(process.execPath, [join(root, 'scripts/tool.mjs'), ...args], root, false, env);
 
 export function tagVersion(tag) {
   if (!/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(tag))
@@ -128,13 +131,14 @@ export async function verifyAssets(directory, { version, revision }) {
 }
 
 async function build(tag, target) {
+  const env = projectEnvironment(root);
   const release = await validate(tag);
   if (git(['status', '--porcelain', '--untracked-files=no']))
     throw new Error('Release builds require a clean tracked checkout');
   const spec = targets[target];
   if (!spec || spec.platform !== process.platform)
     throw new Error('Release builds require a supported native OS target');
-  if (process.env.CARGO_TARGET_DIR || process.env.CARGO_BUILD_TARGET)
+  if (env.CARGO_TARGET_DIR || env.CARGO_BUILD_TARGET)
     throw new Error('Unset Cargo target directory/target overrides for release builds');
   const output = join(root, 'artifacts', `release-${target}`);
   try {
@@ -144,6 +148,7 @@ async function build(tag, target) {
     if (error.code !== 'ENOENT') throw error;
   }
   tool(
+    env,
     'cargo',
     'build',
     '--manifest-path',
@@ -164,6 +169,7 @@ async function build(tag, target) {
   const bundle = join(root, `src-tauri/target/${target}/release/bundle`);
   await rm(bundle, { recursive: true, force: true });
   tool(
+    env,
     'tauri',
     'build',
     '--ci',

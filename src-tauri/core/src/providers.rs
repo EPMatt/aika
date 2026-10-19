@@ -5,10 +5,57 @@ use crate::service::{error, validate_event, validate_range};
 use std::collections::BTreeMap;
 type Result<T> = std::result::Result<T, ServiceError>;
 
-pub trait Provider: Send {
+pub trait Provider: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
     fn capabilities(&self) -> Capabilities;
-    // Future authentication/discovery/HTTP methods belong here, never in repository locks.
+    fn incremental_sync(&self) -> bool {
+        true
+    }
+    fn start_connection(&self) -> Result<ConnectionSession> {
+        Err(error(
+            "unsupported",
+            "This provider does not connect accounts.",
+        ))
+    }
+    fn connection(&self, _id: &str) -> Result<(ConnectionSession, Option<ConnectedIdentity>)> {
+        Err(error("unsupported", "Connection unavailable."))
+    }
+    fn cancel_connection(&self, _id: &str) -> Result<()> {
+        Err(error("unsupported", "Connection unavailable."))
+    }
+    fn discover(&self, _subject: &str) -> Result<Vec<DiscoveredCalendar>> {
+        Err(error("unsupported", "Discovery unavailable."))
+    }
+    fn discover_for_sync(
+        &self,
+        subject: &str,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<DiscoveredCalendar>> {
+        checkpoint()?;
+        self.discover(subject)
+    }
+    fn incoming_page(
+        &self,
+        _subject: &str,
+        _calendar: &str,
+        _cursor: Option<&str>,
+        _page: Option<&str>,
+        _projection: Option<&EventRange>,
+    ) -> Result<crate::sync::IncomingPage> {
+        Err(error(
+            "unsupported",
+            "Incoming synchronization unavailable.",
+        ))
+    }
+    fn disconnect(&self, _subject: &str) -> Result<()> {
+        Err(error("unsupported", "Disconnection unavailable."))
+    }
+}
+/// Backend-only identity; never includes credentials or authorization URLs.
+#[derive(Clone)]
+pub struct ConnectedIdentity {
+    pub subject: String,
+    pub display_name: String,
 }
 pub struct LocalProvider;
 impl Provider for LocalProvider {
@@ -26,7 +73,7 @@ impl Provider for LocalProvider {
     }
 }
 pub struct ProviderRegistry {
-    providers: BTreeMap<String, Box<dyn Provider>>,
+    providers: BTreeMap<String, std::sync::Arc<dyn Provider>>,
     pub(crate) repository: Repository,
 }
 impl ProviderRegistry {
@@ -44,8 +91,14 @@ impl ProviderRegistry {
                 "Duplicate or invalid provider identity.",
             ));
         }
-        self.providers.insert(descriptor.id, provider);
+        self.providers.insert(descriptor.id, provider.into());
         Ok(())
+    }
+    pub fn adapter(&self, id: &str) -> Result<std::sync::Arc<dyn Provider>> {
+        self.providers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| error("unsupported", "Provider unavailable."))
     }
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.providers.values().map(|p| p.descriptor()).collect()
@@ -114,8 +167,9 @@ impl ProviderRegistry {
         Ok(())
     }
     pub fn collection_snapshot(&mut self, range: EventRange) -> Result<CalendarCollectionSnapshot> {
-        let mut snapshot = self.repository.collection_snapshot(range)?;
+        let mut snapshot = self.repository.collection_snapshot(range.clone())?;
         snapshot.accounts = self.accounts()?;
+        snapshot.sync_status = self.repository.sync_status(&range)?;
         snapshot.calendar_capabilities = snapshot
             .calendars
             .iter()
@@ -662,7 +716,11 @@ mod tests {
     #[test]
     fn service_uses_shared_series_reads_and_remote_outbox_without_network() {
         let (r, one, _, _) = registry(Path::new(":memory:"));
-        let mut service = crate::service::CalendarService { providers: r };
+        let mut service = crate::service::CalendarService {
+            providers: r,
+            discoveries: Default::default(),
+            recorded_connections: Default::default(),
+        };
         let account = service
             .providers
             .repository

@@ -31,6 +31,24 @@ test.beforeEach(async ({ page }) => {
             throw { code: 'storage', message: 'Calendar database is unavailable.' };
           }
           switch (command) {
+            case 'list_providers':
+              return [
+                {
+                  id: 'local',
+                  name: 'On this device',
+                  connectionAvailable: true,
+                  unavailableReason: null,
+                  capabilities: {
+                    read: true,
+                    create: true,
+                    edit: true,
+                    delete: true,
+                    recurrence: true,
+                    customizeMetadata: true,
+                    moveEvent: true,
+                  },
+                },
+              ];
             case 'get_app_info':
               return { name: 'aika', version: 'test', provider: 'local' };
             case 'get_preferences':
@@ -96,6 +114,7 @@ test('calendar write failures retain drafts and visibility; reload hydrates meta
 }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Create calendar', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'On this device' }).click();
   await page.getByLabel('Calendar name').fill('Work');
   await page.getByLabel('Calendar description').fill('Office schedule');
   await page.getByRole('button', { name: 'Teal', exact: true }).click();

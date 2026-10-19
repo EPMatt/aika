@@ -88,4 +88,62 @@ pub struct CalendarCollectionSnapshot {
     pub accounts: Vec<AccountSummary>,
     pub calendar_capabilities: BTreeMap<String, Capabilities>,
     pub event_capabilities: BTreeMap<String, Capabilities>,
+    pub sync_status: Vec<AccountSyncStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionProgress {
+    WaitingForBrowser,
+    Connected,
+    Cancelled,
+    Failed,
+    TimedOut,
+}
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionSession {
+    pub id: String,
+    pub progress: ConnectionProgress,
+    pub account_id: Option<String>,
+    pub failure: Option<ServiceError>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredCalendar {
+    pub remote_id: String,
+    pub name: String,
+    pub color: String,
+    pub description: String,
+    pub access_role: String,
+    pub eligible: bool,
+    pub disabled_reason: Option<String>,
+    pub selected: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarDiscovery {
+    pub id: String,
+    pub account: AccountSummary,
+    pub calendars: Vec<DiscoveredCalendar>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarSyncStatus {
+    pub calendar_id: String,
+    pub available: bool,
+    pub range_complete: bool,
+    pub last_success: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSyncStatus {
+    pub account_id: String,
+    pub syncing: bool,
+    pub last_success: Option<String>,
+    pub failure: Option<ServiceError>,
+    pub pending_count: u32,
+    pub conflict_count: u32,
+    pub calendars: Vec<CalendarSyncStatus>,
 }

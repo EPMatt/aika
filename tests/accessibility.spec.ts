@@ -53,6 +53,7 @@ for (const theme of ['light', 'dark']) {
       .locator('.sidebar')
       .getByRole('button', { name: 'Create calendar', exact: true })
       .click();
+    await page.getByRole('menuitem', { name: 'On this device' }).click();
     await audit(page);
     await page.keyboard.press('Escape');
     await openCalendarMenu(page);

@@ -1,3 +1,4 @@
+mod sync_runtime;
 pub use aika_core::{contracts, credentials, providers, service};
 
 use contracts::*;
@@ -28,6 +29,115 @@ async fn with_service<T: Send + 'static>(
     })
     .await
     .map_err(|_| error("service", "The calendar operation could not finish."))?
+}
+
+// Adapter work is deliberately performed outside ServiceState / SQLite locks.
+async fn provider_work<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ServiceError> + Send + 'static,
+) -> Result<T, ServiceError> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|_| error("service", "The provider operation could not finish."))?
+}
+#[tauri::command]
+async fn list_providers(
+    state: tauri::State<'_, ServiceState>,
+) -> Result<Vec<ProviderDescriptor>, ServiceError> {
+    with_service(state.inner().clone(), |s| Ok(s.providers())).await
+}
+#[tauri::command]
+async fn start_connection(
+    state: tauri::State<'_, ServiceState>,
+    provider: String,
+) -> Result<ConnectionSession, ServiceError> {
+    let adapter = with_service(state.inner().clone(), move |s| {
+        s.connection_adapter(&provider)
+    })
+    .await?;
+    provider_work(move || adapter.start_connection()).await
+}
+#[tauri::command]
+async fn connection_status(
+    state: tauri::State<'_, ServiceState>,
+    provider: String,
+    id: String,
+) -> Result<ConnectionSession, ServiceError> {
+    let key = provider.clone();
+    let adapter = with_service(state.inner().clone(), move |s| s.connection_adapter(&key)).await?;
+    let (session, identity) = provider_work(move || adapter.connection(&id)).await?;
+    with_service(state.inner().clone(), move |s| {
+        s.record_connection(&provider, session, identity)
+    })
+    .await
+}
+#[tauri::command]
+async fn cancel_connection(
+    state: tauri::State<'_, ServiceState>,
+    provider: String,
+    id: String,
+) -> Result<(), ServiceError> {
+    let adapter = with_service(state.inner().clone(), move |s| {
+        s.connection_adapter(&provider)
+    })
+    .await?;
+    provider_work(move || adapter.cancel_connection(&id)).await
+}
+#[tauri::command]
+async fn discover_calendars(
+    state: tauri::State<'_, ServiceState>,
+    account_id: String,
+) -> Result<CalendarDiscovery, ServiceError> {
+    let (account, adapter) = with_service(state.inner().clone(), move |s| {
+        let account = s.account(&account_id)?;
+        let adapter = s.connection_adapter(&account.provider_id)?;
+        Ok((account, adapter))
+    })
+    .await?;
+    if account.connection_state != ConnectionState::Connected {
+        return Err(error(
+            "authenticationRequired",
+            "Reconnect this account before discovering calendars.",
+        ));
+    }
+    let subject = account.remote_subject.clone();
+    let result = provider_work(move || adapter.discover(&subject)).await;
+    with_service(state.inner().clone(), move |s| match result {
+        Ok(calendars) => s.prepare_discovery(&account, calendars),
+        Err(failure) => {
+            s.account_failure(&account.id, &failure)?;
+            Err(failure)
+        }
+    })
+    .await
+}
+#[tauri::command]
+async fn commit_calendar_selection(
+    state: tauri::State<'_, ServiceState>,
+    discovery_id: String,
+    selected: Vec<String>,
+) -> Result<(), ServiceError> {
+    with_service(state.inner().clone(), move |s| {
+        s.commit_selection(&discovery_id, selected)
+    })
+    .await
+}
+#[tauri::command]
+async fn disconnect_account(
+    state: tauri::State<'_, ServiceState>,
+    account_id: String,
+) -> Result<(), ServiceError> {
+    let (account, adapter) = with_service(state.inner().clone(), move |s| {
+        let account = s.account(&account_id)?;
+        let adapter = s.connection_adapter(&account.provider_id)?;
+        Ok((account, adapter))
+    })
+    .await?;
+    let subject = account.remote_subject;
+    provider_work(move || adapter.disconnect(&subject)).await?;
+    with_service(state.inner().clone(), move |s| {
+        s.record_disconnect(&account.id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -207,6 +317,7 @@ pub fn run() {
             let directory = std::env::var_os("AIKA_TEST_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .ok_or_else(|| error("storage", "Native tests require AIKA_TEST_DATA_DIR."));
+            app.manage(sync_runtime::SyncQueue::default());
             app.manage(Arc::new(Mutex::new(LocalState { directory, service: None })) as ServiceState);
             Ok(())
         })
@@ -223,7 +334,7 @@ pub fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![get_app_info, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
+        .invoke_handler(tauri::generate_handler![get_app_info, sync_runtime::request_sync, list_providers, start_connection, connection_status, cancel_connection, discover_calendars, commit_calendar_selection, disconnect_account, calendar_snapshot, create_calendar, update_calendar, delete_calendar, calendar_event_count, set_default_calendar, set_calendar_visibility, save_event, get_event_series, mutate_recurring_event, preview_recurrence, delete_event, undo_event, get_preferences, set_preferences, resolve_local_time])
         .run(tauri::generate_context!())
         .expect("could not start aika");
 }

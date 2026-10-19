@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { projectEnvironment } from './environment.mjs';
 
 export const targets = {
   'x86_64-unknown-linux-gnu': {
@@ -95,11 +96,12 @@ export async function collect({ bundle, output, target, version, revision, notes
 
 async function main() {
   const root = fileURLToPath(new URL('..', import.meta.url));
+  const env = projectEnvironment(root);
   const [target, ...extra] = process.argv.slice(2);
   const spec = targets[target];
   if (!spec || extra.length || spec.platform !== process.platform)
     throw new Error('Usage: pnpm alpha:build <native target triple>');
-  if (process.env.CARGO_TARGET_DIR || process.env.CARGO_BUILD_TARGET)
+  if (env.CARGO_TARGET_DIR || env.CARGO_BUILD_TARGET)
     throw new Error('Unset Cargo target directory/target overrides for alpha builds');
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const config = JSON.parse(await readFile(join(root, 'src-tauri/tauri.conf.json'), 'utf8'));
@@ -119,7 +121,7 @@ async function main() {
     if (error.code !== 'ENOENT') throw error;
   }
   const git = (args) => {
-    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
     if (result.status !== 0) throw new Error('Could not record source revision');
     return result.stdout.trim();
   };
@@ -139,7 +141,7 @@ async function main() {
       '--bundles',
       spec.bundles.join(','),
     ],
-    { cwd: root, stdio: 'inherit' },
+    { cwd: root, env, stdio: 'inherit' },
   );
   if (build.error || build.status !== 0)
     throw new Error('Alpha release build failed; no candidate collected');

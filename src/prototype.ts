@@ -106,6 +106,7 @@ export class PrototypeRepository {
       hiddenCalendarIds: this.hiddenCalendarIds,
       canUndo: this.canUndo(),
       accounts: [],
+      syncStatus: [],
       calendarCapabilities: Object.fromEntries(
         this.calendars.map((c) => [
           c.id,

@@ -2,9 +2,11 @@
 
 ## Current work and next increment
 
-The desktop currently supports multiple local calendars, common recurrence, and a standalone CLI. The provider registry and OS credential service exist; production still registers only the local provider. The original v0 phases below are historical milestones, not a description of today's complete feature set.
+The desktop currently supports multiple local calendars, common recurrence, and a standalone CLI. The provider registry and OS credential service exist; production registers Local and Google, with incoming Google sync implemented and event editing still gated. The original v0 phases below are historical milestones, not a description of today's complete feature set.
 
-The next increment is [extensible connected calendars and Google integration](integrations/google-calendar.md). Its phases use a separate Google phase numbering scheme. **Google phases 0–1 are delivered: specification plus shared repository/account/capability foundations. Phases 2–6 remain planned.** Start with the [Google phase 1 handoff](handoffs/google-phase-1.md) and the [connected-calendar architecture decisions](architecture.md#connected-calendar-decisions-google-integration).
+The next increment is [extensible connected calendars and Google integration](integrations/google-calendar.md). Its phases use a separate Google phase numbering scheme. **Google phases 0–1 are delivered. Phase 2 connection/selection is implemented with its live/platform exit gate pending; phase 3 incoming sync is implemented with live/platform evidence pending; phases 4–6 remain planned.** Start with the [Google phase 3 handoff](handoffs/google-phase-3.md) and the [connected-calendar architecture decisions](architecture.md#connected-calendar-decisions-google-integration).
+
+Packaged apps can now embed optional Desktop OAuth client settings supplied at build time, with complete runtime overrides retained. See the [build configuration follow-up](handoffs/google-build-configuration.md) and [optional dotenv configuration](handoffs/google-dotenv-configuration.md); it does not complete live/platform gates or advance phase 4.
 
 This specification supersedes the earlier instruction to defer all Google work until alpha acceptance. It does not complete or waive outstanding platform, installer, accessibility, or user-acceptance checks; their evidence remains tracked in [alpha verification](alpha/verification.md).
 
@@ -41,7 +43,7 @@ CRUD/undo/restart; timed/all-day/overnight/multi-day ranges; leap days and year 
 
 ## Defaults
 
-System appearance; month on first launch; remember last view/sidebar/appearance in phase 2. New timed events last one hour; timed gestures snap to 15 minutes. Month gestures move by local date; time-grid gestures operate on time. Event type changes in the editor. All-day ranges use an exclusive end date internally. Connected calendars follow the separate [Google integration specification](integrations/google-calendar.md); its shared backend foundation is delivered; production Google connectivity remains planned.
+System appearance; month on first launch; remember last view/sidebar/appearance in phase 2. New timed events last one hour; timed gestures snap to 15 minutes. Month gestures move by local date; time-grid gestures operate on time. Event type changes in the editor. All-day ranges use an exclusive end date internally. Connected calendars follow the separate [Google integration specification](integrations/google-calendar.md); its shared backend foundation is delivered; Google connection/selection is implemented; incoming synchronization is implemented; event editing remains planned.
 
 ## Implementation status after phase 3
 

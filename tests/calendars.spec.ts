@@ -9,6 +9,7 @@ async function createCalendar(page: Page, name: string) {
     .locator('.sidebar')
     .getByRole('button', { name: 'Create calendar', exact: true })
     .click();
+  await page.getByRole('menuitem', { name: 'On this device' }).click();
   const dialog = page.getByRole('dialog', { name: 'Create calendar' });
   await dialog.getByLabel('Calendar name').fill(name);
   await dialog.getByLabel('Calendar description').fill(`${name} description`);

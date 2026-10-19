@@ -23,7 +23,32 @@ The tooling wrapper also detects a workspace-local Rust installation in `.tools/
 
 ## Local calendars
 
-Use **+** beside **Calendars** in the sidebar to create a calendar. Click a calendar row to show or hide its events. Hover or focus the row to open **…**, where you can select the default, edit its name/description/color, or permanently delete the calendar and its events. The event editor lets you choose a calendar and move existing events. Saving a new or moved event to a hidden calendar reveals it. You can delete every calendar; event creation becomes available again after creating one.
+Use **+ → On this device** beside **Calendars** in the sidebar to create a calendar. Click a calendar row to show or hide its events. Hover or focus the row to open **…**, where you can select the default, edit its name/description/color, or permanently delete the calendar and its events. The event editor lets you choose a calendar and move existing events. Saving a new or moved event to a hidden calendar reveals it. You can delete every calendar; event creation becomes available again after creating one.
+
+## Google account connection
+
+The native app supports **+ → Google Calendar**, system-browser authorization, and a calendar checklist. All eligible calendars start checked; free/busy-only or inaccessible calendars explain why they cannot be included. Existing exclusions and local name/color/visibility preferences survive reconnection. **Manage account** revises selection, reconnects, or disconnects without deleting provider calendars. **Remove from aika** excludes an imported calendar. Selected Google calendars import events while the desktop is open and remain read-only. Startup, focus/resume, navigation, manual refresh, and 60-second polling request synchronization. Cached events can be read offline; uncached recurrence ranges are identified explicitly. Event editing remains planned.
+
+Configure an application-owned Google Cloud project, Calendar API, consent test audience, and **Desktop app** OAuth client as described in [Google setup](docs/integrations/google-calendar.md#google-setup-and-authentication-boundary). Supply `AIKA_GOOGLE_CLIENT_ID` and, when present in Google's Desktop client configuration, `AIKA_GOOGLE_CLIENT_SECRET` while building:
+
+```sh
+AIKA_GOOGLE_CLIENT_ID='your-desktop-client-id' \
+AIKA_GOOGLE_CLIENT_SECRET='your-desktop-client-secret' \
+pnpm desktop:build
+```
+
+Alternatively, copy [.env.example](.env.example) to `.env` in the repository root and fill in the Desktop client values:
+
+```dotenv
+AIKA_GOOGLE_CLIENT_ID=your-desktop-client-id
+AIKA_GOOGLE_CLIENT_SECRET=your-desktop-client-secret
+```
+
+Then run `pnpm desktop` or `pnpm desktop:build` normally. The root `.env` is optional and ignored by Git. Its entries override matching inherited environment variables, including explicit empty values; omitted variables remain inherited. Leave the secret entry empty when no secret is needed. Native tool, CLI, alpha, and release build commands load this same file regardless of the current working directory. Restart development commands or rebuild packages after changing it. Packaged apps use the embedded settings and do not search for `.env` files.
+
+The resulting packages embed these public Desktop OAuth settings and can connect Google accounts when launched normally without environment variables. Omit the secret assignment if the client has no secret. Unconfigured builds remain valid and explain why Google is disabled. Existing installers must be rebuilt to gain this support. A nonblank runtime client ID overrides the complete embedded pair; provide its matching runtime secret when needed. Blank IDs fall back to embedded settings, and a runtime secret alone is ignored. These native settings are independent of renderer `VITE_` variables.
+
+Embedded Desktop client configuration is extractable from the binary; it is not a confidential server credential. User tokens remain in the unlocked persistent OS credential store, with no plaintext fallback. The browser preview cannot connect an account. See the [build configuration handoff](docs/handoffs/google-build-configuration.md) for verification and remaining live/platform checks.
 
 ## Recurring events
 
@@ -84,7 +109,7 @@ Review URLs use a fixed date for reproducible screenshots:
 
 Shortcuts: **N** creates an event; **T** returns to today; **1/2/3** selects month/week/day; **Ctrl/Cmd+Z** undoes a session change; **Escape** dismisses the editor. In month view, dragging an event between dates preserves its local time and duration; DST gaps and repeated times require editing explicitly. Drag across month dates to create an all-day range, or across a time column to create a timed range. Timed drops and the bottom resize handle snap to 15 minutes. Escape cancels a selection. All-day events span visible dates; crowded month rows use overflow. Enter on a time column or all-day row creates an event; Enter on an event opens its dates/times for keyboard moving and resizing. Gesture failures leave saved data unchanged; retry the gesture or use the editor to select a DST offset.
 
-Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [private-alpha handoff](docs/handoffs/phase-5.md) before continuing. The backend provider registry and OS credential service are in place; production calendars remain local. The [Google integration specification](docs/integrations/google-calendar.md) and [Google phase 1 handoff](docs/handoffs/google-phase-1.md) describe the shared repository, account model, capabilities, and outbox foundation; Google connection and synchronization remain planned. Windows/macOS and manual assistive-technology checks remain pending before alpha acceptance.
+Read [the implementation plan](docs/plan.md), [architecture decisions](docs/architecture.md), and the [private-alpha handoff](docs/handoffs/phase-5.md) before continuing. The backend registers Local and Google. Google connection and calendar selection are implemented; live Google/platform verification remains pending. The [Google integration specification](docs/integrations/google-calendar.md) and [Google phase 3 handoff](docs/handoffs/google-phase-3.md) document the boundary and evidence. Incoming synchronization and offline reading are implemented with automated fixtures; live-provider and installed-platform exit evidence remains pending. Ordinary-event two-way synchronization is next. Windows/macOS and manual assistive-technology checks remain pending before alpha acceptance.
 
 ## Private alpha candidates
 

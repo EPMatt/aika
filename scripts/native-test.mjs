@@ -6,32 +6,45 @@ import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { remote } from 'webdriverio';
+import { projectEnvironment } from './environment.mjs';
+
+const nativeEnvironment = projectEnvironment();
 
 const binary = resolve(
-  process.env.AIKA_TEST_BINARY ??
+  nativeEnvironment.AIKA_TEST_BINARY ??
     `src-tauri/target/debug/cal-desktop${process.platform === 'win32' ? '.exe' : ''}`,
 );
 const cliBinary = resolve(
   `src-tauri/target/debug/aika-cli${process.platform === 'win32' ? '.exe' : ''}`,
 );
 const runFile = promisify(execFile);
+const expectedGoogle = nativeEnvironment.AIKA_TEST_EXPECT_GOOGLE_AVAILABLE;
+if (expectedGoogle !== undefined && !['true', 'false'].includes(expectedGoogle))
+  throw new Error('AIKA_TEST_EXPECT_GOOGLE_AVAILABLE must be true or false');
+const googleAvailable =
+  expectedGoogle === undefined
+    ? Boolean(nativeEnvironment.AIKA_GOOGLE_CLIENT_ID?.trim())
+    : expectedGoogle === 'true';
 const directory = await mkdtemp(join(tmpdir(), 'aika-native-'));
 async function cli(...args) {
-  const { stdout } = await runFile(cliBinary, [
-    '--database',
-    join(directory, 'calendar.sqlite3'),
-    'events',
-    ...args,
-  ]);
+  const { stdout } = await runFile(
+    cliBinary,
+    ['--database', join(directory, 'calendar.sqlite3'), 'events', ...args],
+    { env: nativeEnvironment },
+  );
   return stdout;
 }
-const port = Number(process.env.TAURI_WEBDRIVER_PORT ?? 4445);
+const port = Number(nativeEnvironment.TAURI_WEBDRIVER_PORT ?? 4445);
 await mkdir('test-results/native', { recursive: true });
 let app;
 let browser;
 async function start(expectCalendar = true) {
   app = spawn(binary, [], {
-    env: { ...process.env, AIKA_TEST_DATA_DIR: directory, TAURI_WEBDRIVER_PORT: String(port) },
+    env: {
+      ...nativeEnvironment,
+      AIKA_TEST_DATA_DIR: directory,
+      TAURI_WEBDRIVER_PORT: String(port),
+    },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   let spawnError;
@@ -355,6 +368,14 @@ try {
   // Calendar management through actual renderer -> Rust -> SQLite, including restart.
   await click('button=Month');
   await click('.sidebar [aria-label="Create calendar"]');
+  const googleProvider = await browser.$('button=Google Calendar');
+  await googleProvider.waitForDisplayed();
+  assert.equal(await googleProvider.isEnabled(), googleAvailable);
+  if (!googleAvailable) {
+    assert.match(await browser.$('.provider-menu').getText(), /AIKA_GOOGLE_CLIENT_ID/);
+  }
+  await browser.saveScreenshot('test-results/native/provider-popup.png');
+  await click('button=On this device');
   await fill('[aria-label="Calendar name"]', 'Native Work');
   await fill('[aria-label="Calendar description"]', 'Native persisted description');
   await click('[aria-label="Blue"]');

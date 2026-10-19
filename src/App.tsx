@@ -20,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import { DateTime } from 'luxon';
+import { listen } from '@tauri-apps/api/event';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { AppInfo } from './generated/AppInfo';
 import type { Calendar } from './generated/Calendar';
@@ -43,6 +44,9 @@ import {
 import type { Appearance, View } from './calendar';
 import type { PrototypeRepository } from './prototype';
 import { calendarClient, desktop, errorMessage, resolveWallTime } from './client';
+import { ProviderControls } from './ProviderControls';
+import type { AccountSyncStatus } from './generated/AccountSyncStatus';
+import type { AccountSummary } from './generated/AccountSummary';
 import { CalendarForm, CalendarMenu } from './CalendarControls';
 import { RepeatControls } from './RepeatControls';
 import { previewRecurrence, recurrenceDomain } from './recurrence';
@@ -258,14 +262,14 @@ function EventChip({
         e.stopPropagation();
         onClick(event, e.currentTarget);
       }}
-      aria-label={`${event.title}${event.recurrence ? ', recurring' : ''}, ${calendar.name}, ${event.time.kind === 'allDay' ? `all day, ${event.time.startDate} through ${DateTime.fromISO(event.time.endDate).minus({ days: 1 }).toISODate()}` : timeLabel(event.time.start)}`}
+      aria-label={`${event.title || 'Untitled event'}${event.recurrence ? ', recurring' : ''}, ${calendar.name}, ${event.time.kind === 'allDay' ? `all day, ${event.time.startDate} through ${DateTime.fromISO(event.time.endDate).minus({ days: 1 }).toISODate()}` : timeLabel(event.time.start)}`}
     >
       {event.recurrence && <Repeat2 size={11} aria-label="Recurring event" />}
       {event.time.kind === 'timed' && <span className="event-dot" />}
       {day && event.time.kind === 'allDay' && event.time.startDate < dateKey(day) && (
         <span aria-hidden="true">‹</span>
       )}
-      <span className="event-title">{event.title}</span>
+      <span className="event-title">{event.title || 'Untitled event'}</span>
       {day &&
         event.time.kind === 'allDay' &&
         event.time.endDate > dateKey(day.plus({ days: 1 })) && <span aria-hidden="true">›</span>}
@@ -846,8 +850,8 @@ function TimeView({
                     key={event.id}
                     className="time-event"
                     draggable={eventCalendar.writable}
-                    title={event.title}
-                    aria-label={`${event.title}${event.recurrence ? ', recurring' : ''}, ${eventCalendar.name}, ${event.time.kind === 'timed' ? timeLabel(event.time.start) : 'all day'}`}
+                    title={event.title || 'Untitled event'}
+                    aria-label={`${event.title || 'Untitled event'}${event.recurrence ? ', recurring' : ''}, ${eventCalendar.name}, ${event.time.kind === 'timed' ? timeLabel(event.time.start) : 'all day'}`}
                     style={{
                       ...calendarStyle(eventCalendar),
                       top: (start / 60) * HOUR_HEIGHT + 2,
@@ -870,7 +874,7 @@ function TimeView({
                   >
                     <span className="time-event-title">
                       {event.recurrence && <Repeat2 size={11} aria-label="Recurring event" />}{' '}
-                      {event.title}
+                      {event.title || 'Untitled event'}
                     </span>
                     <span className="time-event-time">
                       {event.time.kind === 'timed'
@@ -1369,6 +1373,9 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [view, setView] = useState<View>('month');
   const [sidebar, setSidebar] = useState(window.innerWidth >= 900);
   const [initialSnapshot] = useState(() => repository?.snapshot());
+  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
+  const [syncStatus, setSyncStatus] = useState<AccountSyncStatus[]>([]);
+  const [syncRequestFailure, setSyncRequestFailure] = useState('');
   const [calendars, setCalendars] = useState<Calendar[]>(initialSnapshot?.calendars ?? []);
   const [defaultCalendarId, setDefaultCalendarId] = useState<string | null>(
     initialSnapshot?.defaultCalendarId ?? null,
@@ -1414,11 +1421,66 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
   const [revision, setRevision] = useState(0);
   const [mutating, setMutating] = useState(false);
   const requestVersion = useRef(0);
+  const syncRange = useCallback(() => {
+    const days = daysForView(date, view);
+    const start = days[0].startOf('day');
+    const end = days[days.length - 1].plus({ days: 1 }).startOf('day');
+    return {
+      start: start.toUTC().toISO()!,
+      end: end.toUTC().toISO()!,
+      startDate: dateKey(start),
+      endDate: dateKey(end),
+    };
+  }, [date, view]);
+  const requestSync = useCallback(() => {
+    if (!desktop) return;
+    void calendarClient
+      .requestSync(syncRange())
+      .then(() => setSyncRequestFailure(''))
+      .catch((e) => setSyncRequestFailure(errorMessage(e)));
+  }, [syncRange]);
+  const connectedSelection = accounts
+    .filter((a) => a.connectionState === 'connected')
+    .map((a) => `${a.id}:${a.selectedCalendarIds.join(',')}`)
+    .join('|');
+  useEffect(() => {
+    if (!desktop || !connectedSelection) return;
+    // Defer startup so Strict Mode cleanup cancels its first effect before provider work.
+    const startup = window.setTimeout(requestSync, 0);
+    const timer = window.setInterval(requestSync, 60_000);
+    const focus = () => {
+      setRevision((v) => v + 1);
+      requestSync();
+    };
+    const resume = () => {
+      if (document.visibilityState === 'visible') focus();
+    };
+    window.addEventListener('focus', focus);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      clearTimeout(startup);
+      clearInterval(timer);
+      window.removeEventListener('focus', focus);
+      document.removeEventListener('visibilitychange', resume);
+    };
+  }, [requestSync, connectedSelection]);
   useEffect(() => {
     if (!desktop) return;
     const refreshOnFocus = () => setRevision((value) => value + 1);
     window.addEventListener('focus', refreshOnFocus);
-    return () => window.removeEventListener('focus', refreshOnFocus);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen('calendar-sync-changed', refreshOnFocus)
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+      window.removeEventListener('focus', refreshOnFocus);
+    };
   }, []);
   useEffect(() => {
     if (!desktop) return;
@@ -1457,6 +1519,8 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
     snapshot
       .then((snapshot) => {
         if (token !== requestVersion.current) return;
+        setAccounts(snapshot.accounts ?? []);
+        setSyncStatus(snapshot.syncStatus ?? []);
         setCalendars(snapshot.calendars);
         setCapabilityState({
           calendars: snapshot.calendarCapabilities ?? {},
@@ -1760,18 +1824,16 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
               <div className="calendar-list">
                 <div className="calendar-list-heading">
                   <span className="section-label">Calendars</span>
-                  <button
-                    className="icon-button"
-                    aria-label="Create calendar"
-                    disabled={!calendarReady || calendarBusy}
-                    onClick={(e) => {
-                      calendarDialogAnchor.current = e.currentTarget;
+                  <ProviderControls
+                    busy={!calendarReady || calendarBusy}
+                    accounts={accounts}
+                    onRefresh={() => refresh('Account selection updated.')}
+                    onLocal={(anchor) => {
+                      calendarDialogAnchor.current = anchor;
                       setCalendarFailure('');
                       setCalendarDialog({ calendar: null });
                     }}
-                  >
-                    <Plus size={15} />
-                  </button>
+                  />
                 </div>
                 {calendars.map((item) => {
                   const isVisible = !hiddenCalendarIds.includes(item.id);
@@ -1857,6 +1919,44 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                   <p className="calendar-empty">No calendars yet. Use + to create one.</p>
                 )}
               </div>
+              {desktop && accounts.length > 0 && (
+                <section className="sync-summary" aria-label="Calendar synchronization">
+                  <button className="text-button" onClick={requestSync}>
+                    Refresh calendars
+                  </button>
+                  {syncRequestFailure && <p role="alert">{syncRequestFailure}</p>}
+                  {syncStatus.map((status) => (
+                    <div key={status.accountId}>
+                      <p className="muted">
+                        {accounts.find((a) => a.id === status.accountId)?.displayName}
+                      </p>
+                      <p role="status">
+                        {status.syncing
+                          ? 'Synchronizing…'
+                          : status.lastSuccess
+                            ? `Last synchronized ${DateTime.fromISO(status.lastSuccess).toLocaleString(DateTime.DATETIME_SHORT)}`
+                            : 'Waiting for the first synchronization.'}
+                      </p>
+                      {status.failure && (
+                        <p role="alert">{status.failure.message} Cached events remain available.</p>
+                      )}
+                      {status.calendars.some((c) => !c.available) && (
+                        <p>Some selected calendars are unavailable.</p>
+                      )}
+                      {status.calendars.some((c) => c.available && !c.rangeComplete) && (
+                        <p>
+                          Some events in this range have not been cached. Connect and refresh to
+                          complete this range.
+                        </p>
+                      )}
+                      {status.pendingCount > 0 && <p>{status.pendingCount} pending changes</p>}
+                      {status.conflictCount > 0 && (
+                        <p>{status.conflictCount} conflicts require attention</p>
+                      )}
+                    </div>
+                  ))}
+                </section>
+              )}
               <div className="sidebar-bottom">
                 <div className="sidebar-footer">
                   <IconButton
@@ -2283,10 +2383,14 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                   )?.focus();
                 }}
               >
-                <Dialog.Title>Delete {deletingCalendar?.calendar.name}?</Dialog.Title>
+                <Dialog.Title>
+                  {deletingCalendar?.calendar.providerId === 'local' ? 'Delete' : 'Remove'}{' '}
+                  {deletingCalendar?.calendar.name}?
+                </Dialog.Title>
                 <Dialog.Description>
-                  This permanently deletes the calendar and all {deletingCalendar?.count} of its
-                  events. This cannot be undone.
+                  {deletingCalendar?.calendar.providerId === 'local'
+                    ? `This permanently deletes the calendar and all ${deletingCalendar?.count} of its events. This cannot be undone.`
+                    : 'This excludes the calendar from aika and clears its cached events. The calendar remains available with its provider. Include it again through Manage account.'}
                 </Dialog.Description>
                 {calendarFailure && (
                   <p role="alert" className="editor-error">
@@ -2322,7 +2426,11 @@ export function App({ repository = null }: { repository?: PrototypeRepository | 
                       }
                     }}
                   >
-                    {calendarBusy ? 'Deleting…' : 'Delete calendar'}
+                    {calendarBusy
+                      ? 'Removing…'
+                      : deletingCalendar?.calendar.providerId === 'local'
+                        ? 'Delete calendar'
+                        : 'Remove from aika'}
                   </button>
                 </div>
               </Dialog.Content>

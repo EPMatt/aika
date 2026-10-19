@@ -1523,3 +1523,55 @@ input {
   max-height: calc(100vh - 70px);
   overflow-y: auto;
 }
+
+.provider-menu {
+  width: 270px;
+}
+.provider-reason {
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.75;
+  margin: 6px 10px 12px;
+}
+.connected-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.calendar-list-heading:has(.connected-accounts) {
+  flex-wrap: wrap;
+}
+.connected-accounts .text-button {
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.connection-content {
+  display: grid;
+  gap: 12px;
+}
+.import-checklist {
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 0;
+  padding: 8px 0;
+}
+.import-checklist label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.import-checklist input {
+  width: auto;
+}
+
+.sync-summary {
+  padding: 12px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.sync-summary p {
+  margin: 6px 0;
+}

@@ -10,6 +10,9 @@ import type { EventRange } from './generated/EventRange';
 import type { Preferences } from './generated/Preferences';
 import type { ServiceError } from './generated/ServiceError';
 
+import type { ProviderDescriptor } from './generated/ProviderDescriptor';
+import type { ConnectionSession } from './generated/ConnectionSession';
+import type { CalendarDiscovery } from './generated/CalendarDiscovery';
 export const desktop = isTauri();
 let pendingMutation: Promise<unknown> = Promise.resolve();
 function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -18,6 +21,19 @@ function mutate<T>(command: string, args?: Record<string, unknown>): Promise<T> 
   return operation;
 }
 export const calendarClient = {
+  requestSync: (range: EventRange) => invoke<void>('request_sync', { range }),
+  providers: () => invoke<ProviderDescriptor[]>('list_providers'),
+  startConnection: (provider: string) =>
+    invoke<ConnectionSession>('start_connection', { provider }),
+  connectionStatus: (provider: string, id: string) =>
+    invoke<ConnectionSession>('connection_status', { provider, id }),
+  cancelConnection: (provider: string, id: string) =>
+    invoke<void>('cancel_connection', { provider, id }),
+  discoverCalendars: (accountId: string) =>
+    invoke<CalendarDiscovery>('discover_calendars', { accountId }),
+  commitSelection: (discoveryId: string, selected: string[]) =>
+    mutate<void>('commit_calendar_selection', { discoveryId, selected }),
+  disconnectAccount: (accountId: string) => invoke<void>('disconnect_account', { accountId }),
   getSeries: (target: string) => invoke<EventSeries>('get_event_series', { target }),
   mutateEvent: (request: EventMutation) =>
     mutate<CalendarEvent[]>('mutate_recurring_event', { request }),

@@ -31,6 +31,7 @@ jobs:
       - run: pnpm format:check
       - run: pnpm build
       - run: pnpm test
+      - run: pnpm test:env
       - run: pnpm test:packaging
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:ui
@@ -79,6 +80,8 @@ jobs:
       - run: pnpm rust fmt --manifest-path src-tauri/Cargo.toml --all --check
       - run: pnpm rust clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
       - run: pnpm rust test --manifest-path src-tauri/Cargo.toml --workspace
+      - name: Google build configuration smoke checks
+        run: pnpm test:google-config
       - run: pnpm cli:build
       - run: pnpm types:generate
       - run: git diff --exit-code -- src/generated
@@ -96,6 +99,9 @@ jobs:
           name: native-quality-evidence
           path: test-results/native/
       - run: pnpm alpha:build ${{ matrix.target }}
+        env:
+          AIKA_GOOGLE_CLIENT_ID: ${{ vars.AIKA_GOOGLE_CLIENT_ID }}
+          AIKA_GOOGLE_CLIENT_SECRET: ${{ secrets.AIKA_GOOGLE_CLIENT_SECRET }}
       - name: Inspect Linux RPM and candidate checksums
         if: runner.os == 'Linux'
         run: python3 scripts/linux-rpm-check.py artifacts/aika-*-${{ matrix.target }}

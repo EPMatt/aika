@@ -44,6 +44,24 @@ pnpm release:build v0.1.0 x86_64-unknown-linux-gnu
 
 Use the Windows or macOS target from the table in `scripts/alpha.mjs` on the corresponding native OS. Outputs are collected under `artifacts/release-<target>/`; move an existing output aside before rebuilding. Local builds do not publish.
 
+## Google configuration in packages
+
+Release and private-alpha packaging load the optional repository-root `.env` over the inherited build environment, then use `AIKA_GOOGLE_CLIENT_ID` and optional `AIKA_GOOGLE_CLIENT_SECRET`. The shared Rust core embeds these Desktop OAuth client settings, so packaged apps can connect Google accounts when launched normally. Builds without a client ID remain valid with Google disabled. A nonblank runtime client ID overrides the embedded pair using only its runtime secret; blank values are absent and a secret alone cannot override the embedded client.
+
+For GitHub Actions, set repository variable **AIKA_GOOGLE_CLIENT_ID** and optional repository secret **AIKA_GOOGLE_CLIENT_SECRET**. The release-package and private-alpha-package steps receive these inputs; ordinary quality/native checks remain unconfigured. Missing repository inputs become empty values and do not block packaging. This implementation does not create repository variables, a Cloud project, or an OAuth client.
+
+For local packages, copy `.env.example` to `.env`, fill in the Desktop client settings, and run the build command normally. Every key declared in `.env` overrides the matching inherited variable, including a blank value; omitted keys remain inherited. Keep the secret entry present but empty when the client has no secret. Only the root `.env` is loaded; `.env.local` and mode-specific dotenv files are not native configuration inputs. Values support Node dotenv comments/quotes and optional `export`, with no shell execution or variable interpolation. The file remains local and is not bundled. Packaged applications use embedded settings and do not search their working directory for `.env`.
+
+For local packages, export the variables before `pnpm desktop:build`, `pnpm alpha:build <target>`, or `pnpm release:build <tag> <target>`. For example:
+
+```sh
+export AIKA_GOOGLE_CLIENT_ID='your-desktop-client-id'
+export AIKA_GOOGLE_CLIENT_SECRET='your-desktop-client-secret'
+pnpm desktop:build
+```
+
+In PowerShell, set `$env:AIKA_GOOGLE_CLIENT_ID` and, when applicable, `$env:AIKA_GOOGLE_CLIENT_SECRET` before the same build command. Omit the secret assignment if the downloaded Desktop client configuration has no secret. Existing installers must be rebuilt. Embedded settings are public Desktop client configuration and are extractable from executables, even when supplied through GitHub Secrets. User access/refresh tokens remain in the OS credential store. Never use renderer `VITE_` settings or user tokens as build inputs. See [Google setup](integrations/google-calendar.md#google-setup-and-authentication-boundary) and the [build configuration handoff](handoffs/google-build-configuration.md).
+
 ## Use the bundled CLI
 
 - **Linux deb/RPM:** run `aika-cli --help`; the package installs it under `/usr/bin`.

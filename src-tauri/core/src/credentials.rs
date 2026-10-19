@@ -47,6 +47,10 @@ impl Default for CredentialService {
     }
 }
 impl CredentialService {
+    #[cfg(test)]
+    pub(crate) fn testing(store: Box<dyn CredentialStore>) -> Self {
+        Self { store }
+    }
     fn account(provider: &str, account: &str) -> Result<String> {
         if provider.is_empty() || account.is_empty() || provider.len() > 256 || account.len() > 256
         {

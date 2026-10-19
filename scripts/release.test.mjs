@@ -183,13 +183,41 @@ for (const problem of ['missing', 'duplicate', 'empty']) {
     }));
 }
 
+test('release builds apply .env before enforcing build-directory guards', () =>
+  temporary(async (directory) => {
+    await repository(directory);
+    for (const file of ['release.mjs', 'alpha.mjs', 'environment.mjs'])
+      await copyFile(new URL(file, import.meta.url), join(directory, 'scripts', file));
+    await writeFile(join(directory, '.env'), 'CARGO_TARGET_DIR=fictional-override');
+    const target = {
+      linux: 'x86_64-unknown-linux-gnu',
+      darwin: 'aarch64-apple-darwin',
+      win32: 'x86_64-pc-windows-msvc',
+    }[process.platform];
+    assert.ok(target, 'unsupported fixture host');
+    const result = spawnSync(
+      process.execPath,
+      [join(directory, 'scripts/release.mjs'), 'build', 'v1.2.3', target],
+      {
+        cwd: directory,
+        encoding: 'utf8',
+        env: { ...process.env, CARGO_TARGET_DIR: '', CARGO_BUILD_TARGET: '' },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /Unset Cargo target directory\/target overrides for release builds/,
+    );
+  }));
+
 // Exercise the publication process with real Git and a fake GitHub CLI. No network or releases are created.
 for (const scenario of ['new', 'retry', 'published', 'corrupt-download']) {
   test(`publication: ${scenario}`, { skip: process.platform === 'win32' }, async () =>
     temporary(async (directory) => {
       const revision = await repository(directory);
       git(directory, 'remote', 'add', 'origin', directory);
-      for (const file of ['release.mjs', 'alpha.mjs'])
+      for (const file of ['release.mjs', 'alpha.mjs', 'environment.mjs'])
         await copyFile(new URL(file, import.meta.url), join(directory, 'scripts', file));
       const output = await assets(directory, revision);
       const bin = join(directory, 'bin');

@@ -1,14 +1,14 @@
 # Extensible calendar providers and Google integration
 
-Status: **phases 0–1 delivered; Google connection and runtime sync phases 2–6 planned.** Accepted decisions were agreed with the user before implementation. This document is the implementation specification for the next increment, not a claim that Google connectivity exists today.
+Status: **phases 0–1 delivered; phase 2 connection/selection implemented with live/platform exit evidence pending; phase 3 incoming sync implemented with live/platform evidence pending; phases 4–6 planned.** Accepted decisions were agreed with the user before implementation. This document is the implementation specification for the next increment, not a claim that live Google verification or synchronization is complete.
 
-Read the [main plan](../plan.md), [architecture decisions](../architecture.md#connected-calendar-decisions-google-integration), and [phase 1 handoff](../handoffs/google-phase-1.md). Original v0 phase numbers refer to earlier milestones; Google phase numbers below form a separate sequence. Outstanding alpha/platform checks remain tracked in [alpha verification](../alpha/verification.md).
+Read the [main plan](../plan.md), [architecture decisions](../architecture.md#connected-calendar-decisions-google-integration), and [phase 3 handoff](../handoffs/google-phase-3.md). Original v0 phase numbers refer to earlier milestones; Google phase numbers below form a separate sequence. Outstanding alpha/platform checks remain tracked in [alpha verification](../alpha/verification.md).
 
 ## Current implementation and intended behavior
 
-The desktop and CLI share `aika-core`, SQLite schema v4, and checked mutations. Multiple local calendars and common recurring events already exist. `ProviderRegistry` registers only the stateless `LocalProvider` in production and owns a shared `Repository`; collection/calendar management, series, settings, and session undo use that repository. Accounts, scoped remote mappings/shadows, effective events, capability restrictions, and durable outbox operations are modeled and tested with a second adapter compiled only in tests. No Google adapter, HTTP, authentication, discovery UI, or sync worker exists yet. `CredentialService` still uses persistent OS stores. The sidebar plus button still opens the local creation form directly.
+The desktop and CLI share `aika-core`, SQLite schema v5, and checked mutations. Multiple local calendars and common recurring events already exist. `ProviderRegistry` owns the shared `Repository` and registers Local and Google once by provider type. Google now supplies backend OAuth sessions, persistent OS credentials/refresh, every-page calendar discovery, and checked import selection. The sidebar plus button opens a descriptor-driven provider popup; Local reuses its existing form. Account management revises selections, reconnects, and disconnects. The desktop coordinator now imports paginated event feeds and bounded unsupported-recurrence projections through checked shared repository transactions. Imported calendars remain read-only, caches reopen offline, and coverage/status accompany snapshots. Native/mocked automated evidence and unexecuted live/platform gates are distinguished in the phase 3 handoff.
 
-The completed increment provides **+ → provider popup → Local or Google**. Local opens the existing calendar form. Google connects an account in the system browser, discovers calendars, and shows an import checklist with every eligible calendar checked. Confirming adds the selected calendars and starts their synchronization. The same generic flows and coordinator serve future providers.
+The intended complete integration provides **+ → provider popup → Local or Google**. Local opens the existing calendar form. Google connects an account in the system browser, discovers calendars, and shows an import checklist with every eligible calendar checked. Confirming adds the selected calendars and starts their synchronization. The same generic flows and coordinator serve future providers.
 
 ### Agreed defaults
 
@@ -34,7 +34,7 @@ After disconnection or loss of default-calendar eligibility, select the oldest r
 
 ### Ownership and data flow
 
-The future flow is renderer/CLI → `CalendarService` → shared repository for reads and immediate mutations; a separate backend coordinator communicates with provider adapters and applies checked results to that repository. See ADRs G01–G04 in the [architecture document](../architecture.md#connected-calendar-decisions-google-integration).
+The flow is renderer/CLI → `CalendarService` → shared repository for reads and immediate mutations; a desktop-only backend coordinator communicates with provider adapters and applies checked results to that repository. See ADRs G01–G04 in the [architecture document](../architecture.md#connected-calendar-decisions-google-integration).
 
 - Register provider implementations by stable provider type. Model accounts separately, including provider identity, stable remote subject, display metadata, connection state, and selections.
 - Preserve existing internal IDs, including `local-default`. Scope remote-calendar mappings by account, and remote-event mappings by account/calendar. Use internal UUIDs for newly imported identities. A shared calendar connected through two accounts remains two account-labelled local identities.
@@ -49,7 +49,7 @@ Google event synchronization uses a paginated master/exception feed with `single
 
 ### Public contracts and commands
 
-Phase 1 exports `ProviderDescriptor`, `AccountSummary`, `ConnectionState`, `Capabilities`, and the enriched native `CalendarCollectionSnapshot`. The remaining connection/sync/conflict interfaces below are planned. Provider/account listing is available through the backend service; connection and discovery IPC belong to phase 2. Define them in Rust and generate TypeScript with the existing exporter; do not hand-edit generated files. Native-only DTOs need not introduce accounts or credentials into the pure event domain.
+Phase 1 exports `ProviderDescriptor`, `AccountSummary`, `ConnectionState`, `Capabilities`, and the enriched native `CalendarCollectionSnapshot`. Phase 2 additionally exports `ConnectionSession`, `ConnectionProgress`, `DiscoveredCalendar`, and `CalendarDiscovery`, with native connection/discovery/selection/disconnect IPC. Phase 3 adds generated account/calendar sync status and `request_sync` IPC. Conflict-resolution interfaces remain planned. Define them in Rust and generate TypeScript with the existing exporter; do not hand-edit generated files. Native-only DTOs need not introduce accounts or credentials into the pure event domain.
 
 | Interface                   | Required information or operation                                                                                                                                               |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -74,15 +74,15 @@ Register and configure the adapter in the backend; expose its descriptor through
 
 ## Delivery phases and exit gates
 
-| Google phase | Status                  | Deliverable                                                                              |
-| ------------ | ----------------------- | ---------------------------------------------------------------------------------------- |
-| 0            | Documentation delivered | Specification, accepted architecture decisions, links, and handoff.                      |
-| 1            | Delivered               | Shared repository, account model, generic dispatch/capabilities, and test-adapter proof. |
-| 2            | Planned                 | Provider popup, Google authentication, discovery, and import selection.                  |
-| 3            | Planned                 | Incoming sync, persisted cache, and offline reading.                                     |
-| 4            | Planned                 | Ordinary-event two-way sync, offline mutations, conflicts, and undo.                     |
-| 5            | Planned                 | Compatible recurring-event two-way sync and recoverable splits.                          |
-| 6            | Planned                 | Recovery UX, platform evidence, upgrade checks, and release documentation.               |
+| Google phase | Status                         | Deliverable                                                                              |
+| ------------ | ------------------------------ | ---------------------------------------------------------------------------------------- |
+| 0            | Documentation delivered        | Specification, accepted architecture decisions, links, and handoff.                      |
+| 1            | Delivered                      | Shared repository, account model, generic dispatch/capabilities, and test-adapter proof. |
+| 2            | Implemented; live gate pending | Provider popup, Google authentication, discovery, and import selection.                  |
+| 3            | Implemented; live gate pending | Incoming sync, persisted cache, and offline reading.                                     |
+| 4            | Planned                        | Ordinary-event two-way sync, offline mutations, conflicts, and undo.                     |
+| 5            | Planned                        | Compatible recurring-event two-way sync and recoverable splits.                          |
+| 6            | Planned                        | Recovery UX, platform evidence, upgrade checks, and release documentation.               |
 
 ### Phase 0: Specification and decisions
 
@@ -108,6 +108,8 @@ This milestone proves connection and selection only; successful event import is 
 
 **Exit:** native connection/discovery/selection, cancellation, duplicate-account recovery, pagination, and credential isolation are verified; Local still works independently.
 
+Implementation is present and tested with disposable native socket/SQLite fixtures and test-only provider transport/store implementations. Real Google authorization/refresh/discovery and installed OS-browser/store behavior still require a configured desktop client and disposable Google account, so phase 2's full exit gate remains pending. Confirming selection adds empty read-only calendars; it does not start synchronization at this milestone. Revising selection requires a new complete discovery. Disconnect retains cached calendars and deletes local OS-store credentials; it does not revoke Google's remote grant. See the [phase 2 handoff](../handoffs/google-phase-2.md).
+
 ### Phase 3: Incoming sync and offline reading
 
 Import ordinary events, masters, exceptions, and cancellations. Implement staged pagination, incremental cursors, and full-resync recovery. Reconcile discovery regularly, including a full calendar-list refresh to catch metadata/permission changes that incremental discovery can miss. Auto-add new eligible calendars and respect exclusions. Mark unavailable calendars without discarding unresolved local intent.
@@ -115,6 +117,12 @@ Import ordinary events, masters, exceptions, and cancellations. Implement staged
 Expand compatible rules with the common domain. Refresh unsupported occurrence projections for the agreed window and online navigation ranges; invalidate changed series projections and track completed coverage. Preserve missing/redacted event fields and unsupported provider payloads. Show progress, last success, account failures, and missing offline coverage. Imported calendars remain read-only at this phase even when remote permissions allow writing.
 
 **Exit:** external changes appear locally, caches reopen after restart, read-only permissions work, failed resync preserves useful data, and offline ranges never falsely appear complete/empty.
+
+Phase 3 implementation uses schema v5, a desktop request queue with one active worker per account, and renewable persisted 90-second account leases. Account/selection epochs fence stale pages and publications. A complete raw feed and separate instance projection are staged before publishing effective events, shadows, cursor, and coverage together. HTTP 410 restarts a full generation without clearing useful cache. Automatic reconciliation begins only after checklist confirmation, including an explicitly empty selection. Previous metadata values let provider changes update untouched fields while preserving local overrides; the first refresh of a legacy import preserves its existing presentation.
+
+Compatibility is conservative: simple daily/weekly/monthly-by-date/yearly rules with supported intervals/counts, Monday week start, weekly plain BYDAY, and all-day date UNTIL use the common domain when validation succeeds. Timed common rules currently require UTC; source-zone/DST rules, timed UNTIL, EXDATE/RDATE, ordinal BYDAY, and other constructs use Google projections. Raw fields remain intact in shadows; missing titles and redacted ordinary events bypass local creation validation. Projections cover 12 calendar months past and 24 ahead, extended to include the opened range. Any feed change invalidates older projection coverage; successful bounded refresh replaces overlapping projections. This conservative invalidation may require reopening/refetching previously cached distant ranges. Feed/projection limits are 1,000 pages, 100,000 items per stream, 4 MiB per HTTP response, and 64 MiB per staged generation.
+
+The full exit gate still requires disposable live-provider and installed-platform evidence. Failed requests preserve previously published data and surface redacted recovery status. A calendar permission failure does not stop other calendars; authentication/store failures stop that account. Polling/manual refresh retries incoming work; persisted exponential backoff and outgoing mutation/conflict recovery belong to phase 4. See the [phase 3 handoff](../handoffs/google-phase-3.md) for commands, evidence, and next starting instructions.
 
 ### Phase 4: Ordinary-event two-way sync
 
@@ -144,16 +152,18 @@ Document actual Google configuration, live test setup, consent/verification stat
 
 ## Google setup and authentication boundary
 
-Phases 0–1 configure no cloud project and connect no account. These prerequisites are for phase 2/live verification:
+Google Desktop client settings can be embedded at build time; no real client is checked into the repository. Unconfigured builds remain valid with Google disabled. These prerequisites are required for native Google connection/live verification:
 
 1. Use an application-owned Google Cloud project and enable the Calendar API.
 2. Configure the OAuth consent screen and test audience; use disposable test accounts during development. Record consent/verification status before public distribution.
-3. Create an OAuth client of type **Desktop app** and provide its client configuration to the native backend/build configuration. Do not use renderer `VITE_` configuration for tokens. Exact configuration keys are introduced and documented with phase 2.
+3. Create an OAuth client of type **Desktop app** and provide its client configuration to the native backend/build configuration. Do not use renderer `VITE_` configuration for tokens. Native development/build commands first load optional repository-root `.env` entries over inherited variables; values in the file win, including blanks, while omitted variables remain inherited. Rust embeds optional `AIKA_GOOGLE_CLIENT_ID` and `AIKA_GOOGLE_CLIENT_SECRET` values supplied during compilation. The same variables at launch provide a complete runtime override when the client ID is nonblank. Otherwise the embedded pair is used; a runtime secret alone is ignored and secrets never mix across sources. Blank values count as absent. Cargo tracks build-input changes, so changing/removing settings rebuilds the core without requiring a clean build. Supply the Desktop app client ID and the client secret if present in the downloaded Google client configuration. No user credential may be placed in either setting.
 4. Request `openid`, `email`, `https://www.googleapis.com/auth/calendar.calendarlist.readonly`, and `https://www.googleapis.com/auth/calendar.events`. Import selection controls aika's synchronization; it does not narrow Google's account-wide permission grant. Calendar/ACL management scopes are not needed for the chosen scope.
 5. Use the system browser, S256 PKCE, fresh state, and a one-use random-port loopback listener. Exchange/refresh in Rust, request offline access, and preserve an existing refresh token when a refresh response omits it. Resolve account subject through a verified Google identity response.
 6. Store user credentials only in the existing persistent OS store. A locked store pauses remote access; cached and local calendars remain accessible. Missing client configuration disables connection with a clear reason.
 
-The [desktop OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app) documents the supported flow. The [scope reference](https://developers.google.com/workspace/calendar/api/auth) and [OAuth consent setup](https://developers.google.com/workspace/guides/configure-oauth-consent) describe permissions and publication prerequisites. Treat desktop client configuration as public-client configuration, not a confidential server credential. No user token, authorization code, PKCE verifier, or raw authentication failure body belongs in SQLite, renderer storage, logs, screenshots, or handoffs.
+The [desktop OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app) documents the supported flow. The [scope reference](https://developers.google.com/workspace/calendar/api/auth) and [OAuth consent setup](https://developers.google.com/workspace/guides/configure-oauth-consent) describe permissions and publication prerequisites. Treat desktop client configuration as public-client configuration, not a confidential server credential; embedded values, including the Desktop client secret, are extractable from the executable. Rebuild existing installers to embed configuration. Changing the OAuth client may require existing accounts to reconnect. See the [build configuration handoff](../handoffs/google-build-configuration.md) for build commands, optional CI inputs, and evidence. No user token, authorization code, PKCE verifier, or raw authentication failure body belongs in SQLite, renderer storage, logs, screenshots, or handoffs.
+
+The optional root `.env` uses Node dotenv parsing (comments, quotes, multiline values, and optional `export`; no shell execution or variable interpolation). Copy `.env.example` to configure it locally. Only this file is read, regardless of the command working directory. CLI/tool wrappers and alpha/release builds share the loader. Normal packaged apps do not load dotenv files; restart development commands or rebuild to apply file changes. The [dotenv follow-up](../handoffs/google-dotenv-configuration.md) records verification.
 
 ## Verification and handoff procedure
 

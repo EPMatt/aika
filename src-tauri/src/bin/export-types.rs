@@ -9,12 +9,19 @@ use cal_desktop_lib::contracts::{
 use ts_rs::{Config, TS};
 
 use cal_desktop_lib::contracts::{
-    AccountSummary, Capabilities, ConnectionState, ProviderDescriptor,
+    AccountSummary, AccountSyncStatus, CalendarDiscovery, CalendarSyncStatus, Capabilities,
+    ConnectionProgress, ConnectionSession, ConnectionState, DiscoveredCalendar, ProviderDescriptor,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/generated");
     let config = Config::default().with_out_dir(directory);
+    AccountSyncStatus::export_all(&config)?;
+    CalendarSyncStatus::export_all(&config)?;
+    ConnectionSession::export_all(&config)?;
+    ConnectionProgress::export_all(&config)?;
+    DiscoveredCalendar::export_all(&config)?;
+    CalendarDiscovery::export_all(&config)?;
     AccountSummary::export_all(&config)?;
     Capabilities::export_all(&config)?;
     ConnectionState::export_all(&config)?;

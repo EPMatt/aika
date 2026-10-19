@@ -88,7 +88,11 @@ export function CalendarMenu({
             }
           }}
         >
-          <button role="menuitem" disabled={isDefault || busy} onClick={() => select(onDefault)}>
+          <button
+            role="menuitem"
+            disabled={isDefault || busy || !calendar.writable}
+            onClick={() => select(onDefault)}
+          >
             {isDefault ? 'Default calendar' : 'Set as default'}
           </button>
           <button
@@ -110,7 +114,7 @@ export function CalendarMenu({
               select(() => onDelete(trigger.current!));
             }}
           >
-            Delete calendar
+            {calendar.providerId === 'local' ? 'Delete calendar' : 'Remove from aika'}
           </button>
         </Popover.Content>
       </Popover.Portal>

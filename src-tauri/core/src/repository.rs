@@ -29,7 +29,7 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 4 {
+        if version > 5 {
             return Err(error(
                 "migration",
                 "This database was created by a newer version of aika.",
@@ -68,6 +68,9 @@ impl Repository {
         }
         if version < 4 {
             tx.execute_batch(include_str!("schema_v4.sql"))?;
+        }
+        if version < 5 {
+            tx.execute_batch(include_str!("schema_v5.sql"))?;
         }
         tx.commit()?;
         Ok(Self {
@@ -176,6 +179,138 @@ impl Repository {
         tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars WHERE selected=1 AND active=1 AND writable=1 AND (capabilities IS NULL OR json_extract(capabilities,'$.create')=1) ORDER BY account_id IS NOT NULL,rowid LIMIT 1) WHERE default_calendar_id IS NULL OR default_calendar_id IN (SELECT id FROM calendars WHERE writable=0 OR active=0 OR selected=0 OR json_extract(capabilities,'$.create')=0)", [])?;
         tx.commit()?;
         Ok(id)
+    }
+    pub(crate) fn selection_state(db: &Connection, account: &str) -> Result<String> {
+        let state: String = db.query_row(
+            "SELECT connection_state FROM accounts WHERE id=?1",
+            [account],
+            |r| r.get(0),
+        )?;
+        let mut statement = db.prepare("SELECT remote_id,selected,active FROM calendars WHERE account_id=?1 ORDER BY remote_id")?;
+        let rows = statement
+            .query_map([account], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(serde_json::to_string(&(state, rows))?)
+    }
+    pub(crate) fn prepare_selection(
+        &self,
+        account: &str,
+        calendars: &mut [DiscoveredCalendar],
+    ) -> Result<String> {
+        for c in calendars {
+            let selected: Option<bool> = self
+                .db
+                .query_row(
+                    "SELECT selected FROM calendars WHERE account_id=?1 AND remote_id=?2",
+                    params![account, c.remote_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            c.selected = c.eligible && selected.unwrap_or(true);
+        }
+        Self::selection_state(&self.db, account)
+    }
+    /// Checked all-or-nothing selection from a backend-owned, fully paginated discovery.
+    pub(crate) fn commit_selection(
+        &mut self,
+        account: &str,
+        calendars: &[DiscoveredCalendar],
+        selected: &[String],
+        expected: &str,
+    ) -> Result<()> {
+        let choices: std::collections::BTreeSet<_> = selected.iter().collect();
+        if choices.len() != selected.len()
+            || choices
+                .iter()
+                .any(|id| !calendars.iter().any(|c| &c.remote_id == *id && c.eligible))
+        {
+            return Err(error(
+                "validation",
+                "Select only eligible discovered calendars.",
+            ));
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::selection_state(&tx, account)? != expected {
+            return Err(error(
+                "conflict",
+                "Calendar selection changed. Discover calendars again before saving.",
+            ));
+        }
+        let (provider, state): (String, String) = tx.query_row(
+            "SELECT provider_id,connection_state FROM accounts WHERE id=?1",
+            [account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if serde_json::from_str::<ConnectionState>(&state)? != ConnectionState::Connected {
+            return Err(error(
+                "authenticationRequired",
+                "Reconnect the account before changing its selection.",
+            ));
+        }
+        tx.execute(
+            "UPDATE accounts SET selection_confirmed=1,sync_epoch=sync_epoch+1 WHERE id=?1",
+            [account],
+        )?;
+        let caps = serde_json::to_string(&Capabilities::read_only())?;
+        for c in calendars {
+            let existing: Option<(String, bool)> = tx
+                .query_row(
+                    "SELECT id,selected FROM calendars WHERE account_id=?1 AND remote_id=?2",
+                    params![account, c.remote_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            // Lack of access is not a user exclusion. Keep selection intent/cache for
+            // existing unavailable calendars; never persist a new inaccessible entry.
+            if !c.eligible && existing.is_none() {
+                continue;
+            }
+            let chosen = if c.eligible {
+                choices.contains(&c.remote_id)
+            } else {
+                existing.as_ref().is_some_and(|(_, selected)| *selected)
+            };
+            let id = existing
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if !chosen && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE calendar_id=?1 AND state!='acknowledged')", [&id], |r| r.get::<_,bool>(0))? {
+                return Err(error("pendingWork", "Pending changes prevent excluding this calendar."));
+            }
+            tx.execute("INSERT INTO calendars(id,name,color,description,provider_id,account_id,remote_id,writable,capabilities,selected,active) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10) ON CONFLICT(account_id,remote_id) DO UPDATE SET selected=excluded.selected,active=excluded.active,writable=0,capabilities=excluded.capabilities", params![id,c.name,c.color,c.description,provider,account,c.remote_id,caps,chosen,c.eligible])?;
+            if !chosen {
+                tx.execute("DELETE FROM sync_cursors WHERE calendar_id=?1", [&id])?;
+                tx.execute("DELETE FROM coverage WHERE calendar_id=?1", [&id])?;
+                tx.execute("UPDATE event_exceptions SET payload=NULL,calendar_id=NULL WHERE calendar_id=?1", [&id])?;
+                tx.execute("DELETE FROM events WHERE calendar_id=?1", [&id])?;
+            }
+        }
+        tx.execute("UPDATE calendar_settings SET default_calendar_id=(SELECT id FROM calendars WHERE selected=1 AND active=1 AND writable=1 AND (capabilities IS NULL OR json_extract(capabilities,'$.create')=1) ORDER BY account_id IS NOT NULL,rowid LIMIT 1) WHERE default_calendar_id IN (SELECT id FROM calendars WHERE selected=0 OR active=0 OR writable=0)", [])?;
+        let calendars = Self::read_calendars(&tx)?;
+        tx.commit()?;
+        self.retain_calendar_history(&calendars);
+        Ok(())
+    }
+    pub(crate) fn set_account_state(
+        &mut self,
+        account: &str,
+        state: ConnectionState,
+    ) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE accounts SET connection_state=?2 WHERE id=?1",
+            params![account, serde_json::to_string(&state)?],
+        )?;
+        if changed != 1 {
+            return Err(error("notFound", "Unknown connected account."));
+        }
+        Ok(())
     }
     pub fn calendar_account(&self, calendar: &str) -> Result<Option<String>> {
         Ok(self.db.query_row(
@@ -449,7 +584,6 @@ impl Repository {
         details: CalendarDetails,
         expected: Calendar,
     ) -> Result<()> {
-        let details = Self::validate_details(details)?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -475,6 +609,19 @@ impl Repository {
                 "conflict",
                 "The calendar changed. Reopen its settings before saving.",
             ));
+        }
+        // Keep a checked provider color when only other local presentation fields change.
+        let preserve_color = current.provider_id != "local" && details.color == current.color;
+        let mut details = Self::validate_details(CalendarDetails {
+            color: if preserve_color {
+                "#718675".into()
+            } else {
+                details.color
+            },
+            ..details
+        })?;
+        if preserve_color {
+            details.color = current.color;
         }
         tx.execute(
             "UPDATE calendars SET name=?2,color=?3,description=?4 WHERE id=?1",
@@ -520,6 +667,8 @@ impl Repository {
         )?;
         tx.execute("DELETE FROM events WHERE calendar_id=?1", [id])?;
         if account.is_some() {
+            tx.execute("DELETE FROM sync_cursors WHERE calendar_id=?1", [id])?;
+            tx.execute("DELETE FROM coverage WHERE calendar_id=?1", [id])?;
             tx.execute("UPDATE calendars SET selected=0 WHERE id=?1", [id])?;
             tx.execute("UPDATE calendar_settings SET default_calendar_id=NULL WHERE default_calendar_id=?1", [id])?;
         } else {
@@ -862,6 +1011,7 @@ impl Repository {
             accounts: vec![],
             calendar_capabilities: Default::default(),
             event_capabilities: Default::default(),
+            sync_status: vec![],
         })
     }
     pub fn snapshot_calendar(&self, calendar: &str, range: EventRange) -> Result<CalendarSnapshot> {
@@ -894,7 +1044,7 @@ impl Repository {
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
-    fn write(db: &Connection, event: &CalendarEvent) -> Result<()> {
+    pub(crate) fn write(db: &Connection, event: &CalendarEvent) -> Result<()> {
         let (kind, start, end) = match &event.time {
             EventTime::Timed { start, end, .. } => ("timed", start, end),
             EventTime::AllDay {
@@ -1509,7 +1659,7 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                4
+                5
             );
         }
         std::fs::remove_file(path).unwrap();
@@ -1832,7 +1982,7 @@ mod recurrence_tests {
         };
         provider.set_preferences(prefs.clone()).unwrap();
         provider.db.execute_batch("DROP TABLE event_exceptions; DROP INDEX events_recurring; ALTER TABLE events DROP COLUMN recurring;
-        DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
+        ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
         DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert; ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities;
         DROP TABLE accounts; PRAGMA user_version=2;").unwrap();
         drop(provider);
@@ -1848,7 +1998,7 @@ mod recurrence_tests {
                 .db
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            4
+            5
         );
         drop(provider);
         std::fs::remove_file(path).unwrap();
@@ -1903,7 +2053,7 @@ mod migration_v4_tests {
                 [&event.id],
             )
             .unwrap();
-        repo.db.execute_batch("DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
+        repo.db.execute_batch("ALTER TABLE calendars DROP COLUMN remote_metadata; DROP TRIGGER invalidate_new_calendar_sync; ALTER TABLE accounts DROP COLUMN selection_confirmed; DROP TRIGGER invalidate_account_sync; DROP TRIGGER invalidate_selection_sync; DROP TABLE incoming_items; DROP TABLE incoming_projections; ALTER TABLE accounts DROP COLUMN sync_epoch; ALTER TABLE accounts DROP COLUMN sync_failure; ALTER TABLE accounts DROP COLUMN last_sync_success; DROP TABLE conflicts; DROP TABLE outbox; DROP TABLE remote_events; DROP TABLE sync_generations; DROP TABLE sync_cursors; DROP TABLE coverage; DROP TABLE account_leases;
             DROP INDEX remote_calendar_identity; DROP TRIGGER calendar_account_insert;
             ALTER TABLE calendars DROP COLUMN account_id; ALTER TABLE calendars DROP COLUMN remote_id; ALTER TABLE calendars DROP COLUMN provider_id; ALTER TABLE calendars DROP COLUMN writable; ALTER TABLE calendars DROP COLUMN selected; ALTER TABLE calendars DROP COLUMN active; ALTER TABLE calendars DROP COLUMN capabilities; DROP TABLE accounts; PRAGMA user_version=3;").unwrap();
         event
@@ -1940,7 +2090,7 @@ mod migration_v4_tests {
                 repo.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
-                4
+                5
             );
         }
         std::fs::remove_file(path).unwrap();
